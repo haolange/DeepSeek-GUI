@@ -21,8 +21,11 @@ import {
 import {
   detectImageMimeType,
   resolveExecutable,
+  shellCommandArgs,
   shellRuntimeInfo,
-  spawnCapture
+  spawnCapture,
+  terminateSpawnTree,
+  waitForSpawnExit
 } from './builtin-tool-utils.js'
 
 function imageExtension(mimeType: string): string {
@@ -131,7 +134,7 @@ export function createLocalBashOperations(): BashLocalToolOperations {
   return {
     exec: async (command, cwd, options) => {
       const { shell, args, name } = shellRuntimeInfo()
-      const child = spawn(shell, [...args, command], {
+      const child = spawn(shell, shellCommandArgs({ shell, args }, command), {
         cwd,
         env: process.env,
         detached: process.platform !== 'win32',
@@ -139,17 +142,7 @@ export function createLocalBashOperations(): BashLocalToolOperations {
         windowsHide: true
       })
       let timedOut = false
-      const kill = () => {
-        if (child.pid && process.platform !== 'win32') {
-          try {
-            process.kill(-child.pid, 'SIGTERM')
-            return
-          } catch {
-            // Fall through to direct kill.
-          }
-        }
-        child.kill('SIGTERM')
-      }
+      const kill = () => terminateSpawnTree(child)
       const timer = setTimeout(() => {
         timedOut = true
         kill()
@@ -162,10 +155,7 @@ export function createLocalBashOperations(): BashLocalToolOperations {
       child.stderr?.on('data', (chunk: Buffer | string) => {
         options.onData?.(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
       })
-      const exitCode = await new Promise<number | null>((resolvePromise, rejectPromise) => {
-        child.once('error', rejectPromise)
-        child.once('close', (code) => resolvePromise(code))
-      }).finally(() => {
+      const exitCode = await waitForSpawnExit(child).finally(() => {
         clearTimeout(timer)
         options.signal.removeEventListener('abort', onAbort)
       })

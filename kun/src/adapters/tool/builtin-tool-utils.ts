@@ -1,6 +1,6 @@
 import { existsSync } from 'node:fs'
 import { readFile, readdir, stat } from 'node:fs/promises'
-import { spawn, spawnSync } from 'node:child_process'
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type { ToolHostContext } from '../../ports/tool-host.js'
 import type {
@@ -16,6 +16,12 @@ import type {
 import { COMPACT_RESOURCE_FILE_NAMES } from './builtin-tool-types.js'
 
 type SpawnSyncLike = typeof spawnSync
+type SpawnLike = typeof spawn
+const POWERSHELL_UTF8_OUTPUT_PREAMBLE = [
+  '$OutputEncoding = [System.Text.UTF8Encoding]::new($false)',
+  '[Console]::OutputEncoding = $OutputEncoding',
+  'try { [Console]::InputEncoding = $OutputEncoding } catch {}'
+].join('; ')
 
 function firstLookupResult(
   lookup: SpawnSyncLike,
@@ -188,8 +194,6 @@ export function shellConfig(
   fileExists: (path: string) => boolean = existsSync
 ): ShellConfig {
   if (platform === 'win32') {
-    const bash = firstLookupResult(lookup, 'where', ['bash.exe'])
-    if (bash) return { shell: bash, args: ['-lc'] }
     const pwsh = firstLookupResult(lookup, 'where', ['pwsh.exe'])
     if (pwsh) {
       return {
@@ -204,6 +208,8 @@ export function shellConfig(
         args: ['-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command']
       }
     }
+    const bash = firstLookupResult(lookup, 'where', ['bash.exe'])
+    if (bash) return { shell: bash, args: ['-lc'] }
     return { shell: 'cmd.exe', args: ['/d', '/s', '/c'] }
   }
   if (fileExists('/bin/bash')) return { shell: '/bin/bash', args: ['-lc'] }
@@ -232,9 +238,102 @@ export function shellRuntimeInfo(config: ShellConfig = shellConfig()): ShellRunt
   }
 }
 
+export function shellCommandArgs(config: ShellConfig, command: string): string[] {
+  const name = shellDisplayName(config.shell)
+  if (name === 'pwsh' || name === 'powershell') {
+    const baseArgs = config.args.filter((arg) => arg.toLowerCase() !== '-command')
+    const encodedCommand = Buffer.from(`${POWERSHELL_UTF8_OUTPUT_PREAMBLE}\n${command}`, 'utf16le')
+      .toString('base64')
+    return [...baseArgs, '-EncodedCommand', encodedCommand]
+  }
+  return [...config.args, command]
+}
+
 export function shellRuntimeInstruction(config: ShellConfig = shellConfig()): string {
   const shell = shellRuntimeInfo(config)
-  return `Shell runtime: the \`bash\` tool executes commands with \`${shell.name}\` (${shell.shell}). Write shell commands appropriate for the host platform using ${shell.syntax} syntax. Do not assume POSIX/Bash syntax unless the current shell is Bash-compatible.`
+  return `Shell runtime: the \`bash\` tool executes commands with \`${shell.name}\` (${shell.shell}). Write shell commands appropriate for the host platform using ${shell.syntax} syntax. Do not assume POSIX/Bash syntax unless the current shell is Bash-compatible. Long-running commands may return a \`session_id\`; use \`bash\` with \`action: "poll"\` to read more output, \`action: "write"\` plus \`input\` to send stdin, or \`action: "stop"\` to terminate the process. For dev servers, start them normally, verify readiness once a URL or 200 response appears, then finish the user-facing answer without waiting for the server to exit.`
+}
+
+// `close` can be held open by background grandchildren that inherit stdio.
+// Treat the shell's `exit` as command completion, then briefly flush output.
+export async function waitForSpawnExit(
+  child: ChildProcess,
+  options: { flushAfterExitMs?: number } = {}
+): Promise<number | null> {
+  const flushAfterExitMs = options.flushAfterExitMs ?? 50
+  let closeCode: number | null | undefined
+  let closeSeen = false
+
+  const exitCode = await new Promise<number | null>((resolvePromise, rejectPromise) => {
+    child.once('error', rejectPromise)
+    child.once('close', (code) => {
+      closeSeen = true
+      closeCode = code
+      resolvePromise(code)
+    })
+    child.once('exit', (code) => {
+      resolvePromise(code)
+    })
+  })
+
+  if (!closeSeen && flushAfterExitMs > 0) {
+    await new Promise<void>((resolvePromise) => {
+      const timer = setTimeout(resolvePromise, flushAfterExitMs)
+      child.once('close', (code) => {
+        closeSeen = true
+        closeCode = code
+        clearTimeout(timer)
+        resolvePromise()
+      })
+    })
+  }
+
+  if (!closeSeen) {
+    child.stdout?.destroy()
+    child.stderr?.destroy()
+  }
+
+  return closeCode ?? exitCode
+}
+
+export function terminateSpawnTree(
+  child: ChildProcess,
+  options: {
+    platform?: NodeJS.Platform
+    signal?: NodeJS.Signals
+    spawnImpl?: SpawnLike
+  } = {}
+): void {
+  const signal = options.signal ?? 'SIGTERM'
+  const pid = child.pid
+  if (!pid) {
+    child.kill(signal)
+    return
+  }
+
+  if ((options.platform ?? process.platform) === 'win32') {
+    try {
+      const taskkill = (options.spawnImpl ?? spawn)('taskkill', ['/pid', String(pid), '/T', '/F'], {
+        stdio: 'ignore',
+        windowsHide: true
+      })
+      taskkill.once('error', () => {
+        child.kill(signal)
+      })
+      taskkill.unref?.()
+      return
+    } catch {
+      child.kill(signal)
+      return
+    }
+  }
+
+  try {
+    process.kill(-pid, signal)
+    return
+  } catch {
+    child.kill(signal)
+  }
 }
 
 function shellSyntaxHint(name: string): string {
@@ -294,7 +393,7 @@ export async function spawnCapture(
   })
   let stdout = ''
   let stderr = ''
-  const onAbort = () => child.kill('SIGTERM')
+  const onAbort = () => terminateSpawnTree(child)
   options.signal?.addEventListener('abort', onAbort, { once: true })
   child.stdout?.on('data', (chunk: Buffer | string) => {
     stdout += chunk.toString()
