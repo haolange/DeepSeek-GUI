@@ -1,0 +1,24 @@
+# 知识卡导出索引文件
+schema_version: 1
+locale: zh-CN
+branch: master
+exported_at: "2026-06-07T11:08:00Z"
+modules:
+    electron_app:
+        dir_name: DeepSeek GUI 桌面应用与多模态代理运行时
+        title: DeepSeek GUI 桌面应用与多模态代理运行时
+        scope:
+            - src/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
+    kun:
+        dir_name: Kun Agent Runtime & HTTP_SSE Server
+        title: Kun Agent Runtime & HTTP/SSE Server
+        scope:
+            - kun/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []

@@ -1,0 +1,8 @@
+schema_version: 1
+module_path: electron_app
+title: DeepSeek GUI 桌面应用与多模态代理运行时
+scope:
+    - src/
+source_files: []
+depends_on: []
+related_to: []
