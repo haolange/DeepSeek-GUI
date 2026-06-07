@@ -515,7 +515,7 @@ export function FloatingComposer({
   const canOpenGoalPanel = canCompose && route !== 'claw'
   const canRunReview = canCompose && route !== 'claw' && Boolean(onReviewCommand)
   const canOpenComposerMenu = showComposerMenuButton && (canTogglePlanMode || canOpenGoalPanel || canRunReview)
-  const showToolbarStartControls = attachmentUploadEnabled || showComposerMenuButton
+  const showToolbarStartControls = showComposerMenuButton
   const stretchModelPicker =
     compact && modelPickerMode === 'combobox' && !showToolbarStartControls && !hideModelPicker
   const draft = useComposerDraft({ input, canCompose })
@@ -958,6 +958,13 @@ export function FloatingComposer({
     draft.focusComposer()
   }
 
+  const handleAttachmentMenuClick = (): void => {
+    if (!canPickAttachment || !onPickAttachments) return
+    setComposerMenuOpen(false)
+    fileInputRef.current?.click()
+    draft.focusComposer()
+  }
+
   const handlePlanToolbarClick = (): void => {
     if (!canTogglePlanMode) return
     setComposerMenuOpen(false)
@@ -1229,6 +1236,24 @@ export function FloatingComposer({
             ref={composerMenuPanelRef}
             className="absolute bottom-12 left-1 z-40 w-48 overflow-hidden rounded-[18px] border border-ds-border bg-white py-1.5 text-[13px] text-ds-muted shadow-[0_18px_48px_rgba(15,23,42,0.16)] dark:bg-ds-card"
           >
+            {attachmentUploadEnabled ? (
+              <>
+                <button
+                  type="button"
+                  disabled={!canPickAttachment || !onPickAttachments}
+                  onClick={handleAttachmentMenuClick}
+                  className="ds-no-drag flex h-8 w-full items-center gap-2 px-3 text-left transition hover:bg-ds-hover hover:text-ds-ink disabled:cursor-not-allowed disabled:opacity-45 disabled:hover:bg-transparent disabled:hover:text-ds-muted"
+                >
+                  {attachmentUploadBusy ? (
+                    <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" strokeWidth={1.9} />
+                  ) : (
+                    <ImagePlus className="h-3.5 w-3.5 shrink-0" strokeWidth={1.9} />
+                  )}
+                  <span className="min-w-0 flex-1 truncate">{t('composerAddImage')}</span>
+                </button>
+                <div className="my-1 h-px bg-ds-border-muted/70" />
+              </>
+            ) : null}
             <button
               type="button"
               disabled={!canTogglePlanMode}
@@ -1589,6 +1614,16 @@ export function FloatingComposer({
               ) : null}
             </div>
           ) : null}
+          {attachmentUploadEnabled ? (
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/png,image/jpeg,image/webp"
+              multiple
+              className="hidden"
+              onChange={handleAttachmentInput}
+            />
+          ) : null}
           <div
             className={`ds-composer-toolbar flex min-h-9 items-center gap-2 ${
               showToolbarStartControls ? 'justify-between' : 'justify-end'
@@ -1596,32 +1631,6 @@ export function FloatingComposer({
           >
             {showToolbarStartControls ? (
               <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto overflow-y-hidden">
-                {attachmentUploadEnabled ? (
-                  <>
-                    <input
-                      ref={fileInputRef}
-                      type="file"
-                      accept="image/png,image/jpeg,image/webp"
-                      multiple
-                      className="hidden"
-                      onChange={handleAttachmentInput}
-                    />
-                    <button
-                      type="button"
-                      disabled={!canPickAttachment}
-                      onClick={() => fileInputRef.current?.click()}
-                      className="ds-no-drag flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-ds-muted transition hover:bg-ds-hover hover:text-ds-ink disabled:cursor-not-allowed disabled:opacity-45"
-                      aria-label={t('composerAddImage')}
-                      title={t('composerAddImage')}
-                    >
-                      {attachmentUploadBusy ? (
-                        <Loader2 className="h-4 w-4 animate-spin" strokeWidth={2} />
-                      ) : (
-                        <ImagePlus className="h-4 w-4" strokeWidth={1.8} />
-                      )}
-                    </button>
-                  </>
-                ) : null}
                 {showComposerMenuButton ? (
                   <>
                     <button

@@ -457,7 +457,7 @@ describe('FloatingComposer capability controls', () => {
     expect(html).not.toContain('Image input is unavailable')
   })
 
-  it('renders enabled image attachment state for Kun image send smoke', () => {
+  it('renders the plus trigger alongside uploaded attachments', () => {
     const html = renderToStaticMarkup(
       createElement(FloatingComposer, {
         input: 'describe this',
@@ -481,7 +481,7 @@ describe('FloatingComposer capability controls', () => {
       })
     )
     expect(html).toContain('More actions')
-    expect(html).toContain('Attach image')
+    expect(html).not.toContain('Attach image')
     expect(html).toContain('shot.png')
   })
 
