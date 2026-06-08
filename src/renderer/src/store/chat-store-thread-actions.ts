@@ -566,7 +566,7 @@ export function createThreadActions(
       } else {
         runtimeText = buildCodeRuntimePrompt(settings, trimmedText)
       }
-      const runtimeDisplayText = channel ? displayText : userDisplayText
+      const runtimeDisplayText = channel ? displayText : (userDisplayText ?? trimmedText)
       const { turnId, userMessageItemId } = await p.sendUserMessage(activeThreadId, runtimeText, {
         mode,
         ...(composerModel ? { model: composerModel } : {}),
