@@ -203,6 +203,51 @@ function goalContinuationInstruction(goal: ThreadGoal | undefined): string | nul
   ].join('\n')
 }
 
+const GOAL_NO_TOOL_REPEAT_SIMILARITY = 0.85
+const GOAL_NO_TOOL_REPEAT_MIN_LENGTH = 12
+
+/**
+ * Goal continuation re-prompts the model whenever it stops without tool
+ * calls, which can spin forever on "I will do X next" filler that never
+ * acts. Exact-equality checks miss this: the filler usually varies in
+ * punctuation, casing, or word order between rounds, so the guard
+ * normalizes both texts and falls back to character-bigram similarity.
+ */
+function isRepeatedNoToolAssistantText(previous: string | undefined, current: string): boolean {
+  if (previous === undefined) return false
+  const a = normalizeNoToolAssistantText(previous)
+  const b = normalizeNoToolAssistantText(current)
+  if (a === b) return true
+  if (a.length < GOAL_NO_TOOL_REPEAT_MIN_LENGTH || b.length < GOAL_NO_TOOL_REPEAT_MIN_LENGTH) {
+    return false
+  }
+  return charBigramDiceSimilarity(a, b) >= GOAL_NO_TOOL_REPEAT_SIMILARITY
+}
+
+function normalizeNoToolAssistantText(text: string): string {
+  return text.toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, '')
+}
+
+function charBigramDiceSimilarity(a: string, b: string): number {
+  const bigramsA = charBigramCounts(a)
+  const bigramsB = charBigramCounts(b)
+  let shared = 0
+  for (const [bigram, countA] of bigramsA) {
+    const countB = bigramsB.get(bigram)
+    if (countB) shared += Math.min(countA, countB)
+  }
+  return (2 * shared) / (a.length - 1 + b.length - 1)
+}
+
+function charBigramCounts(text: string): Map<string, number> {
+  const counts = new Map<string, number>()
+  for (let index = 0; index < text.length - 1; index += 1) {
+    const bigram = text.slice(index, index + 2)
+    counts.set(bigram, (counts.get(bigram) ?? 0) + 1)
+  }
+  return counts
+}
+
 function todoContinuationInstruction(todos: ThreadTodoList | undefined): string | null {
   const items = todos?.items ?? []
   if (items.length === 0) return null
@@ -342,6 +387,7 @@ export class AgentLoop {
   private readonly promptTokenPressure = new Map<string, { model: string; promptTokens: number }>()
   private readonly toolStormBreakers = new Map<string, ToolStormBreaker>()
   private readonly toolCatalogSnapshots = new Map<string, ToolCatalogSnapshot>()
+  private readonly lastNoToolTextByTurn = new Map<string, string>()
 
   constructor(opts: AgentLoopOptions) {
     this.opts = opts
@@ -402,6 +448,7 @@ export class AgentLoop {
       await this.finishGoalElapsedTimer(threadId, goalTimer)
       this.autoModelRoutes.delete(autoModelRouteKey(threadId, turnId))
       this.toolStormBreakers.delete(turnId)
+      this.lastNoToolTextByTurn.delete(turnId)
     }
   }
 
@@ -974,9 +1021,41 @@ export class AgentLoop {
         )
         return 'failed'
       }
-      if (stopReason === 'stop' && activeGoalInstruction) return 'continue'
+      if (stopReason === 'stop' && activeGoalInstruction) {
+        const previousText = this.lastNoToolTextByTurn.get(turnId)
+        if (isRepeatedNoToolAssistantText(previousText, textAccumulator.value)) {
+          const message =
+            'Goal continuation stopped: the model repeated a near-identical reply twice in a row without calling any tool.'
+          await this.opts.turns.applyItem(
+            threadId,
+            makeErrorItem({
+              id: this.opts.ids.next('item_error'),
+              turnId,
+              threadId,
+              message,
+              code: 'goal_repetition_stop',
+              severity: 'warning'
+            })
+          )
+          await this.opts.events.record({
+            kind: 'error',
+            threadId,
+            turnId,
+            message,
+            code: 'goal_repetition_stop',
+            severity: 'warning'
+          })
+          this.lastNoToolTextByTurn.delete(turnId)
+          return 'stop'
+        }
+        this.lastNoToolTextByTurn.set(turnId, textAccumulator.value)
+        return 'continue'
+      }
       return 'stop'
     }
+    // Tool calls mean the turn is making progress again; reset the no-tool
+    // repetition window so unrelated later status texts are not compared.
+    this.lastNoToolTextByTurn.delete(turnId)
     const dispatched = await this.dispatchToolCalls({
       calls: completedToolCalls,
       threadId,
