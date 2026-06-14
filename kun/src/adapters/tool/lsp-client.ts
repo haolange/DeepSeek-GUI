@@ -35,8 +35,15 @@ interface LspSession {
   initPromise: Promise<void> | null
 }
 
-/** Map<workspaceRoot, LspSession> */
-const sessions = new Map<string, LspSession>()
+/**
+ * Map<workspaceRoot, Promise<LspSession>>.
+ * Storing the Promise (not the resolved session) prevents a race where two
+ * concurrent acquireLspSession calls both see sessions.get() === undefined
+ * and each spawns their own server. The first caller writes its Promise
+ * into the map before awaiting anything; the second caller awaits the same
+ * Promise.
+ */
+const sessions = new Map<string, Promise<LspSession>>()
 
 /**
  * Check whether a language server binary is available on PATH.
@@ -199,10 +206,14 @@ function sendNotification(session: LspSession, method: string, params: Record<st
  * Acquire (or reuse) an LSP session for the given workspace.
  * The returned session is initialized and ready for requests.
  * Caller MUST call releaseLspSession when done.
+ *
+ * Race-safe: the in-flight Promise is written to the sessions map before
+ * any await, so concurrent callers get the same session.
  */
 export async function acquireLspSession(workspaceRoot: string): Promise<LspSession> {
-  let session = sessions.get(workspaceRoot)
-  if (session) {
+  const existing = sessions.get(workspaceRoot)
+  if (existing) {
+    const session = await existing
     if (session.cleanupTimer) {
       clearTimeout(session.cleanupTimer)
       session.cleanupTimer = null
@@ -212,6 +223,21 @@ export async function acquireLspSession(workspaceRoot: string): Promise<LspSessi
     return session
   }
 
+  // Write the Promise immediately to prevent concurrent spawns.
+  const sessionPromise = createSession(workspaceRoot)
+  sessions.set(workspaceRoot, sessionPromise)
+
+  try {
+    const session = await sessionPromise
+    return session
+  } catch (err) {
+    // If spawn/init fails, remove the placeholder so the next call can retry.
+    sessions.delete(workspaceRoot)
+    throw err
+  }
+}
+
+async function createSession(workspaceRoot: string): Promise<LspSession> {
   const cmd = await resolveTsLsCommand(workspaceRoot)
   if (!cmd) {
     throw new Error(
@@ -226,7 +252,7 @@ export async function acquireLspSession(workspaceRoot: string): Promise<LspSessi
     windowsHide: true
   })
 
-  session = {
+  const session: LspSession = {
     process: proc,
     workspaceRoot,
     refCount: 1,
@@ -239,39 +265,62 @@ export async function acquireLspSession(workspaceRoot: string): Promise<LspSessi
   }
 
   proc.stdout?.on('data', (chunk: Buffer) => {
-    session!.stdoutBuffer += chunk.toString('utf-8')
-    processBuffer(session!)
+    session.stdoutBuffer += chunk.toString('utf-8')
+    processBuffer(session)
   })
 
   proc.on('error', (err) => {
+    // Kill + reject pending rather than throwing (throw in an event handler
+    // becomes an uncaught exception).
+    killSession(session)
     sessions.delete(workspaceRoot)
-    throw new Error(`Failed to start language server: ${err.message}`)
+    void err
   })
 
   proc.on('exit', () => {
-    const s = sessions.get(workspaceRoot)
-    if (s === session) sessions.delete(workspaceRoot)
+    // Reject all pending requests so callers don't hang for 30s.
+    killSession(session)
+    sessions.delete(workspaceRoot)
   })
 
-  sessions.set(workspaceRoot, session)
   await initialize(session)
   return session
 }
 
-export function releaseLspSession(workspaceRoot: string): void {
-  const session = sessions.get(workspaceRoot)
-  if (!session) return
-  session.refCount -= 1
-  if (session.refCount <= 0) {
-    session.cleanupTimer = setTimeout(() => {
-      const s = sessions.get(workspaceRoot)
-      if (s && s.refCount <= 0) {
-        killSession(s)
-        sessions.delete(workspaceRoot)
-      }
-    }, CLEANUP_DELAY)
+/**
+ * Kill all active LSP sessions. Should be called on app quit / process exit
+ * to prevent orphaned language-server processes.
+ */
+export function shutdownAllLspSessions(): void {
+  for (const [workspaceRoot, sessionPromise] of sessions) {
+    sessions.delete(workspaceRoot)
+    sessionPromise
+      .then((session) => killSession(session))
+      .catch(() => { /* session failed to init — nothing to kill */ })
   }
 }
+
+export function releaseLspSession(workspaceRoot: string): void {
+  const sessionPromise = sessions.get(workspaceRoot)
+  if (!sessionPromise) return
+  sessionPromise
+    .then((session) => {
+      session.refCount -= 1
+      if (session.refCount <= 0) {
+        session.cleanupTimer = setTimeout(() => {
+          const sp = sessions.get(workspaceRoot)
+          if (!sp) return
+          sp.then((s) => {
+            if (s.refCount <= 0) {
+              killSession(s)
+              sessions.delete(workspaceRoot)
+            }
+          }).catch(() => { /* ignore */ })
+        }, CLEANUP_DELAY)
+      }
+    })
+    .catch(() => { /* session failed to init — nothing to release */ })
+  }
 
 // --- LSP operations ---
 
@@ -362,5 +411,24 @@ export async function lspDocumentSymbol(session: LspSession, filePath: string): 
 export async function lspWorkspaceSymbol(session: LspSession, query: string): Promise<unknown> {
   return sendRequest(session, 'workspace/symbol', { query })
 }
+
+/**
+ * Synchronous last-resort cleanup on process exit. The exit handler can only
+ * run synchronous code, so we SIGKILL immediately (no grace period). This
+ * prevents orphaned typescript-language-server / tsserver processes when the
+ * host process (Electron / kun serve) terminates.
+ */
+function syncKillAll(): void {
+  for (const [, sessionPromise] of sessions) {
+    sessionPromise
+      .then((session) => {
+        try { session.process.kill('SIGKILL') } catch { /* already dead */ }
+      })
+      .catch(() => { /* init failed — no process to kill */ })
+  }
+  sessions.clear()
+}
+
+process.on('exit', syncKillAll)
 
 export type { LspSession }
