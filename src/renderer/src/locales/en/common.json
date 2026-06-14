@@ -750,6 +750,8 @@
   "composerNoProvidersShort": "Set up provider",
   "composerNoProviders": "No chat model provider is available yet.",
   "composerConfigureProviders": "Open provider settings",
+  "composerModelSearchPlaceholder": "Filter models",
+  "composerNoMatchingModels": "No matching models",
   "composerModelVision": "Vision",
   "composerModelTextOnly": "Text",
   "composerReasoning": "Reasoning",

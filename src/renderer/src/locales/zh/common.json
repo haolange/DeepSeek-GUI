@@ -750,6 +750,8 @@
   "composerNoProvidersShort": "配置供应商",
   "composerNoProviders": "还没有可用的对话模型供应商。",
   "composerConfigureProviders": "打开供应商设置",
+  "composerModelSearchPlaceholder": "筛选模型",
+  "composerNoMatchingModels": "没有匹配的模型",
   "composerModelVision": "识图",
   "composerModelTextOnly": "文本",
   "composerReasoning": "推理",
