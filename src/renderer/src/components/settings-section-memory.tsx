@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react'
 import type { ReactElement } from 'react'
 import { Ban, BrainCircuit, Pencil, Plus, Trash2 } from 'lucide-react'
 import type { CoreMemoryRecordJson } from '../agent/kun-contract'
-import { SettingsCard, SettingRow } from './settings-controls'
+import { SettingsCard, SettingRow, Toggle } from './settings-controls'
 
 type MemoryScope = 'user' | 'workspace' | 'project'
 
@@ -23,6 +23,8 @@ const EMPTY_DRAFT: MemoryDraft = {
 export function MemorySettingsSection({ ctx }: { ctx: Record<string, any> }): ReactElement {
   const {
     t,
+    kun,
+    updateKun,
     memoryRecords,
     memoryDiagnostics,
     createMemoryRecord,
@@ -96,6 +98,16 @@ export function MemorySettingsSection({ ctx }: { ctx: Record<string, any> }): Re
 
   return (
     <SettingsCard title={t('sectionMemory')}>
+      <SettingRow
+        title={t('memoryEnable')}
+        description={t('memoryEnableDesc')}
+        control={
+          <Toggle
+            checked={kun?.memoryEnabled ?? false}
+            onChange={(checked: boolean) => updateKun({ memoryEnabled: checked })}
+          />
+        }
+      />
       <SettingRow
         title={t('memoryOverview')}
         description={t('memoryOverviewDesc')}
