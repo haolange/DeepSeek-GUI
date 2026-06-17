@@ -64,6 +64,7 @@ import { listSddDraftHistory, titleFromSddDraftContent } from '../sdd/sdd-draft-
 import { saveActiveSddDraftToDisk } from '../sdd/sdd-draft-actions'
 import { restoreRememberedSddDraft, restoreSddDraft } from '../sdd/sdd-draft-restore'
 import { composeSddAssistantPrompt } from '../sdd/sdd-assistant-prompt'
+import { frameworkById } from '../sdd/pm-skill-frameworks'
 import { collectSddDraftImages, withAttachmentIds, type SddDraftImageReference } from '../sdd/sdd-draft-images'
 import { PENDING_INFOGRAPHIC_PROTOCOL } from '../write/infographic-pending'
 import { buildSddDraftToPlanPrompt } from '../sdd/sdd-plan-prompt'
@@ -95,9 +96,11 @@ import { useUiModeCameosEnabled, useUiPluginStore } from '../store/ui-plugin-sto
 import { readFocusModePreference, writeFocusModePreference } from '../lib/focus-mode'
 import {
   buildComposerFileContextPrompt,
+  isComposerDirectoryReference,
   mergeComposerFileReferences,
   type ComposerFileContextEntry
 } from '../lib/composer-file-references'
+import { filesUnderDirectory, loadWorkspaceFileIndex } from '../lib/workspace-file-index'
 import { resolveWriteRuntimeBannerMessage } from '../lib/write-runtime-banner'
 
 const ChangeInspector = lazy(() =>
@@ -135,6 +138,9 @@ type PendingSddPlanTarget = {
 
 const COMPOSER_FILE_CONTEXT_MAX_CHARS_PER_FILE = 60_000
 const COMPOSER_FILE_CONTEXT_MAX_TOTAL_CHARS = 180_000
+// Upper bound on how many files a single `@directory` mention expands into, so a
+// large folder cannot flood the prompt (the char budget above is the hard cap).
+const COMPOSER_DIRECTORY_CONTEXT_MAX_FILES = 60
 const SDD_ASSISTANT_TITLE_SYNC_DELAY_MS = 900
 const DESKTOP_SHORTCUT_COMMANDS: Partial<Record<KeyboardShortcutCommandId, DesktopCommand>> = {
   quit: 'quit',
@@ -342,7 +348,6 @@ export function Workbench(): ReactElement {
     disabledSkillIds,
     setComposerModel,
     setThreadSearch,
-    setShowArchivedThreads,
     renameThread,
     archiveThread,
     deleteThread,
@@ -400,7 +405,6 @@ export function Workbench(): ReactElement {
       disabledSkillIds: s.disabledSkillIds,
       setComposerModel: s.setComposerModel,
       setThreadSearch: s.setThreadSearch,
-      setShowArchivedThreads: s.setShowArchivedThreads,
       renameThread: s.renameThread,
       archiveThread: s.archiveThread,
       deleteThread: s.deleteThread,
@@ -474,6 +478,12 @@ export function Workbench(): ReactElement {
 
   const draftByThread = useRef<Record<string, string>>({})
   const prevThreadId = useRef<string | null>(null)
+  // PM-skill framework selected via an assistant-panel button. The id is only
+  // applied on send when its injected prompt text is still present in the
+  // composer (see sendSddAssistantPrompt) — so editing the prompt away, clearing
+  // the composer, or switching drafts all drop it without a stale-guidance leak.
+  const pendingSddFrameworkRef = useRef<string | null>(null)
+  const pendingSddFrameworkPromptRef = useRef<string | null>(null)
   const inputRef = useRef('')
   const sddUpgradeInFlightRef = useRef(false)
   const sddUpgradeTargetRef = useRef<PendingSddPlanTarget | null>(null)
@@ -1382,6 +1392,20 @@ export function Workbench(): ReactElement {
   // flow; they just no longer hijack startup. See the workspace picker below
   // the composer for switching directories.
 
+  // Inject a PM-skill framework prompt (see pm-skill-frameworks.ts) into the
+  // Requirement AI composer and remember it so the next send applies the
+  // framework's guidance. Frameworks without guidance (the generic
+  // clarify/research actions) only set the composer text.
+  const applySddFramework = (frameworkId: string): void => {
+    const framework = frameworkById(frameworkId)
+    if (!framework?.promptKey) return
+    const promptText = t(framework.promptKey)
+    setInput(input.trim() ? `${input.trim()}\n\n${promptText}` : promptText)
+    // Arm the framework only when it carries guidance; the latest click wins.
+    pendingSddFrameworkRef.current = framework.guidance ? framework.id : null
+    pendingSddFrameworkPromptRef.current = framework.guidance ? promptText : null
+  }
+
   const sendSddAssistantPrompt = async (value: string): Promise<void> => {
     const v = value.trim()
     const draft = useSddDraftStore.getState().activeDraft
@@ -1397,11 +1421,20 @@ export function Workbench(): ReactElement {
     const snapshot = useSddDraftStore.getState()
     void saveActiveSddDraftToDisk()
     const userPrompt = v || t('composerImageOnlyPrompt')
+    // Apply the armed framework only if its injected prompt is still in the
+    // message being sent — editing it away, clearing the composer, or switching
+    // drafts all leave a value that no longer contains it, so it is dropped.
+    const pendingPrompt = pendingSddFrameworkPromptRef.current
+    const frameworkId =
+      pendingSddFrameworkRef.current && pendingPrompt && value.includes(pendingPrompt)
+        ? pendingSddFrameworkRef.current
+        : null
     const prompt = composeSddAssistantPrompt({
       userPrompt,
       draftMarkdown: snapshot.content,
       draftRelativePath: draft.relativePath,
-      workspaceRoot: draft.workspaceRoot
+      workspaceRoot: draft.workspaceRoot,
+      ...(frameworkId ? { frameworkIds: [frameworkId] } : {})
     })
     setInput('')
     const model = writeAssistantModel.trim()
@@ -1415,8 +1448,12 @@ export function Workbench(): ReactElement {
       ...(attachmentIds.length ? { attachmentIds, attachments } : {})
     })
     if (sent) {
+      pendingSddFrameworkRef.current = null
+      pendingSddFrameworkPromptRef.current = null
       if (attachmentIds.length > 0) clearComposerAttachments()
     } else {
+      // Restore the composer (incl. any framework prompt) so a retry re-applies
+      // the same guidance the user still sees; the refs are intentionally kept.
       setInput(v)
     }
   }
@@ -1682,19 +1719,33 @@ export function Workbench(): ReactElement {
     workspace: string
   ): Promise<ComposerFileContextEntry[]> => {
     const entries: ComposerFileContextEntry[] = []
+    const seen = new Set<string>()
     let remainingChars = COMPOSER_FILE_CONTEXT_MAX_TOTAL_CHARS
-    for (const reference of references) {
-      if (remainingChars <= 0) break
+
+    const contextKey = (path: string): string =>
+      path.trim().replaceAll('\\', '/').replace(/\/+/g, '/').toLowerCase()
+
+    // strict=true (explicit file mention) surfaces read errors to the user;
+    // strict=false (directory expansion) silently skips files that vanished.
+    const appendFileEntry = async (
+      reference: ComposerFileReference,
+      strict: boolean
+    ): Promise<void> => {
+      if (remainingChars <= 0) return
+      const key = contextKey(reference.relativePath || reference.path)
+      if (seen.has(key)) return
       const result = await window.kunGui.readWorkspaceFile({
         workspaceRoot: workspace,
         path: reference.relativePath || reference.path
       })
       if (!result.ok) {
+        if (!strict) return
         throw new Error(t('composerFileReadFailed', {
           path: reference.relativePath,
           message: result.message
         }))
       }
+      seen.add(key)
       const clipped = clipComposerFileContext(result.content, remainingChars, result.truncated)
       remainingChars -= clipped.consumed
       entries.push({
@@ -1702,6 +1753,23 @@ export function Workbench(): ReactElement {
         content: clipped.content,
         ...(clipped.truncated ? { truncated: true } : {})
       })
+    }
+
+    for (const reference of references) {
+      if (remainingChars <= 0) break
+      if (isComposerDirectoryReference(reference)) {
+        const index = await loadWorkspaceFileIndex(workspace).catch(() => null)
+        const dirFiles = index
+          ? filesUnderDirectory(index.files, reference.relativePath)
+              .slice(0, COMPOSER_DIRECTORY_CONTEXT_MAX_FILES)
+          : []
+        for (const file of dirFiles) {
+          if (remainingChars <= 0) break
+          await appendFileEntry(file, false)
+        }
+        continue
+      }
+      await appendFileEntry(reference, true)
     }
     return entries
   }
@@ -2116,8 +2184,11 @@ export function Workbench(): ReactElement {
                 onRetryConnection={() => void probeRuntime('user', { restart: true })}
                 onOpenSettings={() => openSettings('agents')}
                 onConfigureProviders={() => openSettings('providers')}
+                onApplyFramework={applySddFramework}
                 onNewConversation={() => {
                   setInput('')
+                  pendingSddFrameworkRef.current = null
+                  pendingSddFrameworkPromptRef.current = null
                   void createSddAssistantThreadForDraft(activeSddDraft)
                 }}
                 onCollapse={closeRightPanel}
@@ -2210,7 +2281,6 @@ export function Workbench(): ReactElement {
               threadSearch={threadSearch}
               showArchivedThreads={showArchivedThreads}
               onThreadSearchChange={setThreadSearch}
-              onShowArchivedThreadsChange={setShowArchivedThreads}
               onSelectThread={openThread}
               onRenameThread={renameThread}
               onArchiveThread={(id) => archiveThread(id, true)}
