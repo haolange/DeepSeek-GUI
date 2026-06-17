@@ -1514,9 +1514,20 @@ function ComputerUsePermissionRow({ t }: { t: (key: string) => string }): ReactE
       control={
         <div className="flex min-w-0 flex-col items-start gap-2 sm:items-end">
           <div className="flex flex-wrap gap-2">
-            {badge(t('computerUseAccessibility'), permissions?.accessibility ?? 'unknown')}
+            {permissions?.accessibilityNeedsRestart ? (
+              <span className="rounded-lg border border-amber-400/30 bg-amber-500/10 px-2 py-0.5 text-[12px] font-medium text-amber-700 dark:text-amber-200">
+                {t('computerUseAccessibility')}: {t('computerUsePermissionNeedsRestart')}
+              </span>
+            ) : (
+              badge(t('computerUseAccessibility'), permissions?.accessibility ?? 'unknown')
+            )}
             {badge(t('computerUseScreenRecording'), permissions?.screenRecording ?? 'unknown')}
           </div>
+          {permissions?.accessibilityNeedsRestart ? (
+            <p className="max-w-full text-[12px] leading-5 text-amber-700 dark:text-amber-200">
+              {t('computerUseRestartHint')}
+            </p>
+          ) : null}
           <div className="flex flex-wrap gap-2">
             <button
               type="button"

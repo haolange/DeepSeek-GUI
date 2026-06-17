@@ -744,6 +744,8 @@
   "computerUsePermission_granted": "已授予",
   "computerUsePermission_denied": "未授予",
   "computerUsePermission_unknown": "未知",
+  "computerUsePermissionNeedsRestart": "已授予 — 需重启应用生效",
+  "computerUseRestartHint": "辅助功能已在系统设置中开启，但 macOS 需要重启应用后才会生效。请完全退出 Kun 再重新打开，然后点「重新检查」。",
   "autoApplyHint": "修改会自动生效",
   "applying": "正在应用…",
   "applied": "已应用",

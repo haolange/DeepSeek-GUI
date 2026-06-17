@@ -253,6 +253,8 @@ export type ComputerUsePermissions = {
   needsPermission: boolean
   accessibility: ComputerUsePermissionState
   screenRecording: ComputerUsePermissionState
+  /** Accessibility is enabled in System Settings but needs an app relaunch to take effect. */
+  accessibilityNeedsRestart: boolean
 }
 
 export type KunGuiApi = {

@@ -744,6 +744,8 @@
   "computerUsePermission_granted": "granted",
   "computerUsePermission_denied": "not granted",
   "computerUsePermission_unknown": "unknown",
+  "computerUsePermissionNeedsRestart": "granted — restart to apply",
+  "computerUseRestartHint": "Accessibility is enabled in System Settings, but macOS only applies it after the app restarts. Fully quit Kun and reopen it, then re-check.",
   "autoApplyHint": "Changes apply automatically",
   "applying": "Applying…",
   "applied": "Applied",

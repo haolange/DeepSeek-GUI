@@ -12,6 +12,13 @@ export type ComputerUsePermissions = {
   accessibility: ComputerUsePermissionState
   /** Screen Recording permission (controls screenshots on macOS). */
   screenRecording: ComputerUsePermissionState
+  /**
+   * macOS only: Accessibility is enabled in System Settings, but the running
+   * process still reports untrusted because AXIsProcessTrusted is cached until
+   * relaunch. The UI shows a "restart to take effect" hint instead of "not
+   * granted" so the granted-but-stale state is not mistaken for a failure.
+   */
+  accessibilityNeedsRestart: boolean
 }
 
 /**
@@ -60,7 +67,7 @@ function normalizeState(status: string | undefined): ComputerUsePermissionState 
  * on Windows/Linux no special permission gate applies. Checks are
  * read-only — they never trigger a system prompt.
  */
-export function getComputerUsePermissions(): ComputerUsePermissions {
+export async function getComputerUsePermissions(): Promise<ComputerUsePermissions> {
   const platform = process.platform
   if (platform !== 'darwin') {
     return {
@@ -68,14 +75,27 @@ export function getComputerUsePermissions(): ComputerUsePermissions {
       supported: true,
       needsPermission: false,
       accessibility: 'granted',
-      screenRecording: 'granted'
+      screenRecording: 'granted',
+      accessibilityNeedsRestart: false
     }
   }
-  let accessibility: ComputerUsePermissionState = 'unknown'
+  // Live trust: whether THIS process can inject right now. Cached by macOS
+  // until the app relaunches, so it lags a freshly-toggled grant.
+  let liveTrust = false
   try {
-    accessibility = systemPreferences.isTrustedAccessibilityClient(false) ? 'granted' : 'denied'
+    liveTrust = systemPreferences.isTrustedAccessibilityClient(false)
   } catch {
-    accessibility = 'unknown'
+    liveTrust = false
+  }
+  // TCC db state: what System Settings shows (updates the instant the user
+  // flips the toggle). Used to distinguish "not granted" from
+  // "granted but the process needs a restart to pick it up".
+  let accessibilityGrantedInSettings = false
+  try {
+    const native = await loadMacPermissions()
+    accessibilityGrantedInSettings = native?.getAuthStatus('accessibility') === 'authorized'
+  } catch {
+    accessibilityGrantedInSettings = false
   }
   let screenRecording: ComputerUsePermissionState = 'unknown'
   try {
@@ -83,7 +103,14 @@ export function getComputerUsePermissions(): ComputerUsePermissions {
   } catch {
     screenRecording = 'unknown'
   }
-  return { platform, supported: true, needsPermission: true, accessibility, screenRecording }
+  return {
+    platform,
+    supported: true,
+    needsPermission: true,
+    accessibility: liveTrust ? 'granted' : 'denied',
+    screenRecording,
+    accessibilityNeedsRestart: !liveTrust && accessibilityGrantedInSettings
+  }
 }
 
 /**
