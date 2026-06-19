@@ -9,6 +9,9 @@ import {
   type WorkflowFieldV1,
   WORKFLOW_HOOK_MODES,
   WORKFLOW_HOOK_PHASES,
+  WORKFLOW_NODE_INPUT_TYPES,
+  type WorkflowNodeInputType,
+  type WorkflowNodeInputV1,
   type WorkflowClassifierCategoryV1,
   type WorkflowHookMode,
   type WorkflowHookPhase,
@@ -178,6 +181,22 @@ function normalizeNodeErrorFields(n: Record<string, unknown>): {
   return out
 }
 
+/** Named, typed inputs a node pulls from upstream output (resolved as {{$input.key}}). */
+function normalizeNodeInputs(value: unknown): WorkflowNodeInputV1[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const inputs = value
+    .map((entry): WorkflowNodeInputV1 => {
+      const e = record(entry)
+      const type = WORKFLOW_NODE_INPUT_TYPES.includes(e.type as WorkflowNodeInputType)
+        ? (e.type as WorkflowNodeInputType)
+        : 'text'
+      return { key: asTrimmed(e.key), type, source: asText(e.source) }
+    })
+    .filter((input) => input.key.length > 0)
+    .slice(0, 30)
+  return inputs.length ? inputs : undefined
+}
+
 export function normalizeWorkflowInputSchema(value: unknown): WorkflowInputFieldV1[] {
   if (!Array.isArray(value)) return []
   return value
@@ -260,12 +279,14 @@ export function normalizeWorkflowNode(value: unknown, index: number): WorkflowNo
   const type = n.type
   if (typeof type !== 'string' || !WORKFLOW_NODE_KINDS.includes(type as WorkflowNodeKind)) return null
   const kind = type as WorkflowNodeKind
+  const nodeInputs = normalizeNodeInputs(n.inputs)
   const base = {
     id: asTrimmed(n.id) || `node-${index + 1}`,
     name: asTrimmed(n.name),
     position: normalizePosition(n.position),
     disabled: normalizeBoolean(n.disabled, false),
-    ...normalizeNodeErrorFields(n)
+    ...normalizeNodeErrorFields(n),
+    ...(nodeInputs ? { inputs: nodeInputs } : {})
   }
   const config = record(n.config)
   switch (kind) {

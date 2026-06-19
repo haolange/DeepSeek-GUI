@@ -232,6 +232,8 @@ function stringifyValue(value: unknown): string {
 
 /** Cross-node / variable scope available to {{ }} expressions during a run. */
 export type InterpScope = {
+  /** This node's resolved typed inputs, exposed as {{$input.key}}. */
+  input?: Record<string, unknown>
   /** nodeId -> that node's output payload (only completed, reachable nodes). */
   nodes?: Record<string, WorkflowPayload>
   /** workflow env vars, exposed as {{$env.key}}. */
@@ -254,6 +256,14 @@ function resolveExpr(payload: WorkflowPayload, expr: string, scope?: InterpScope
     if (!sub || sub === 'json') return np.json
     if (sub === 'text') return np.text
     return getByPath(np.json, sub.replace(/^json\.?/, ''))
+  }
+  if (t.startsWith('$input.')) {
+    const rest = t.slice('$input.'.length)
+    const dot = rest.indexOf('.')
+    const key = dot === -1 ? rest : rest.slice(0, dot)
+    const sub = dot === -1 ? '' : rest.slice(dot + 1)
+    const base = scope?.input?.[key]
+    return sub ? getByPath(base, sub) : base
   }
   if (t.startsWith('$env.')) return scope?.env?.[t.slice('$env.'.length)]
   if (t.startsWith('$run.')) {
@@ -729,6 +739,51 @@ function collectSecretValues(settings: AppSettingsV1): string[] {
     }
   }
   return values
+}
+
+/** Coerce a resolved node-input value to its declared type. */
+function coerceNodeInputValue(type: 'text' | 'number' | 'boolean' | 'json', raw: unknown): unknown {
+  switch (type) {
+    case 'number': {
+      const n = typeof raw === 'number' ? raw : Number(String(raw ?? '').trim())
+      return Number.isFinite(n) ? n : 0
+    }
+    case 'boolean':
+      return raw === true || raw === 'true' || raw === 1 || raw === '1'
+    case 'json': {
+      if (raw && typeof raw === 'object') return raw
+      try {
+        return JSON.parse(String(raw ?? ''))
+      } catch {
+        return raw ?? null
+      }
+    }
+    default:
+      return typeof raw === 'string' ? raw : raw == null ? '' : safeJson(raw)
+  }
+}
+
+/**
+ * Resolve a node's typed inputs (bound to upstream output) into a {{$input.key}}
+ * lookup. A single `{{ expr }}` source yields the raw value (object/number/…);
+ * anything else is interpolated as a string. Returns undefined when no inputs.
+ */
+function resolveNodeInputs(
+  node: WorkflowNodeV1,
+  payload: WorkflowPayload,
+  scope: InterpScope
+): Record<string, unknown> | undefined {
+  const bindings = node.inputs
+  if (!bindings || bindings.length === 0) return undefined
+  const out: Record<string, unknown> = {}
+  for (const binding of bindings) {
+    const key = binding.key.trim()
+    if (!key) continue
+    const single = binding.source.trim().match(/^\{\{([^}]+)\}\}$/)
+    const raw = single ? resolveExpr(payload, single[1], scope) : interpolate(binding.source, payload, scope)
+    out[key] = coerceNodeInputValue(binding.type, raw)
+  }
+  return out
 }
 
 /** Coerce a workflow's env vars into a {{$env.key}} lookup (secrets are plain values here). */
@@ -1591,6 +1646,8 @@ export class WorkflowRuntime {
           // Retry, then apply onError: 'fail' (default) stops the run; 'continue'/'fallback' resume.
           while (true) {
             try {
+              const baseScope = scopeFor()
+              const nodeInputs = resolveNodeInputs(node, primary, baseScope)
               produced = await this.executeNode(
                 node,
                 primary,
@@ -1598,7 +1655,7 @@ export class WorkflowRuntime {
                 inputs.length ? inputs : [primary],
                 ctx.depth,
                 runWorkspace,
-                scopeFor(),
+                nodeInputs ? { ...baseScope, input: nodeInputs } : baseScope,
                 runVars,
                 ctx.statusWorkflowId && ctx.runId
                   ? { workflowId: ctx.statusWorkflowId, runId: ctx.runId }

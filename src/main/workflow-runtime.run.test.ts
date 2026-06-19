@@ -756,6 +756,43 @@ describe('WorkflowRuntime end-to-end execution', () => {
     runtime.stop()
   }, 15_000)
 
+  it('resolves typed node inputs from upstream and exposes them as {{$input.key}}', async () => {
+    const workflow = buildWorkflow({
+      id: 'wf-in',
+      name: 'Inputs',
+      enabled: true,
+      nodes: [
+        { id: 'm', type: 'manual-trigger', config: {} },
+        { id: 'c', type: 'code', config: { code: "return { title: 'hello', n: 7 }" } },
+        {
+          id: 'tpl',
+          type: 'template',
+          inputs: [
+            { key: 't', type: 'text', source: '{{$nodes.c.json.title}}' },
+            { key: 'num', type: 'number', source: '{{$nodes.c.json.n}}' }
+          ],
+          config: { template: '{{$input.t}}-{{$input.num}}', outputMode: 'text' }
+        }
+      ],
+      connections: [
+        { id: 'e1', source: 'm', sourceHandle: 'out', target: 'c', targetHandle: 'in' },
+        { id: 'e2', source: 'c', sourceHandle: 'out', target: 'tpl', targetHandle: 'in' }
+      ]
+    })
+    const store = createStore(settingsWithWorkflows([workflow]))
+    const runtime = createWorkflowRuntime({ store: store as never, runtimeRequest: vi.fn() as never, logError: vi.fn() })
+    const runId = requireOk(await runtime.runWorkflow('wf-in'))
+    await waitFor(async () => {
+      const run = store.read().workflow.workflows[0].runs.find((entry) => entry.id === runId)
+      return Boolean(run && run.status !== 'running')
+    }, 10_000)
+    const run = store.read().workflow.workflows[0].runs.find((entry) => entry.id === runId)!
+    expect(run.status).toBe('success')
+    const tpl = run.nodeResults.find((result) => result.nodeId === 'tpl')!
+    expect(JSON.parse(tpl.outputJson).text).toBe('hello-7')
+    runtime.stop()
+  }, 15_000)
+
   it('sort orders the upstream array by a numeric field', async () => {
     const store = createStore(
       settingsWithWorkflows([

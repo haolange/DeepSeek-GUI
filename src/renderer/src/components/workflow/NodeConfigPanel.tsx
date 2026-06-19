@@ -5,6 +5,7 @@ import { ModelPicker } from './ModelPicker'
 import {
   SCHEDULE_REASONING_EFFORT_IDS,
   WORKFLOW_INPUT_FIELD_TYPES,
+  WORKFLOW_NODE_INPUT_TYPES,
   getModelProviderSettings,
   type AppSettingsV1,
   type WorkflowCodeCheckResult,
@@ -14,6 +15,8 @@ import {
   type WorkflowInputFieldType,
   type WorkflowInputFieldV1,
   type WorkflowNodeErrorMode,
+  type WorkflowNodeInputType,
+  type WorkflowNodeInputV1,
   type WorkflowNodeRunResultV1,
   type WorkflowNodeV1,
   type WorkflowTriggerScheduleKind,
@@ -192,6 +195,80 @@ function OptionsInput({ options, onCommit }: { options: string[]; onCommit: (nex
   )
 }
 
+/** Per-node typed inputs bound to upstream output (dify-style). Referenced in the node as {{$input.key}}. */
+function InputBindingsEditor({
+  node,
+  onChange
+}: {
+  node: WorkflowNodeV1
+  onChange: (node: WorkflowNodeV1) => void
+}): ReactElement {
+  const { t } = useTranslation('common')
+  const inputs = node.inputs ?? []
+  const setInputs = (next: WorkflowNodeInputV1[]): void =>
+    onChange({ ...node, inputs: next.length > 0 ? next : undefined })
+  return (
+    <div className="flex flex-col gap-2 border-t border-ds-border pt-3">
+      <div className="flex items-center justify-between">
+        <span className="text-[12px] font-medium text-ds-muted">{t('workflowNodeInputs')}</span>
+        <button
+          type="button"
+          onClick={() => setInputs([...inputs, { key: `in${inputs.length + 1}`, type: 'text', source: '' }])}
+          className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11.5px] font-medium text-accent transition hover:bg-accent/10"
+        >
+          <Plus className="h-3 w-3" strokeWidth={2} />
+          {t('workflowNodeInputAdd')}
+        </button>
+      </div>
+      {inputs.length === 0 ? (
+        <p className="text-[11px] leading-4 text-ds-faint">{t('workflowNodeInputsHint')}</p>
+      ) : (
+        inputs.map((input, index) => {
+          const update = (patch: Partial<WorkflowNodeInputV1>): void =>
+            setInputs(inputs.map((item, i) => (i === index ? { ...item, ...patch } : item)))
+          return (
+            <div key={index} className="flex flex-col gap-2 rounded-lg border border-ds-border p-2.5">
+              <div className="flex items-center gap-2">
+                <input
+                  className={INPUT_CLASS}
+                  value={input.key}
+                  placeholder={t('workflowNodeInputKey')}
+                  onChange={(event) => update({ key: event.target.value })}
+                />
+                <select
+                  className={`${INPUT_CLASS} w-24 shrink-0`}
+                  value={input.type}
+                  onChange={(event) => update({ type: event.target.value as WorkflowNodeInputType })}
+                >
+                  {WORKFLOW_NODE_INPUT_TYPES.map((inputType) => (
+                    <option key={inputType} value={inputType}>
+                      {t(`workflowInputType_${inputType}`)}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  onClick={() => setInputs(inputs.filter((_, i) => i !== index))}
+                  className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-ds-faint transition hover:bg-red-500/10 hover:text-red-600"
+                  aria-label={t('workflowNodeInputRemove')}
+                >
+                  <X className="h-3.5 w-3.5" strokeWidth={2} />
+                </button>
+              </div>
+              <input
+                className={`${INPUT_CLASS} font-mono text-[12px]`}
+                value={input.source}
+                placeholder="{{$nodes.…json.字段}} / {{text}}"
+                onChange={(event) => update({ source: event.target.value })}
+              />
+            </div>
+          )
+        })
+      )}
+    </div>
+  )
+}
+
 /** Reusable typed-field editor — shared by the manual trigger's input schema and the Parameter Extractor. */
 function InputFieldsEditor({
   fields,
@@ -312,6 +389,9 @@ function VariablePicker({
         </button>
         <button type="button" className={row} onClick={() => onInsert('{{json.}}')}>
           <span className="font-mono text-accent">{'{{json.…}}'}</span>
+        </button>
+        <button type="button" className={row} onClick={() => onInsert('{{$input.}}')}>
+          <span className="font-mono text-accent">{'{{$input.…}}'}</span>
         </button>
         <button type="button" className={row} onClick={() => onInsert('{{$env.}}')}>
           <span className="font-mono text-accent">{'{{$env.…}}'}</span>
@@ -507,6 +587,8 @@ export function NodeConfigPanel({
             onChange={(event) => onChange({ ...node, name: event.target.value })}
           />
         </Field>
+
+        {!node.type.endsWith('-trigger') ? <InputBindingsEditor node={node} onChange={onChange} /> : null}
 
         {node.type === 'manual-trigger' || node.type === 'schedule-trigger' || node.type === 'webhook-trigger' ? (
           <Field label={t('workflowTriggerWorkspace')}>

@@ -907,7 +907,19 @@ const workflowNodeBaseShape = {
   onError: z.enum(['fail', 'continue', 'fallback']).optional(),
   retries: z.number().int().min(0).max(10).optional(),
   retryDelayMs: z.number().int().min(0).max(600_000).optional(),
-  fallbackJson: z.string().max(MAX_BODY_BYTES).optional()
+  fallbackJson: z.string().max(MAX_BODY_BYTES).optional(),
+  inputs: z
+    .array(
+      z
+        .object({
+          key: z.string().max(128),
+          type: z.enum(['text', 'number', 'boolean', 'json']),
+          source: z.string().max(4_000)
+        })
+        .strict()
+    )
+    .max(30)
+    .optional()
 }
 
 const workflowInputFieldSchema = z

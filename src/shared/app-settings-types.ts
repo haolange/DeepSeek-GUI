@@ -626,6 +626,21 @@ export type WorkflowHttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
 export const WORKFLOW_INPUT_FIELD_TYPES = ['text', 'paragraph', 'number', 'boolean', 'select', 'json'] as const
 export type WorkflowInputFieldType = (typeof WORKFLOW_INPUT_FIELD_TYPES)[number]
 
+/** Types offered for a node's typed inputs (subset of the field types — no select/paragraph). */
+export const WORKFLOW_NODE_INPUT_TYPES = ['text', 'number', 'boolean', 'json'] as const
+export type WorkflowNodeInputType = (typeof WORKFLOW_NODE_INPUT_TYPES)[number]
+
+/**
+ * A named, typed input a node pulls from an upstream node's output (dify-style).
+ * `source` is an expression ({{$nodes.<id>.json.path}} / {{text}} / {{json.x}});
+ * the resolved + coerced value is exposed to the node as {{$input.key}}.
+ */
+export type WorkflowNodeInputV1 = {
+  key: string
+  type: WorkflowNodeInputType
+  source: string
+}
+
 /**
  * One typed input the caller supplies when starting a workflow. Drives the
  * "Run once" form, validates the /workflow/run + run_workflow input, and lifts
@@ -989,6 +1004,8 @@ export type WorkflowNodeV1 = {
     retryDelayMs?: number
     /** For onError = 'fallback': JSON the node emits instead of failing. */
     fallbackJson?: string
+    /** Named, typed inputs pulled from upstream output; resolved before the node runs as {{$input.key}}. */
+    inputs?: WorkflowNodeInputV1[]
     config: WorkflowNodeConfigByKind[K]
   }
 }[WorkflowNodeKind]
