@@ -1,12 +1,13 @@
 import type { ReactElement } from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Bot, Download, Pencil, Play, Plus, Power, Trash2, Upload, Workflow as WorkflowIcon } from 'lucide-react'
+import { Bot, Download, Pencil, Play, Plus, Power, Trash2, Upload, Workflow as WorkflowIcon, X } from 'lucide-react'
 import {
   mergeWorkflowSettings,
   normalizeWorkflowSettings,
   type AppSettingsV1,
   type WorkflowCustomModuleV1,
+  type WorkflowInputFieldV1,
   type WorkflowNodePresetV1,
   type WorkflowNodeRunResultV1,
   type WorkflowNodeV1,
@@ -50,6 +51,7 @@ export function WorkflowView({ leftSidebarCollapsed, onToggleLeftSidebar }: Prop
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [editingId, setEditingId] = useState<string | null>(null)
+  const [runInputTarget, setRunInputTarget] = useState<WorkflowV1 | null>(null)
 
   const refreshStatus = useCallback(async (): Promise<void> => {
     if (typeof window.kunGui?.getWorkflowStatus !== 'function') return
@@ -206,9 +208,9 @@ export function WorkflowView({ leftSidebarCollapsed, onToggleLeftSidebar }: Prop
   )
 
   const handleRun = useCallback(
-    async (id: string): Promise<void> => {
+    async (id: string, input?: Record<string, unknown>): Promise<void> => {
       if (typeof window.kunGui?.runWorkflow !== 'function') return
-      const result = await window.kunGui.runWorkflow(id)
+      const result = await window.kunGui.runWorkflow(id, input)
       if (!result.ok) {
         setError(result.message)
         return
@@ -217,6 +219,17 @@ export function WorkflowView({ leftSidebarCollapsed, onToggleLeftSidebar }: Prop
       void refreshStatus()
     },
     [refreshStatus]
+  )
+
+  // When a workflow's manual trigger defines a typed input schema, collect values first.
+  const requestRun = useCallback(
+    (workflow: WorkflowV1): void => {
+      const trigger = workflow.nodes.find((node) => node.type === 'manual-trigger')
+      const schema = trigger && trigger.type === 'manual-trigger' ? trigger.config.inputSchema ?? [] : []
+      if (schema.length > 0) setRunInputTarget(workflow)
+      else void handleRun(workflow.id)
+    },
+    [handleRun]
   )
 
   const handleStop = useCallback(
@@ -271,24 +284,37 @@ export function WorkflowView({ leftSidebarCollapsed, onToggleLeftSidebar }: Prop
       for (const result of lastRun.nodeResults) lastResults[result.nodeId] = result
     }
     return (
-      <WorkflowEditorView
-        key={editingWorkflow.id}
-        workflow={editingWorkflow}
-        settings={settings}
-        runStatus={status?.nodeStatus[editingWorkflow.id] ?? {}}
-        lastResults={lastResults}
-        running={runningIds.has(editingWorkflow.id)}
-        onPersist={handleEditorPersist}
-        onRun={() => handleRun(editingWorkflow.id)}
-        onRunNode={(nodeId) => handleRunNode(editingWorkflow.id, nodeId)}
-        onStop={() => handleStop(editingWorkflow.id)}
-        onBack={() => setEditingId(null)}
-        presets={presets}
-        onSavePreset={handleSavePreset}
-        onDeletePreset={handleDeletePreset}
-        modules={modules}
-        onSaveModules={handleSaveModules}
-      />
+      <>
+        <WorkflowEditorView
+          key={editingWorkflow.id}
+          workflow={editingWorkflow}
+          settings={settings}
+          runStatus={status?.nodeStatus[editingWorkflow.id] ?? {}}
+          lastResults={lastResults}
+          running={runningIds.has(editingWorkflow.id)}
+          onPersist={handleEditorPersist}
+          onRun={() => requestRun(editingWorkflow)}
+          onRunNode={(nodeId) => handleRunNode(editingWorkflow.id, nodeId)}
+          onStop={() => handleStop(editingWorkflow.id)}
+          onBack={() => setEditingId(null)}
+          presets={presets}
+          onSavePreset={handleSavePreset}
+          onDeletePreset={handleDeletePreset}
+          modules={modules}
+          onSaveModules={handleSaveModules}
+        />
+        {runInputTarget ? (
+          <RunInputDialog
+            workflow={runInputTarget}
+            onClose={() => setRunInputTarget(null)}
+            onRun={(input) => {
+              const id = runInputTarget.id
+              setRunInputTarget(null)
+              void handleRun(id, input)
+            }}
+          />
+        ) : null}
+      </>
     )
   }
 
@@ -418,7 +444,7 @@ export function WorkflowView({ leftSidebarCollapsed, onToggleLeftSidebar }: Prop
                         </button>
                         <button
                           type="button"
-                          onClick={() => (running ? void handleStop(workflow.id) : void handleRun(workflow.id))}
+                          onClick={() => (running ? void handleStop(workflow.id) : requestRun(workflow))}
                           className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-ds-border bg-ds-card px-3 text-[12.5px] font-medium text-ds-ink transition hover:bg-ds-hover"
                         >
                           <Play className="h-3.5 w-3.5" strokeWidth={1.9} />
@@ -468,6 +494,130 @@ export function WorkflowView({ leftSidebarCollapsed, onToggleLeftSidebar }: Prop
           )}
         </div>
       </main>
+
+      {runInputTarget ? (
+        <RunInputDialog
+          workflow={runInputTarget}
+          onClose={() => setRunInputTarget(null)}
+          onRun={(input) => {
+            const id = runInputTarget.id
+            setRunInputTarget(null)
+            void handleRun(id, input)
+          }}
+        />
+      ) : null}
+    </div>
+  )
+}
+
+const RUN_INPUT_FIELD =
+  'w-full rounded-lg border border-ds-border bg-ds-card px-3 py-2 text-[13px] text-ds-ink outline-none focus:border-accent/40 focus:ring-1 focus:ring-accent/25'
+
+/** Generated form that collects a manual trigger's typed inputs before a one-off run. */
+function RunInputDialog({
+  workflow,
+  onRun,
+  onClose
+}: {
+  workflow: WorkflowV1
+  onRun: (input: Record<string, unknown>) => void
+  onClose: () => void
+}): ReactElement {
+  const { t } = useTranslation('common')
+  const trigger = workflow.nodes.find((node) => node.type === 'manual-trigger')
+  const schema: WorkflowInputFieldV1[] = trigger && trigger.type === 'manual-trigger' ? trigger.config.inputSchema ?? [] : []
+  const [values, setValues] = useState<Record<string, unknown>>(() => {
+    const initial: Record<string, unknown> = {}
+    for (const field of schema) initial[field.key] = field.type === 'boolean' ? field.defaultValue === 'true' : field.defaultValue
+    return initial
+  })
+  const set = (key: string, value: unknown): void => setValues((prev) => ({ ...prev, [key]: value }))
+  const missing = schema.some((field) => {
+    if (!field.required) return false
+    const value = values[field.key]
+    return value === undefined || value === null || (typeof value === 'string' && value.trim() === '')
+  })
+
+  return (
+    <div className="ds-no-drag fixed inset-0 z-[60] flex items-center justify-center bg-black/40 p-6" onClick={onClose}>
+      <div
+        className="flex max-h-[80vh] w-[460px] flex-col overflow-hidden rounded-2xl border border-ds-border bg-ds-bg shadow-xl"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <header className="flex items-center justify-between border-b border-ds-border px-5 py-3.5">
+          <span className="text-[14px] font-semibold text-ds-ink">{t('workflowRunWithInputs')}</span>
+          <button
+            type="button"
+            onClick={onClose}
+            className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-ds-faint transition hover:bg-ds-hover hover:text-ds-ink"
+          >
+            <X className="h-4 w-4" strokeWidth={1.8} />
+          </button>
+        </header>
+        <div className="flex flex-col gap-3 overflow-y-auto px-5 py-4">
+          {schema.map((field) => (
+            <label key={field.key} className="flex flex-col gap-1.5">
+              <span className="text-[12px] font-medium text-ds-muted">
+                {field.label.trim() || field.key}
+                {field.required ? <span className="ml-1 text-red-500">*</span> : null}
+              </span>
+              {field.description ? <span className="text-[11px] text-ds-faint">{field.description}</span> : null}
+              {field.type === 'boolean' ? (
+                <input
+                  type="checkbox"
+                  className="h-4 w-4 self-start"
+                  checked={Boolean(values[field.key])}
+                  onChange={(event) => set(field.key, event.target.checked)}
+                />
+              ) : field.type === 'paragraph' || field.type === 'json' ? (
+                <textarea
+                  className={`${RUN_INPUT_FIELD} min-h-[80px] resize-y ${field.type === 'json' ? 'font-mono text-[12px]' : ''}`}
+                  value={String(values[field.key] ?? '')}
+                  onChange={(event) => set(field.key, event.target.value)}
+                />
+              ) : field.type === 'select' ? (
+                <select
+                  className={RUN_INPUT_FIELD}
+                  value={String(values[field.key] ?? '')}
+                  onChange={(event) => set(field.key, event.target.value)}
+                >
+                  <option value="" />
+                  {field.options.map((option) => (
+                    <option key={option} value={option}>
+                      {option}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <input
+                  type={field.type === 'number' ? 'number' : 'text'}
+                  className={RUN_INPUT_FIELD}
+                  value={String(values[field.key] ?? '')}
+                  onChange={(event) => set(field.key, event.target.value)}
+                />
+              )}
+            </label>
+          ))}
+        </div>
+        <footer className="flex justify-end gap-2 border-t border-ds-border px-5 py-3">
+          <button
+            type="button"
+            onClick={onClose}
+            className="inline-flex items-center rounded-xl border border-ds-border bg-ds-card px-4 py-2 text-[13px] font-medium text-ds-muted transition hover:bg-ds-hover"
+          >
+            {t('cancel')}
+          </button>
+          <button
+            type="button"
+            disabled={missing}
+            onClick={() => onRun(values)}
+            className="inline-flex items-center gap-2 rounded-xl bg-ds-userbubble px-4 py-2 text-[13px] font-semibold text-ds-userbubbleFg shadow-sm transition hover:opacity-90 disabled:opacity-50"
+          >
+            <Play className="h-4 w-4" strokeWidth={2} />
+            {t('workflowRunNow')}
+          </button>
+        </footer>
+      </div>
     </div>
   )
 }

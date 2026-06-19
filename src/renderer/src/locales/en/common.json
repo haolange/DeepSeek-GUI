@@ -256,6 +256,7 @@
   "workflowTestMock": "Mock upstream input (JSON)",
   "workflowTestMockHint": "Used as this node's input payload. The Create Loop is saved first, then just this node runs.",
   "workflowTestRun": "Run test",
+  "workflowRunWithInputs": "Run inputs",
   "workflowScheduleKind": "Trigger type",
   "workflowScheduleKind_manual": "Manual",
   "workflowScheduleKind_interval": "Interval",
