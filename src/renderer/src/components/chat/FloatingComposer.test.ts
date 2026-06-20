@@ -27,7 +27,10 @@ import {
   filterComposerModelIds,
   normalizeComposerReasoningEffort
 } from './FloatingComposerModelPicker'
-import { FloatingComposerExecutionPicker } from './FloatingComposerExecutionPicker'
+import {
+  FloatingComposerExecutionPicker,
+  calculateExecutionMenuPlacement
+} from './FloatingComposerExecutionPicker'
 import { getGoalPanelDraftObjective } from './floating-composer-commands'
 import { useChatStore } from '../../store/chat-store'
 import i18n from '../../i18n'
@@ -306,6 +309,20 @@ describe('FloatingComposer model controls', () => {
 
     expect(placement.left).toBe(712)
     expect(placement.top).toBe(633)
+  })
+
+  it('keeps execution menus anchored when the app UI is zoomed', () => {
+    const placement = calculateExecutionMenuPlacement({
+      anchorRect: { top: 624, left: 240, bottom: 648, width: 96 },
+      menuWidth: 184,
+      menuHeight: 190,
+      viewportHeight: 720,
+      viewportWidth: 800,
+      coordinateScale: 0.8
+    })
+
+    expect(placement.left).toBe(268)
+    expect(placement.top).toBe(582)
   })
 
   it('places the model submenu beside the active provider row', () => {

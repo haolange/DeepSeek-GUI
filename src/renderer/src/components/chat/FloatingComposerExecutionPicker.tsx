@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type CSSProperties, type ReactElement } from 'react'
+import { useCallback, useEffect, useRef, useState, type CSSProperties, type ReactElement } from 'react'
 import { createPortal } from 'react-dom'
 import { Check, ChevronDown, ShieldAlert, ShieldCheck } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
@@ -25,6 +25,21 @@ type SandboxOption = {
   value: SandboxMode
   labelKey: string
 }
+
+type ExecutionMenuAnchorRect = Pick<DOMRect, 'bottom' | 'left' | 'top' | 'width'>
+
+type ExecutionMenuPlacement = {
+  left: number
+  top: number
+  width: number
+}
+
+const EXECUTION_MENU_MARGIN = 12
+const EXECUTION_MENU_GAP = 8
+const APPROVAL_MENU_WIDTH = 156
+const SANDBOX_MENU_WIDTH = 184
+const APPROVAL_MENU_ESTIMATED_HEIGHT = 228
+const SANDBOX_MENU_ESTIMATED_HEIGHT = 190
 
 const APPROVAL_OPTIONS: ApprovalOption[] = [
   { value: 'auto', labelKey: 'approvalAutoShort' },
@@ -66,22 +81,22 @@ export function FloatingComposerExecutionPicker({
   const SandboxIcon = fullAccess ? ShieldAlert : ShieldCheck
   const title = `${t('composerApprovalShort')}: ${t(approvalLabelKey(value.approvalPolicy))} / ${t('composerAccessShort')}: ${t(sandboxLabelKey(value.sandboxMode))}`
 
-  const updateMenuPosition = (menu: 'approval' | 'sandbox' = openMenu ?? 'approval'): void => {
+  const updateMenuPosition = useCallback((menu: 'approval' | 'sandbox' = openMenu ?? 'approval'): void => {
     const button = menu === 'approval' ? approvalButtonRef.current : sandboxButtonRef.current
     const rect = button?.getBoundingClientRect()
     if (!rect) return
-    const menuWidth = menu === 'approval' ? 156 : 184
-    const estimatedMenuHeight = menu === 'approval' ? 228 : 190
+    const menuWidth = executionMenuWidth(menu)
+    const estimatedMenuHeight = executionMenuEstimatedHeight(menu)
     const menuHeight = menuRef.current?.offsetHeight ?? estimatedMenuHeight
-    const anchorLeft = rect.left + (rect.width / 2) - (menuWidth / 2)
-    const topAbove = rect.top - menuHeight - 8
-    const top = topAbove >= 12 ? topAbove : rect.bottom + 8
-    setMenuStyle({
-      top: Math.min(Math.max(12, top), Math.max(12, window.innerHeight - menuHeight - 12)),
-      left: Math.min(Math.max(12, anchorLeft), Math.max(12, window.innerWidth - menuWidth - 12)),
-      width: menuWidth
-    })
-  }
+    setMenuStyle(calculateExecutionMenuPlacement({
+      anchorRect: rect,
+      menuWidth,
+      menuHeight,
+      viewportHeight: window.innerHeight,
+      viewportWidth: window.innerWidth,
+      coordinateScale: currentBodyZoom()
+    }))
+  }, [openMenu])
 
   useEffect(() => {
     if (!openMenu) return
@@ -103,7 +118,7 @@ export function FloatingComposerExecutionPicker({
       window.removeEventListener('resize', onUpdatePosition)
       window.removeEventListener('scroll', onUpdatePosition, true)
     }
-  }, [openMenu])
+  }, [openMenu, updateMenuPosition])
 
   const update = (patch: Partial<ComposerExecutionSettings>): void => {
     onChange(patch)
@@ -222,4 +237,68 @@ function ExecutionRow({
       {selected ? <Check className="h-3.5 w-3.5 shrink-0" strokeWidth={2} /> : null}
     </button>
   )
+}
+
+export function calculateExecutionMenuPlacement({
+  anchorRect,
+  menuWidth,
+  menuHeight,
+  viewportHeight,
+  viewportWidth,
+  coordinateScale = 1
+}: {
+  anchorRect: ExecutionMenuAnchorRect
+  menuWidth: number
+  menuHeight: number
+  viewportHeight: number
+  viewportWidth: number
+  coordinateScale?: number
+}): ExecutionMenuPlacement {
+  const scale = Number.isFinite(coordinateScale) && coordinateScale > 0 ? coordinateScale : 1
+  const normalizedAnchorRect = {
+    bottom: anchorRect.bottom / scale,
+    left: anchorRect.left / scale,
+    top: anchorRect.top / scale,
+    width: anchorRect.width / scale
+  }
+  const normalizedViewportHeight = viewportHeight / scale
+  const normalizedViewportWidth = viewportWidth / scale
+  const anchorLeft = normalizedAnchorRect.left + (normalizedAnchorRect.width / 2) - (menuWidth / 2)
+  const topAbove = normalizedAnchorRect.top - menuHeight - EXECUTION_MENU_GAP
+  const top = topAbove >= EXECUTION_MENU_MARGIN
+    ? topAbove
+    : normalizedAnchorRect.bottom + EXECUTION_MENU_GAP
+
+  return {
+    top: executionMenuClamp(
+      top,
+      EXECUTION_MENU_MARGIN,
+      Math.max(EXECUTION_MENU_MARGIN, normalizedViewportHeight - menuHeight - EXECUTION_MENU_MARGIN)
+    ),
+    left: executionMenuClamp(
+      anchorLeft,
+      EXECUTION_MENU_MARGIN,
+      Math.max(EXECUTION_MENU_MARGIN, normalizedViewportWidth - menuWidth - EXECUTION_MENU_MARGIN)
+    ),
+    width: menuWidth
+  }
+}
+
+export function executionMenuWidth(menu: 'approval' | 'sandbox'): number {
+  return menu === 'approval' ? APPROVAL_MENU_WIDTH : SANDBOX_MENU_WIDTH
+}
+
+export function executionMenuEstimatedHeight(menu: 'approval' | 'sandbox'): number {
+  return menu === 'approval' ? APPROVAL_MENU_ESTIMATED_HEIGHT : SANDBOX_MENU_ESTIMATED_HEIGHT
+}
+
+function currentBodyZoom(): number {
+  if (typeof window === 'undefined') return 1
+  const zoom = window.getComputedStyle(document.body).zoom
+  const parsed = Number.parseFloat(zoom)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1
+}
+
+function executionMenuClamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max)
 }
