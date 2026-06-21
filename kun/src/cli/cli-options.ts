@@ -10,7 +10,9 @@ import {
   DEFAULT_KUN_MODEL,
   DEFAULT_STORAGE_CONFIG,
   ModelConfigSchema,
+  QualityConfigSchema,
   RuntimeTuningConfigSchema,
+  ServeProviderConfigSchema,
   StorageConfigSchema,
   TokenEconomyConfigSchema
 } from '../config/kun-config.js'
@@ -18,6 +20,12 @@ import {
   DEFAULT_KUN_CAPABILITIES_CONFIG,
   KunCapabilitiesConfig
 } from '../contracts/capabilities.js'
+import {
+  DEFAULT_MODEL_ENDPOINT_FORMAT,
+  MODEL_ENDPOINT_FORMATS,
+  normalizeModelEndpointFormat
+} from '../contracts/model-endpoint-format.js'
+import { HooksConfigSchema } from '../hooks/hook-config.js'
 
 export const DEFAULT_SERVE_PORT = 8899
 export const DEFAULT_SERVE_MODEL = DEFAULT_KUN_MODEL
@@ -38,6 +46,8 @@ export const ServeOptionsSchema = z.object({
   runtimeToken: z.string().default(''),
   apiKey: z.string().default(''),
   baseUrl: z.string().default('https://api.deepseek.com/beta'),
+  modelProxyUrl: z.string().default(''),
+  endpointFormat: z.preprocess(normalizeModelEndpointFormat, z.enum(MODEL_ENDPOINT_FORMATS)).default(DEFAULT_MODEL_ENDPOINT_FORMAT),
   model: z.string().default(DEFAULT_SERVE_MODEL),
   approvalPolicy: ApprovalPolicySchema.default(DEFAULT_APPROVAL_POLICY),
   sandboxMode: SandboxModeSchema.default(DEFAULT_SANDBOX_MODE),
@@ -45,10 +55,13 @@ export const ServeOptionsSchema = z.object({
   tokenEconomy: TokenEconomyConfigSchema.optional(),
   insecure: z.boolean().default(false),
   storage: StorageConfigSchema.default(DEFAULT_STORAGE_CONFIG),
+  providers: z.record(z.string().min(1), ServeProviderConfigSchema).optional(),
   models: ModelConfigSchema.optional(),
   contextCompaction: ContextCompactionConfigSchema.optional(),
   runtime: RuntimeTuningConfigSchema.optional(),
-  capabilities: KunCapabilitiesConfig.default(DEFAULT_KUN_CAPABILITIES_CONFIG)
+  capabilities: KunCapabilitiesConfig.default(DEFAULT_KUN_CAPABILITIES_CONFIG),
+  hooks: HooksConfigSchema.optional(),
+  quality: QualityConfigSchema.optional()
 })
 export type ServeOptions = z.infer<typeof ServeOptionsSchema>
 
@@ -59,6 +72,8 @@ export const DEFAULT_SERVE_OPTIONS: ServeOptions = {
   runtimeToken: '',
   apiKey: '',
   baseUrl: 'https://api.deepseek.com/beta',
+  modelProxyUrl: '',
+  endpointFormat: DEFAULT_MODEL_ENDPOINT_FORMAT,
   model: DEFAULT_SERVE_MODEL,
   approvalPolicy: DEFAULT_APPROVAL_POLICY,
   sandboxMode: DEFAULT_SANDBOX_MODE,

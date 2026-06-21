@@ -5,6 +5,8 @@ import { z } from 'zod'
 type McpLaunchOptions = {
   baseUrl: string
   secret: string
+  workflowBaseUrl: string
+  workflowSecret: string
 }
 
 function parseArgValue(argv: string[], flag: string): string {
@@ -17,11 +19,13 @@ function parseLaunchOptions(argv: string[]): McpLaunchOptions | null {
   if (!argv.includes('--gui-schedule-mcp-server') && !argv.includes('--claw-schedule-mcp-server')) return null
   const baseUrl = parseArgValue(argv, '--base-url').trim() || 'http://127.0.0.1:8787'
   const secret = parseArgValue(argv, '--secret').trim()
-  return { baseUrl, secret }
+  const workflowBaseUrl = parseArgValue(argv, '--workflow-base-url').trim()
+  const workflowSecret = parseArgValue(argv, '--workflow-secret').trim()
+  return { baseUrl, secret, workflowBaseUrl, workflowSecret }
 }
 
 async function postJson(
-  options: McpLaunchOptions,
+  options: { baseUrl: string; secret: string },
   path: string,
   body: Record<string, unknown>
 ): Promise<Record<string, unknown>> {
@@ -71,15 +75,15 @@ export async function runClawScheduleMcpServerFromArgv(argv: string[]): Promise<
   if (!options) return false
 
   const server = new McpServer(
-    { name: 'deepseek-gui-schedule', version: '0.1.0' },
+    { name: 'kun-schedule', version: '0.1.0' },
     { capabilities: { logging: {} } }
   )
 
   const registerListTool = (name: string): void => {
     server.registerTool(name, {
       description: name.startsWith('claw_')
-        ? 'Legacy alias. List scheduled tasks managed by the currently running DeepSeek GUI app.'
-        : 'List scheduled tasks managed by the currently running DeepSeek GUI app.'
+        ? 'Legacy alias. List scheduled tasks managed by the currently running Kun app.'
+        : 'List scheduled tasks managed by the currently running Kun app.'
     }, async () => {
       try {
         const result = await postJson(options, '/schedule/internal/list', {})
@@ -101,8 +105,8 @@ export async function runClawScheduleMcpServerFromArgv(argv: string[]): Promise<
   const registerCreateTool = (name: string): void => {
     server.registerTool(name, {
       description: name.startsWith('claw_')
-        ? 'Legacy alias. Create a scheduled task in DeepSeek GUI. Supports one-time (`at`), daily, or interval schedules.'
-        : 'Create a scheduled task in DeepSeek GUI. Supports one-time (`at`), daily, or interval schedules.',
+        ? 'Legacy alias. Create a scheduled task in Kun. Supports one-time (`at`), daily, or interval schedules.'
+        : 'Create a scheduled task in Kun. Supports one-time (`at`), daily, or interval schedules. When creating from an existing conversation, pass that conversation\'s provider_id, model, and reasoning_effort so the scheduled task keeps the same execution settings.',
       inputSchema: {
         title: z.string().min(1).describe('Short task title shown in the GUI'),
         prompt: z.string().min(1).describe('The prompt/instruction the agent should run at schedule time'),
@@ -111,8 +115,10 @@ export async function runClawScheduleMcpServerFromArgv(argv: string[]): Promise<
         time_of_day: z.string().optional().describe('24h time like 09:00, required when schedule_kind is `daily`'),
         every_minutes: z.number().int().min(1).max(10080).optional().describe('Interval in minutes, required when schedule_kind is `interval`'),
         workspace_root: z.string().optional().describe('Optional workspace directory override'),
-        model: z.string().optional().describe('Optional model id, e.g. auto / deepseek-v4-pro / deepseek-v4-flash'),
-        reasoning_effort: z.enum(['off', 'low', 'medium', 'high', 'max']).optional().describe('Optional reasoning strength'),
+        claw_channel_id: z.string().optional().describe('Optional Claw IM channel id whose persona should run this task'),
+        provider_id: z.string().optional().describe('Optional model provider id configured in Kun settings'),
+        model: z.string().optional().describe('Optional model id, e.g. deepseek-v4-pro / deepseek-v4-flash'),
+        reasoning_effort: z.enum(['auto', 'off', 'low', 'medium', 'high', 'max']).optional().describe('Optional reasoning strength'),
         mode: z.enum(['agent', 'plan']).optional().describe('Execution mode'),
         enabled: z.boolean().optional().describe('Whether the task should be enabled immediately')
       }
@@ -123,6 +129,8 @@ export async function runClawScheduleMcpServerFromArgv(argv: string[]): Promise<
             title: args.title,
             prompt: args.prompt,
             workspaceRoot: args.workspace_root,
+            clawChannelId: args.claw_channel_id,
+            providerId: args.provider_id,
             model: args.model,
             reasoningEffort: args.reasoning_effort,
             mode: args.mode,
@@ -151,16 +159,18 @@ export async function runClawScheduleMcpServerFromArgv(argv: string[]): Promise<
   const registerUpdateTool = (name: string): void => {
     server.registerTool(name, {
       description: name.startsWith('claw_')
-        ? 'Legacy alias. Update an existing DeepSeek GUI scheduled task.'
-        : 'Update an existing DeepSeek GUI scheduled task.',
+        ? 'Legacy alias. Update an existing Kun scheduled task.'
+        : 'Update an existing Kun scheduled task.',
       inputSchema: {
         task_id: z.string().min(1).describe('Task id returned by gui_schedule_list or gui_schedule_create'),
         title: z.string().optional(),
         prompt: z.string().optional(),
         enabled: z.boolean().optional(),
         workspace_root: z.string().optional(),
+        claw_channel_id: z.string().optional(),
+        provider_id: z.string().optional(),
         model: z.string().optional(),
-        reasoning_effort: z.enum(['off', 'low', 'medium', 'high', 'max']).optional(),
+        reasoning_effort: z.enum(['auto', 'off', 'low', 'medium', 'high', 'max']).optional(),
         mode: z.enum(['agent', 'plan']).optional(),
         schedule_kind: z.enum(['manual', 'at', 'daily', 'interval']).optional(),
         at_time: z.string().optional(),
@@ -174,6 +184,8 @@ export async function runClawScheduleMcpServerFromArgv(argv: string[]): Promise<
         if (args.prompt !== undefined) patch.prompt = args.prompt
         if (args.enabled !== undefined) patch.enabled = args.enabled
         if (args.workspace_root !== undefined) patch.workspaceRoot = args.workspace_root
+        if (args.claw_channel_id !== undefined) patch.clawChannelId = args.claw_channel_id
+        if (args.provider_id !== undefined) patch.providerId = args.provider_id
         if (args.model !== undefined) patch.model = args.model
         if (args.reasoning_effort !== undefined) patch.reasoningEffort = args.reasoning_effort
         if (args.mode !== undefined) patch.mode = args.mode
@@ -210,8 +222,8 @@ export async function runClawScheduleMcpServerFromArgv(argv: string[]): Promise<
   const registerDeleteTool = (name: string): void => {
     server.registerTool(name, {
       description: name.startsWith('claw_')
-        ? 'Legacy alias. Delete a scheduled task from DeepSeek GUI.'
-        : 'Delete a scheduled task from DeepSeek GUI.',
+        ? 'Legacy alias. Delete a scheduled task from Kun.'
+        : 'Delete a scheduled task from Kun.',
       inputSchema: {
         task_id: z.string().min(1).describe('Task id returned by gui_schedule_list or gui_schedule_create')
       }
@@ -230,6 +242,92 @@ export async function runClawScheduleMcpServerFromArgv(argv: string[]): Promise<
   // The `gui_plan_create` MCP tool has been retired in favour of the
   // native Kun `create_plan` tool. See RETIRED_CLAW_GUI_PLAN_TOOL_NAMES
   // for the list of removed tool names.
+
+  // Workflow tools — the same bridge exposes the GUI's node-based workflows that
+  // the user marked "callable by agent", by calling the WorkflowRuntime's local
+  // /workflow/internal/* endpoints.
+  if (options.workflowBaseUrl) {
+    const wf = { baseUrl: options.workflowBaseUrl, secret: options.workflowSecret }
+    const RUN_WORKFLOW_BASE_DESC =
+      "Run one of the user's saved \"Create Loop\" workflows by name (or id) and wait for it to finish; returns its final output. When the user's request matches a saved workflow below, prefer running it over doing the steps manually."
+
+    const buildCatalog = (result: Record<string, unknown>): string => {
+      const workflows = Array.isArray(result.workflows) ? result.workflows : []
+      const lines = workflows
+        .map((item: { name?: unknown; description?: unknown }) => {
+          const name = typeof item.name === 'string' ? item.name : ''
+          const desc = typeof item.description === 'string' ? item.description : ''
+          return name ? `- "${name}"${desc ? ` — ${desc}` : ''}` : ''
+        })
+        .filter((line) => line.length > 0)
+      return lines.length
+        ? `\n\nWorkflows the user has saved (run by name; call list_workflows for inputs):\n${lines.join('\n')}`
+        : ''
+    }
+
+    server.registerTool('list_workflows', {
+      description:
+        'List the GUI "Create Loop" workflows the user marked callable by the agent. Returns each workflow id, name, a short description, and its required inputs. Check this whenever a request might be satisfied by a saved workflow.'
+    }, async () => {
+      try {
+        const result = await postJson(wf, '/workflow/internal/list', {})
+        const workflows = Array.isArray(result.workflows) ? result.workflows : []
+        return textResult(
+          workflows.length
+            ? `Found ${workflows.length} callable workflow(s).`
+            : 'No workflows are marked callable by the agent.',
+          { workflows }
+        )
+      } catch (error) {
+        return errorResult(`Failed to list workflows: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    })
+
+    const runWorkflowTool = server.registerTool('run_workflow', {
+      description: RUN_WORKFLOW_BASE_DESC,
+      inputSchema: {
+        workflow: z.string().min(1).describe('Workflow name or id from list_workflows'),
+        input: z.string().optional().describe('Optional input passed to the trigger; available to nodes as {{text}}'),
+        workspace_root: z.string().optional().describe('Optional working directory override for this run')
+      }
+    }, async (args) => {
+      try {
+        const result = await postJson(wf, '/workflow/internal/run', {
+          workflow: args.workflow,
+          input: args.input,
+          workspaceRoot: args.workspace_root
+        })
+        const status = typeof result.status === 'string' ? result.status : 'done'
+        const output = typeof result.output === 'string' ? result.output : ''
+        const message = typeof result.message === 'string' ? result.message : ''
+        return textResult(
+          `Workflow "${args.workflow}" finished (${status}).${message ? ` ${message}` : ''}${output ? `\n\nOutput:\n${output}` : ''}`,
+          { status, output, message }
+        )
+      } catch (error) {
+        return errorResult(`Failed to run workflow: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    })
+
+    // Keep run_workflow's description (the workflow catalog the agent sees) fresh:
+    // without needing a kun restart: re-fetch on an interval and update the tool
+    // only when the list actually changes. update() emits tools/list_changed, so
+    // the agent re-reads the current catalog on its next turn.
+    let lastCatalog = ' '
+    const refreshCatalog = async (): Promise<void> => {
+      try {
+        const catalog = buildCatalog(await postJson(wf, '/workflow/internal/list', {}))
+        if (catalog === lastCatalog) return
+        lastCatalog = catalog
+        runWorkflowTool.update({ description: RUN_WORKFLOW_BASE_DESC + catalog })
+      } catch {
+        /* ignore — list_workflows still works live */
+      }
+    }
+    await refreshCatalog() // seed the catalog before connect so the first tools/list carries it
+    const catalogTimer = setInterval(() => void refreshCatalog(), 30_000)
+    catalogTimer.unref?.()
+  }
 
   const transport = new StdioServerTransport()
   await server.connect(transport)

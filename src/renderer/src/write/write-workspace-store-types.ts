@@ -1,18 +1,26 @@
-import type { WriteInlineCompletionSettingsV1 } from '@shared/app-settings'
+import type { WriteAgentPresetV1, WriteInlineCompletionSettingsV1, WriteSelectionAssistSettingsV1 } from '@shared/app-settings'
 import type { WorkspaceEntry } from '@shared/workspace-file'
 import type { WriteEditorSelectionState } from '../components/write/WriteMarkdownEditor'
 import type { WriteQuotedSelection } from './quoted-selection'
 import type { WriteRecentEdit } from './recent-edits'
 
-export type WritePreviewMode = 'source' | 'live' | 'split' | 'preview'
+export type WritePreviewMode = 'rich' | 'source' | 'live' | 'split' | 'preview'
 export type WriteSaveStatus = 'saved' | 'dirty' | 'saving' | 'error'
-export type WriteActiveFileKind = 'text' | 'image'
+export type WriteActiveFileKind = 'text' | 'image' | 'pdf'
 
 export type WriteWorkspaceState = {
   defaultWorkspaceRoot: string
   workspaceRoots: string[]
   inlineCompletion: WriteInlineCompletionSettingsV1
   inlineCompletionApiReady: boolean
+  /** Selection toolbar AI assists: quick action prompts + infographic prompt. */
+  selectionAssist: WriteSelectionAssistSettingsV1
+  /** Named writing-assistant personas for quick switching. */
+  agentPresets: WriteAgentPresetV1[]
+  /** True when the image generation provider is fully configured (enables 生成信息图). */
+  imageGenReady: boolean
+  /** True when the primary chat provider is configured (enables 生成交互原型). */
+  prototypeReady: boolean
   settingsLoading: boolean
   settingsError: string | null
   workspaceRoot: string
@@ -26,14 +34,24 @@ export type WriteWorkspaceState = {
   fileContent: string
   imageDataUrl: string
   imageMimeType: string
+  pdfDataBase64: string
+  pdfMimeType: string
+  pdfMtimeMs: number
   fileSize: number
   fileTruncated: boolean
   fileError: string | null
   fileLoading: boolean
   saveStatus: WriteSaveStatus
+  /** Set when an agent edited the active file and the change awaits red/green review. */
+  pendingAgentReview: { nextContent: string } | null
+  /** True while an inline diff review (agent edit or AI rewrite) is in progress. */
+  reviewActive: boolean
   previewMode: WritePreviewMode
   assistantOpen: boolean
   assistantModel: string
+  assistantProviderId: string
+  /** Active writing-agent persona preset id ('' = none); applied to assistant sends. */
+  assistantAgentPresetId: string
   selection: WriteEditorSelectionState
   quotedSelections: WriteQuotedSelection[]
   recentEdits: WriteRecentEdit[]
@@ -57,6 +75,8 @@ export type WriteWorkspaceState = {
       message?: string
       animate?: boolean
       force?: boolean
+      /** When true, surface the change as a red/green diff review instead of applying it. */
+      reviewAsDiff?: boolean
     }
   ) => Promise<boolean>
   syncActiveImageFromDisk: (workspaceRoot: string, path?: string) => Promise<boolean>
@@ -68,8 +88,11 @@ export type WriteWorkspaceState = {
   setFileError: (message: string | null) => void
   setPreviewMode: (mode: WritePreviewMode) => void
   setAssistantOpen: (open: boolean) => void
-  setAssistantModel: (model: string) => void
+  setAssistantModel: (model: string, providerId?: string) => void
+  setAssistantAgentPresetId: (id: string) => void
   setSelection: (selection: WriteEditorSelectionState) => void
+  setReviewActive: (active: boolean) => void
+  clearPendingAgentReview: () => void
   recordRecentEdits: (edits: WriteRecentEdit[]) => void
   quoteCurrentSelection: (workspaceRoot: string) => void
   removeQuotedSelection: (id: string) => void

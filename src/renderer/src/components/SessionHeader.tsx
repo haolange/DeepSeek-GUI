@@ -5,7 +5,13 @@ import { useTranslation } from 'react-i18next'
 import { useChatStore } from '../store/chat-store'
 import { formatRelativeTime } from '../lib/format-relative-time'
 import { workspaceLabelFromPath } from '../lib/workspace-label'
-import { formatCompactNumber, formatCost, formatPercent, useThreadUsage } from '../hooks/use-thread-usage'
+import {
+  formatCompactNumber,
+  formatCost,
+  formatPercent,
+  primaryCacheHitRate,
+  useThreadUsage
+} from '../hooks/use-thread-usage'
 
 type Props = {
   compact?: boolean
@@ -27,9 +33,11 @@ export function SessionHeader({ compact = false, className = '' }: Props): React
     : workspaceLabel
   const [editing, setEditing] = useState(false)
   const [draftTitle, setDraftTitle] = useState('')
+  // Usage stats are no longer shown in compact mode (the composer footer
+  // already shows them in the chat route), so skip fetching there.
   const threadUsage = useThreadUsage(
     activeThreadId,
-    runtimeConnection === 'ready',
+    runtimeConnection === 'ready' && !compact,
     `${active?.updatedAt ?? ''}:${busy ? 'busy' : 'idle'}`
   )
   const forkedFromTitle = active?.forkedFromTitle?.trim() ?? ''
@@ -66,7 +74,7 @@ export function SessionHeader({ compact = false, className = '' }: Props): React
   if (compact) {
     return (
       <div
-        className={`session-header-compact ds-no-drag flex min-h-0 min-w-0 flex-1 items-center gap-2 text-left ${className}`}
+        className={`session-header-compact flex min-h-0 min-w-0 flex-1 items-center gap-2 text-left ${className}`}
       >
         {active ? (
           <div className="min-w-0 flex-1">
@@ -100,21 +108,6 @@ export function SessionHeader({ compact = false, className = '' }: Props): React
                   </span>
                 </>
               ) : null}
-              {threadUsage ? (
-                <>
-                  <span className="session-meta-usage-separator opacity-70">·</span>
-                  <span
-                    className="session-meta-usage shrink-0 tabular-nums"
-                    title={t('sessionUsageTitle', { turns: threadUsage.turns })}
-                  >
-                    {t('sessionUsageCompact', {
-                      tokens: formatCompactNumber(threadUsage.totalTokens),
-                      cost: formatCost(threadUsage.costUsd, i18n.language, threadUsage.costCny),
-                      cache: formatPercent(threadUsage.cacheHitRate)
-                    })}
-                  </span>
-                </>
-              ) : null}
             </div>
           </div>
         ) : (
@@ -127,7 +120,7 @@ export function SessionHeader({ compact = false, className = '' }: Props): React
   }
 
   return (
-    <div className={`ds-no-drag flex min-h-[74px] min-w-0 flex-1 items-center gap-4 px-5 py-4 sm:px-6 ${className}`}>
+    <div className={`flex min-h-[74px] min-w-0 flex-1 items-center gap-4 px-5 py-4 sm:px-6 ${className}`}>
       {active ? (
         <>
           <div className="min-w-0 flex-1">
@@ -204,12 +197,19 @@ export function SessionHeader({ compact = false, className = '' }: Props): React
                   </span>
                   <span
                     className="inline-flex items-center rounded-full border border-ds-border bg-ds-card/70 px-2.5 py-1 font-medium text-ds-muted"
-                    title={t('sessionUsageCacheTitle', {
-                      cached: formatCompactNumber(threadUsage.cachedTokens),
-                      miss: formatCompactNumber(threadUsage.cacheMissTokens)
-                    })}
+                    title={t(
+                      threadUsage.lastTurnCacheHitRate != null
+                        ? 'sessionUsageCacheTitleWithLatest'
+                        : 'sessionUsageCacheTitle',
+                      {
+                        cache: formatPercent(threadUsage.cacheHitRate),
+                        latestCache: formatPercent(threadUsage.lastTurnCacheHitRate),
+                        cached: formatCompactNumber(threadUsage.cachedTokens),
+                        miss: formatCompactNumber(threadUsage.cacheMissTokens)
+                      }
+                    )}
                   >
-                    {t('sessionUsageCache', { cache: formatPercent(threadUsage.cacheHitRate) })}
+                    {t('sessionUsageCache', { cache: formatPercent(primaryCacheHitRate(threadUsage)) })}
                   </span>
                 </>
               ) : null}

@@ -3,7 +3,13 @@ import type { NormalizedThread } from '../agent/types'
 import { getProvider } from '../agent/registry'
 import { rendererRuntimeClient } from '../agent/runtime-client'
 import i18n from '../i18n'
-import { applyTheme, applyUiFontScale } from '../lib/apply-theme'
+import {
+  applyCursorSpotlight,
+  applyDocumentLocale,
+  applyTheme,
+  applyUiFontScale,
+  applyWriteTypography
+} from '../lib/apply-theme'
 import { formatWorkspacePickerError } from '../lib/format-workspace-picker-error'
 import { formatRuntimeError, getRuntimeErrorCode } from '../lib/format-runtime-error'
 import {
@@ -38,6 +44,7 @@ import { createSideActions } from './chat-store-side-actions'
 import {
   activeClawChannel,
   compactCodeWorkspaceRoots,
+  fallbackComposerModel,
   forgetCodeWorkspaceRoot,
   hydrateBlockModelLabels,
   isClawThread,
@@ -56,7 +63,6 @@ import {
   collectAssistantTextForTurn,
   findLatestUserBlockId,
   findReusableEmptyThreadId,
-  hasPendingRuntimeWork,
   threadBelongsToWorkspace
 } from './chat-store-runtime-helpers'
 import {
@@ -127,6 +133,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   workspaceRoot: '',
   workspaceLabel: i18n.t('common:workingDirectory'),
   runtimeConnection: 'idle',
+  runtimeStatus: null,
   codeWorkspaceRoots: [],
   threads: [],
   threadSearch: '',
@@ -139,6 +146,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   liveAssistant: '',
   lastSeq: 0,
   usageRefreshKey: 0,
+  lastTurnUsage: null,
   busy: false,
   error: null,
   runtimeErrorDetail: null,
@@ -150,8 +158,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
   turnReasoningLastAtByUserId: {},
   inspectorSelectedId: null,
   composerModel: '',
+  composerProviderId: '',
   composerPickList: mergeComposerPickList(false, []),
   composerModelGroups: [],
+  disabledSkillIds: [],
   queuedMessages: [],
   watchTurnCompletion: {},
   unreadThreadIds: {},
@@ -183,12 +193,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
     persistComposerModel,
     readStoredComposerModel,
     mergeComposerPickList,
+    fallbackComposerModel,
     getComposerModelLoadPromise: () => composerModelLoadPromise,
     setComposerModelLoadPromise: (promise) => {
       composerModelLoadPromise = promise
     },
     applyTheme,
     applyUiFontScale,
+    applyCursorSpotlight,
+    applyWriteTypography,
+    applyDocumentLocale,
     workspaceLabelFromPath,
     normalizeWorkspaceRoot: (workspaceRoot) => normalizeWorkspaceRoot(workspaceRoot ?? undefined)
   }),

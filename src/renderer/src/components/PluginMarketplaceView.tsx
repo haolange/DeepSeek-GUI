@@ -12,8 +12,8 @@ import {
   Search,
   Settings
 } from 'lucide-react'
+import { rendererRuntimeClient } from '../agent/runtime-client'
 import {
-  joinFsPath,
   loadPreferredSkillRootId,
   savePreferredSkillRootId,
   type SkillRootId
@@ -21,7 +21,7 @@ import {
 import { readBrowserStorageItem, writeBrowserStorageItem } from '../lib/browser-storage'
 import { normalizeWorkspaceRoot } from '../lib/workspace-path'
 import { getProvider } from '../agent/registry'
-import type { SkillListItem } from '@shared/ds-gui-api'
+import type { SkillListItem, SkillRootListItem } from '@shared/kun-gui-api'
 import type {
   CoreRuntimeInfoJson,
   CoreRuntimeToolDiagnosticsJson
@@ -49,6 +49,7 @@ type MarketplaceItem = {
   description?: string
   group: 'recommended' | 'personal'
   sourceLabel?: string
+  detail?: string
   statusTone?: 'default' | 'success' | 'warning' | 'error'
   systemManaged?: boolean
   mcpConfig?: (workspaceRoot: string) => JsonRecord
@@ -61,10 +62,13 @@ type SkillRootOption = {
   id: SkillRootId
   label: string
   path: string
-  available: boolean
+  scope: 'project' | 'global'
+  enabled: boolean
+  exists: boolean
+  skillCount: number
 }
 
-const INSTALLED_STORAGE_KEY = 'deepseekgui.installedPlugins'
+const INSTALLED_STORAGE_KEY = 'kun.installedPlugins'
 const GUI_SCHEDULE_MCP_SERVER_ID = 'gui_schedule'
 
 function loadInstalledPlugins(): string[] {
@@ -84,6 +88,18 @@ function saveInstalledPlugins(ids: string[]): void {
 
 function storageKey(kind: PluginKind, id: string): string {
   return `${kind}:${id}`
+}
+
+function normalizeSkillId(id: string): string {
+  return id.trim().replace(/^\/?skill:/i, '').trim()
+}
+
+function normalizeDisabledSkillIds(ids: unknown): string[] {
+  if (!Array.isArray(ids)) return []
+  return [...new Set(ids
+    .filter((id): id is string => typeof id === 'string')
+    .map(normalizeSkillId)
+    .filter(Boolean))]
 }
 
 function normalizePluginId(raw: string): string {
@@ -160,6 +176,19 @@ function mcpServersFromConfig(config: JsonRecord): JsonRecord {
   const capabilities = isJsonRecord(config.capabilities) ? config.capabilities : undefined
   const mcp = isJsonRecord(capabilities?.mcp) ? capabilities.mcp : undefined
   return isJsonRecord(mcp?.servers) ? mcp.servers : {}
+}
+
+function mcpServerConfigFromText(content: string, id: string): JsonRecord | undefined {
+  try {
+    const server = mcpServersFromConfig(parseMcpJsonConfig(content))[id]
+    return isJsonRecord(server) ? server : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function mcpServerEnabledFromConfig(config: JsonRecord | undefined): boolean {
+  return !(config?.enabled === false || config?.disabled === true)
 }
 
 function mcpServerDescription(server: JsonRecord | undefined, fallback: string): string {
@@ -247,6 +276,45 @@ export function mergeMcpJsonConfig(content: string, fragment: JsonRecord): { alr
   return { alreadyExists: false, text: `${JSON.stringify(next, null, 2)}\n` }
 }
 
+export function setMcpServerEnabled(content: string, id: string, enabled: boolean): string {
+  const current = parseMcpJsonConfig(content)
+  const updateServer = (servers: JsonRecord): JsonRecord => {
+    const rawServer = servers[id]
+    if (!isJsonRecord(rawServer)) {
+      throw new Error(`MCP server "${id}" does not exist.`)
+    }
+    return {
+      ...servers,
+      [id]: {
+        ...rawServer,
+        enabled,
+        ...(enabled ? { disabled: undefined } : {})
+      }
+    }
+  }
+
+  if (isJsonRecord(current.servers)) {
+    return `${JSON.stringify({ ...current, servers: updateServer(current.servers) }, null, 2)}\n`
+  }
+
+  const capabilities = isJsonRecord(current.capabilities) ? current.capabilities : undefined
+  const mcp = isJsonRecord(capabilities?.mcp) ? capabilities.mcp : undefined
+  if (isJsonRecord(mcp?.servers)) {
+    return `${JSON.stringify({
+      ...current,
+      capabilities: {
+        ...capabilities,
+        mcp: {
+          ...mcp,
+          servers: updateServer(mcp.servers)
+        }
+      }
+    }, null, 2)}\n`
+  }
+
+  throw new Error(`MCP server "${id}" does not exist.`)
+}
+
 function buildSkillContent(id: string, title: string, description: string, instructions: string): string {
   return [
     '---',
@@ -279,6 +347,34 @@ export function skillMarketplaceItemsFromDiscoveredSkills(
     description: skill.description ?? skill.root,
     group: 'personal' as const,
     sourceLabel: skill.scope === 'project' ? labels.project : labels.global
+  }))
+}
+
+/** Last two path segments, e.g. `/Users/me/.claude/skills` → `.claude/skills`. */
+export function skillRootShortLabel(path: string): string {
+  const parts = path.split(/[\\/]+/).filter(Boolean)
+  return parts.slice(-2).join('/') || path
+}
+
+/**
+ * Builds the skill-root picker options from the backend's detected roots
+ * (`skill:list-roots`) — the same source the settings page renders — so the
+ * marketplace stays in sync instead of hardcoding a fixed subset of dirs.
+ * Common dirs use their i18n label; user-added extra dirs fall back to a short
+ * path label. (#321)
+ */
+export function skillRootOptionsFromRoots(
+  roots: SkillRootListItem[],
+  t: (key: string) => string
+): SkillRootOption[] {
+  return roots.map((root) => ({
+    id: root.id,
+    label: root.labelKey ? t(root.labelKey) : skillRootShortLabel(root.path),
+    path: root.path,
+    scope: root.scope,
+    enabled: root.enabled,
+    exists: root.exists,
+    skillCount: root.skillCount
   }))
 }
 
@@ -327,11 +423,20 @@ export function mcpMarketplaceItemsFromConfigAndDiagnostics(
       status === 'error' || status === 'unavailable' ? labels.error :
       status === 'disabled' ? labels.disabled :
       labels.configured
+    const detail = mcpServerDescription(details, labels.configured)
+    const catalogItem = RECOMMENDED_ITEMS.find((entry) => entry.kind === 'mcp' && entry.id === id)
     return {
       id,
       kind: 'mcp' as const,
       title: id,
-      description: mcpServerDescription(details, labels.configured),
+      // Keep the catalog description for known servers so installing an item
+      // does not replace its human-readable intro with the raw status string (#211).
+      ...(catalogItem?.descriptionKey
+        ? { descriptionKey: catalogItem.descriptionKey }
+        : catalogItem?.description
+          ? { description: catalogItem.description }
+          : { description: detail }),
+      detail,
       group: 'personal' as const,
       sourceLabel,
       statusTone: mcpStatusTone(status)
@@ -352,23 +457,6 @@ const RECOMMENDED_ITEMS: MarketplaceItem[] = [
     descriptionKey: 'pluginMcpGuiScheduleDesc',
     group: 'recommended',
     systemManaged: true
-  },
-  {
-    id: 'filesystem',
-    kind: 'mcp',
-    titleKey: 'pluginMcpFilesystemTitle',
-    descriptionKey: 'pluginMcpFilesystemDesc',
-    group: 'recommended',
-    mcpConfig: (workspaceRoot) =>
-      buildMcpConfig(
-        'filesystem',
-        'npx',
-        ['-y', '@modelcontextprotocol/server-filesystem', workspaceRoot || '/path/to/project'],
-        {
-          trustScope: 'workspace',
-          trustedWorkspaceRoots: [workspaceRoot || '/path/to/project']
-        }
-      )
   },
   {
     id: 'playwright',
@@ -410,6 +498,46 @@ const RECOMMENDED_ITEMS: MarketplaceItem[] = [
       )
   },
   {
+    id: 'sequential-thinking',
+    kind: 'mcp',
+    titleKey: 'pluginMcpSequentialThinkingTitle',
+    descriptionKey: 'pluginMcpSequentialThinkingDesc',
+    group: 'recommended',
+    mcpConfig: () =>
+      buildMcpConfig(
+        'sequential-thinking',
+        'npx',
+        ['-y', '@modelcontextprotocol/server-sequential-thinking']
+      )
+  },
+  {
+    id: 'memory',
+    kind: 'mcp',
+    titleKey: 'pluginMcpMemoryTitle',
+    descriptionKey: 'pluginMcpMemoryDesc',
+    group: 'recommended',
+    mcpConfig: () =>
+      buildMcpConfig(
+        'memory',
+        'npx',
+        ['-y', '@modelcontextprotocol/server-memory']
+      )
+  },
+  {
+    id: 'brave-search',
+    kind: 'mcp',
+    titleKey: 'pluginMcpBraveSearchTitle',
+    descriptionKey: 'pluginMcpBraveSearchDesc',
+    group: 'recommended',
+    mcpConfig: () =>
+      buildMcpConfig(
+        'brave-search',
+        'npx',
+        ['-y', '@modelcontextprotocol/server-brave-search'],
+        { env: { BRAVE_API_KEY: '' } }
+      )
+  },
+  {
     id: 'code-review',
     kind: 'skill',
     titleKey: 'pluginSkillReviewTitle',
@@ -447,6 +575,10 @@ const RECOMMENDED_ITEMS: MarketplaceItem[] = [
   }
 ]
 
+export function recommendedMarketplaceItemIds(): string[] {
+  return RECOMMENDED_ITEMS.map((item) => item.id)
+}
+
 export function PluginMarketplaceView(): ReactElement {
   const { t } = useTranslation('common')
   const workspaceRoot = normalizeWorkspaceRoot(useChatStore((s) => s.workspaceRoot))
@@ -470,59 +602,39 @@ export function PluginMarketplaceView(): ReactElement {
   const [toolDiagnostics, setToolDiagnostics] = useState<CoreRuntimeToolDiagnosticsJson | null>(null)
   const [runtimeOverlayLoading, setRuntimeOverlayLoading] = useState(false)
   const [runtimeOverlayError, setRuntimeOverlayError] = useState('')
+  const [mcpToggleBusyId, setMcpToggleBusyId] = useState<string | null>(null)
   const [discoveredSkills, setDiscoveredSkills] = useState<SkillListItem[]>([])
   const [skillListLoading, setSkillListLoading] = useState(false)
   const [skillListError, setSkillListError] = useState('')
+  const [skillRoots, setSkillRoots] = useState<SkillRootListItem[]>([])
+  const [disabledSkillIds, setDisabledSkillIds] = useState<string[]>([])
+  const [skillToggleBusyId, setSkillToggleBusyId] = useState<string | null>(null)
 
-  const skillRootOptions = useMemo<SkillRootOption[]>(() => {
-    const hasWorkspace = !!workspaceRoot
-    return [
-      {
-        id: 'workspace-agents',
-        label: t('pluginSkillRootWorkspaceAgents'),
-        path: workspaceRoot ? joinFsPath(workspaceRoot, '.agents/skills') : '',
-        available: hasWorkspace
-      },
-      {
-        id: 'workspace-skills',
-        label: t('pluginSkillRootWorkspaceSkills'),
-        path: workspaceRoot ? joinFsPath(workspaceRoot, 'skills') : '',
-        available: hasWorkspace
-      },
-      {
-        id: 'global-agents',
-        label: t('pluginSkillRootGlobalAgents'),
-        path: '~/.agents/skills',
-        available: true
-      },
-      {
-        id: 'global-deepseek',
-        label: t('pluginSkillRootGlobalDeepseek'),
-        path: '~/.kun/skills',
-        available: true
-      }
-    ]
-  }, [t, workspaceRoot])
+  const skillRootOptions = useMemo<SkillRootOption[]>(
+    () => skillRootOptionsFromRoots(skillRoots, t),
+    [skillRoots, t]
+  )
 
   const selectedSkillRoot =
-    skillRootOptions.find((option) => option.id === skillRootId && option.available) ??
-    skillRootOptions.find((option) => option.available)
+    skillRootOptions.find((option) => option.id === skillRootId) ??
+    skillRootOptions.find((option) => option.enabled) ??
+    skillRootOptions[0]
 
   useEffect(() => {
-    const selectedOption = skillRootOptions.find((option) => option.id === skillRootId && option.available)
-    if (selectedOption) {
+    if (skillRootOptions.length === 0) return
+    if (skillRootOptions.some((option) => option.id === skillRootId)) {
       savePreferredSkillRootId(skillRootId)
       return
     }
-    const fallback = skillRootOptions.find((option) => option.available)
+    const fallback = skillRootOptions.find((option) => option.enabled) ?? skillRootOptions[0]
     if (fallback && fallback.id !== skillRootId) {
       setSkillRootId(fallback.id)
     }
   }, [skillRootId, skillRootOptions])
 
   const readMcpConfig = useCallback(async (): Promise<string> => {
-    if (typeof window.dsGui?.getDeepseekConfigFile !== 'function') return mcpConfigText
-    const file = await window.dsGui.getDeepseekConfigFile()
+    if (typeof window.kunGui?.getKunConfigFile !== 'function') return mcpConfigText
+    const file = await window.kunGui.getKunConfigFile()
     setMcpConfigText(file.content)
     setMcpLoaded(true)
     return file.content
@@ -536,7 +648,7 @@ export function PluginMarketplaceView(): ReactElement {
   }, [activeKind, mcpLoaded, readMcpConfig])
 
   const refreshMcpRuntimeOverlay = useCallback(async (): Promise<void> => {
-    if (typeof window.dsGui?.runtimeRequest !== 'function') {
+    if (typeof window.kunGui?.runtimeRequest !== 'function') {
       setRuntimeInfo(null)
       setToolDiagnostics(null)
       setRuntimeOverlayError(t('pluginMcpRuntimeUnavailable'))
@@ -575,7 +687,7 @@ export function PluginMarketplaceView(): ReactElement {
   }, [activeKind, refreshMcpRuntimeOverlay])
 
   const refreshSkillList = useCallback(async (): Promise<void> => {
-    if (typeof window.dsGui?.listSkills !== 'function') {
+    if (typeof window.kunGui?.listSkills !== 'function') {
       setDiscoveredSkills([])
       setSkillListError(t('pluginSkillScanUnavailable'))
       return
@@ -583,7 +695,7 @@ export function PluginMarketplaceView(): ReactElement {
     setSkillListLoading(true)
     setSkillListError('')
     try {
-      const result = await window.dsGui.listSkills(workspaceRoot || undefined)
+      const result = await window.kunGui.listSkills(workspaceRoot || undefined)
       if (!result.ok) {
         setDiscoveredSkills([])
         setSkillListError(result.message)
@@ -601,10 +713,39 @@ export function PluginMarketplaceView(): ReactElement {
     }
   }, [t, workspaceRoot])
 
+  const refreshSkillRoots = useCallback(async (): Promise<void> => {
+    if (typeof window.kunGui?.listSkillRoots !== 'function') {
+      setSkillRoots([])
+      return
+    }
+    try {
+      const result = await window.kunGui.listSkillRoots(workspaceRoot || undefined)
+      setSkillRoots(result.ok ? result.roots : [])
+    } catch {
+      setSkillRoots([])
+    }
+  }, [workspaceRoot])
+
   useEffect(() => {
     if (activeKind !== 'skill') return
     void refreshSkillList()
-  }, [activeKind, refreshSkillList])
+    void refreshSkillRoots()
+  }, [activeKind, refreshSkillList, refreshSkillRoots])
+
+  useEffect(() => {
+    if (activeKind !== 'skill') return
+    let cancelled = false
+    void rendererRuntimeClient.getSettings({ forceRefresh: true })
+      .then((settings) => {
+        if (!cancelled) setDisabledSkillIds(normalizeDisabledSkillIds(settings.disabledSkillIds))
+      })
+      .catch(() => {
+        if (!cancelled) setDisabledSkillIds([])
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [activeKind])
 
   useEffect(() => {
     setNotice(null)
@@ -704,7 +845,7 @@ export function PluginMarketplaceView(): ReactElement {
       setNotice({ tone: 'info', message: t('pluginAlreadyAdded') })
       return
     }
-    const result = await window.dsGui.setDeepseekConfigFile(merged.text)
+    const result = await window.kunGui.setKunConfigFile(merged.text)
     setMcpConfigText(merged.text)
     setMcpLoaded(true)
     markInstalled(storageKey('mcp', id))
@@ -734,13 +875,13 @@ export function PluginMarketplaceView(): ReactElement {
         description,
         item.skillInstructions ?? description
       )
-      const result = await window.dsGui.saveSkillFile(selectedSkillRoot.path, item.id, content)
+      const result = await window.kunGui.saveSkillFile(selectedSkillRoot.path, item.id, content)
       if (!result.ok) {
         setNotice({ tone: 'error', message: result.message })
         return
       }
       markInstalled(storageKey('skill', item.id))
-      await refreshSkillList()
+      await Promise.all([refreshSkillList(), refreshSkillRoots()])
       setNotice({ tone: 'success', message: t('pluginSkillAdded', { path: result.path }) })
     } catch (e) {
       setNotice({ tone: 'error', message: e instanceof Error ? e.message : String(e) })
@@ -776,13 +917,13 @@ export function PluginMarketplaceView(): ReactElement {
         }
         const body = customSkillBody.trim() || t('pluginCustomSkillFallbackBody')
         const content = buildSkillContent(id, customName.trim() || id, description, body)
-        const result = await window.dsGui.saveSkillFile(selectedSkillRoot.path, id, content)
+        const result = await window.kunGui.saveSkillFile(selectedSkillRoot.path, id, content)
         if (!result.ok) {
           setNotice({ tone: 'error', message: result.message })
           return
         }
         markInstalled(storageKey('skill', id))
-        await refreshSkillList()
+        await Promise.all([refreshSkillList(), refreshSkillRoots()])
         setNotice({ tone: 'success', message: t('pluginSkillAdded', { path: result.path }) })
       }
       setCustomName('')
@@ -799,10 +940,55 @@ export function PluginMarketplaceView(): ReactElement {
     }
   }
 
+  const toggleSkillEnabled = async (id: string, enabled: boolean): Promise<void> => {
+    const normalizedId = normalizeSkillId(id)
+    if (!normalizedId) return
+    setSkillToggleBusyId(normalizedId)
+    setNotice(null)
+    try {
+      const next = enabled
+        ? disabledSkillIds.filter((item) => item !== normalizedId)
+        : [...new Set([...disabledSkillIds, normalizedId])]
+      const settings = await rendererRuntimeClient.setSettings({ disabledSkillIds: next })
+      const normalized = normalizeDisabledSkillIds(settings.disabledSkillIds)
+      setDisabledSkillIds(normalized)
+      useChatStore.setState({ disabledSkillIds: normalized })
+      setNotice({
+        tone: 'success',
+        message: enabled ? t('pluginSkillEnabled') : t('pluginSkillDisabled')
+      })
+    } catch (error) {
+      setNotice({ tone: 'error', message: error instanceof Error ? error.message : String(error) })
+    } finally {
+      setSkillToggleBusyId(null)
+    }
+  }
+
+  const toggleMcpEnabled = async (id: string, enabled: boolean): Promise<void> => {
+    setMcpToggleBusyId(id)
+    setNotice(null)
+    try {
+      const content = mcpLoaded ? mcpConfigText : await readMcpConfig()
+      const nextText = setMcpServerEnabled(content, id, enabled)
+      await window.kunGui.setKunConfigFile(nextText)
+      setMcpConfigText(nextText)
+      setMcpLoaded(true)
+      setNotice({
+        tone: 'success',
+        message: enabled ? t('pluginMcpEnabled') : t('pluginMcpDisabled')
+      })
+      await refreshMcpRuntimeOverlay()
+    } catch (error) {
+      setNotice({ tone: 'error', message: error instanceof Error ? error.message : String(error) })
+    } finally {
+      setMcpToggleBusyId(null)
+    }
+  }
+
   const openManageTarget = async (): Promise<void> => {
     try {
       if (activeKind === 'mcp') {
-        const result = await window.dsGui.openDeepseekConfigDir()
+        const result = await window.kunGui.openKunConfigDir()
         if (!result.ok) setNotice({ tone: 'error', message: result.message ?? t('pluginActionFailed') })
         return
       }
@@ -810,7 +996,7 @@ export function PluginMarketplaceView(): ReactElement {
         setNotice({ tone: 'error', message: t('pluginSkillRootMissing') })
         return
       }
-      const result = await window.dsGui.openSkillRoot(selectedSkillRoot.path)
+      const result = await window.kunGui.openSkillRoot(selectedSkillRoot.path)
       if (!result.ok) setNotice({ tone: 'error', message: result.message ?? t('pluginActionFailed') })
     } catch (e) {
       setNotice({ tone: 'error', message: e instanceof Error ? e.message : String(e) })
@@ -884,13 +1070,18 @@ export function PluginMarketplaceView(): ReactElement {
             <select
               value={selectedSkillRoot?.id ?? ''}
               onChange={(event) => setSkillRootId(event.target.value as SkillRootId)}
-              className="h-10 rounded-xl border border-ds-border bg-ds-card px-3 text-[13px] text-ds-ink shadow-sm outline-none focus:border-accent/40 focus:ring-1 focus:ring-accent/30"
+              disabled={skillRootOptions.length === 0}
+              className="h-10 rounded-xl border border-ds-border bg-ds-card px-3 text-[13px] text-ds-ink shadow-sm outline-none focus:border-accent/40 focus:ring-1 focus:ring-accent/30 disabled:cursor-not-allowed disabled:opacity-60"
             >
-              {skillRootOptions.map((option) => (
-                <option key={option.id} value={option.id} disabled={!option.available}>
-                  {option.available ? option.label : `${option.label} · ${t('pluginSkillRootNeedsWorkspace')}`}
-                </option>
-              ))}
+              {skillRootOptions.length === 0 ? (
+                <option value="">{t('pluginSkillRootNone')}</option>
+              ) : (
+                skillRootOptions.map((option) => (
+                  <option key={option.id} value={option.id}>
+                    {option.enabled ? option.label : `${option.label} · ${t('pluginSkillStatusDisabled')}`}
+                  </option>
+                ))
+              )}
             </select>
             <button
               type="button"
@@ -902,7 +1093,7 @@ export function PluginMarketplaceView(): ReactElement {
             </button>
             <button
               type="button"
-              onClick={() => void refreshSkillList()}
+              onClick={() => void Promise.all([refreshSkillList(), refreshSkillRoots()])}
               disabled={skillListLoading}
               className="inline-flex h-10 items-center gap-2 rounded-xl border border-ds-border bg-ds-card px-3 text-[13px] font-medium text-ds-ink shadow-sm transition hover:bg-ds-hover disabled:cursor-not-allowed disabled:opacity-60"
             >
@@ -915,7 +1106,10 @@ export function PluginMarketplaceView(): ReactElement {
               </span>
             ) : (
               <span className="text-[12px] text-ds-faint">
-                {t('pluginSkillDiscoveredCount', { count: discoveredSkills.length })}
+                {t('pluginSkillDiscoveredCountWithEnabled', {
+                  count: discoveredSkills.length,
+                  enabled: discoveredSkills.filter((skill) => !disabledSkillIds.includes(normalizeSkillId(skill.id))).length
+                })}
               </span>
             )}
           </div>
@@ -961,6 +1155,12 @@ export function PluginMarketplaceView(): ReactElement {
             busyId={busyId}
             isInstalled={isInstalled}
             onAdd={addItem}
+            disabledSkillIds={disabledSkillIds}
+            skillToggleBusyId={skillToggleBusyId}
+            onToggleSkillEnabled={toggleSkillEnabled}
+            mcpConfigText={mcpConfigText}
+            mcpToggleBusyId={mcpToggleBusyId}
+            onToggleMcpEnabled={toggleMcpEnabled}
             t={t}
           />
         ) : null}
@@ -972,6 +1172,12 @@ export function PluginMarketplaceView(): ReactElement {
           busyId={busyId}
           isInstalled={isInstalled}
           onAdd={addItem}
+          disabledSkillIds={disabledSkillIds}
+          skillToggleBusyId={skillToggleBusyId}
+          onToggleSkillEnabled={toggleSkillEnabled}
+          mcpConfigText={mcpConfigText}
+          mcpToggleBusyId={mcpToggleBusyId}
+          onToggleMcpEnabled={toggleMcpEnabled}
           t={t}
         />
 
@@ -982,6 +1188,12 @@ export function PluginMarketplaceView(): ReactElement {
           busyId={busyId}
           isInstalled={isInstalled}
           onAdd={addItem}
+          disabledSkillIds={disabledSkillIds}
+          skillToggleBusyId={skillToggleBusyId}
+          onToggleSkillEnabled={toggleSkillEnabled}
+          mcpConfigText={mcpConfigText}
+          mcpToggleBusyId={mcpToggleBusyId}
+          onToggleMcpEnabled={toggleMcpEnabled}
           t={t}
         />
 
@@ -1121,7 +1333,7 @@ function marketplaceSourceTone(tone: MarketplaceItem['statusTone']): string {
 
 function runtimeOverlayErrorMessage(error: unknown, fallback: string): string {
   const message = error instanceof Error ? error.message : String(error)
-  return /runtimeRequest|dsGui|Cannot read properties/i.test(message) ? fallback : message
+  return /runtimeRequest|kunGui|Cannot read properties/i.test(message) ? fallback : message
 }
 
 function PluginSection({
@@ -1131,6 +1343,12 @@ function PluginSection({
   busyId,
   isInstalled,
   onAdd,
+  disabledSkillIds = [],
+  skillToggleBusyId = null,
+  onToggleSkillEnabled,
+  mcpConfigText = '',
+  mcpToggleBusyId = null,
+  onToggleMcpEnabled,
   t
 }: {
   title: string
@@ -1139,6 +1357,12 @@ function PluginSection({
   busyId: string | null
   isInstalled: (item: Pick<MarketplaceItem, 'kind' | 'id'>) => boolean
   onAdd: (item: MarketplaceItem) => Promise<void>
+  disabledSkillIds?: string[]
+  skillToggleBusyId?: string | null
+  onToggleSkillEnabled?: (id: string, enabled: boolean) => Promise<void>
+  mcpConfigText?: string
+  mcpToggleBusyId?: string | null
+  onToggleMcpEnabled?: (id: string, enabled: boolean) => Promise<void>
   t: (key: string, values?: Record<string, unknown>) => string
 }): ReactElement {
   return (
@@ -1154,6 +1378,14 @@ function PluginSection({
             const itemKey = storageKey(item.kind, item.id)
             const installed = isInstalled(item)
             const busy = busyId === itemKey
+            const normalizedSkillId = normalizeSkillId(item.id)
+            const skillDisabled = item.kind === 'skill' && disabledSkillIds.includes(normalizedSkillId)
+            const canToggleSkill = item.kind === 'skill' && item.group === 'personal' && onToggleSkillEnabled
+            const toggleBusy = skillToggleBusyId === normalizedSkillId
+            const mcpConfig = item.kind === 'mcp' ? mcpServerConfigFromText(mcpConfigText, item.id) : undefined
+            const mcpDisabled = item.kind === 'mcp' && !mcpServerEnabledFromConfig(mcpConfig)
+            const canToggleMcp = item.kind === 'mcp' && item.group === 'personal' && !!mcpConfig && onToggleMcpEnabled
+            const mcpBusy = mcpToggleBusyId === item.id
             return (
               <div
                 key={itemKey}
@@ -1171,30 +1403,87 @@ function PluginSection({
                         {item.sourceLabel}
                       </span>
                     ) : null}
+                    {skillDisabled ? (
+                      <span className="shrink-0 rounded-md bg-amber-500/15 px-2 py-0.5 text-[11px] font-semibold text-amber-700 dark:text-amber-200">
+                        {t('pluginSkillStatusDisabled')}
+                      </span>
+                    ) : null}
+                    {mcpDisabled ? (
+                      <span className="shrink-0 rounded-md bg-amber-500/15 px-2 py-0.5 text-[11px] font-semibold text-amber-700 dark:text-amber-200">
+                        {t('pluginMcpStatusDisabled')}
+                      </span>
+                    ) : null}
                   </div>
                   <p className="mt-1 line-clamp-2 text-[14px] leading-5 text-ds-muted">
                     {itemDescription(item, t)}
                   </p>
+                  {item.detail && item.detail !== itemDescription(item, t) ? (
+                    <p className="mt-0.5 truncate font-mono text-[12px] text-ds-faint" title={item.detail}>
+                      {item.detail}
+                    </p>
+                  ) : null}
                 </div>
-                <button
-                  type="button"
-                  disabled={installed || busy}
-                  onClick={() => void onAdd(item)}
-                  title={installed ? t('pluginAdded') : t('pluginAdd')}
-                  className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-xl transition ${
-                    installed
-                      ? 'text-ds-faint'
-                      : 'bg-ds-subtle text-ds-ink hover:bg-ds-hover disabled:opacity-60'
-                  }`}
-                >
-                  {busy ? (
-                    <Loader2 className="h-4 w-4 animate-spin" strokeWidth={2} />
-                  ) : installed ? (
-                    <Check className="h-4 w-4" strokeWidth={2} />
-                  ) : (
-                    <Plus className="h-4 w-4" strokeWidth={2} />
-                  )}
-                </button>
+                {canToggleSkill ? (
+                  <button
+                    type="button"
+                    disabled={toggleBusy}
+                    onClick={() => void onToggleSkillEnabled(item.id, skillDisabled)}
+                    title={skillDisabled ? t('pluginSkillEnable') : t('pluginSkillDisable')}
+                    className={`inline-flex h-9 shrink-0 items-center justify-center rounded-xl px-3 text-[12px] font-semibold transition disabled:cursor-not-allowed disabled:opacity-60 ${
+                      skillDisabled
+                        ? 'bg-ds-subtle text-ds-ink hover:bg-ds-hover'
+                        : 'bg-ds-skill-soft text-ds-skill hover:opacity-85'
+                    }`}
+                  >
+                    {toggleBusy ? (
+                      <Loader2 className="h-4 w-4 animate-spin" strokeWidth={2} />
+                    ) : skillDisabled ? (
+                      t('pluginSkillEnable')
+                    ) : (
+                      t('pluginSkillDisable')
+                    )}
+                  </button>
+                ) : canToggleMcp ? (
+                  <button
+                    type="button"
+                    disabled={mcpBusy}
+                    onClick={() => void onToggleMcpEnabled(item.id, mcpDisabled)}
+                    title={mcpDisabled ? t('pluginMcpEnable') : t('pluginMcpDisable')}
+                    className={`inline-flex h-9 shrink-0 items-center justify-center rounded-xl px-3 text-[12px] font-semibold transition disabled:cursor-not-allowed disabled:opacity-60 ${
+                      mcpDisabled
+                        ? 'bg-ds-subtle text-ds-ink hover:bg-ds-hover'
+                        : 'bg-ds-subtle text-ds-muted hover:bg-ds-hover'
+                    }`}
+                  >
+                    {mcpBusy ? (
+                      <Loader2 className="h-4 w-4 animate-spin" strokeWidth={2} />
+                    ) : mcpDisabled ? (
+                      t('pluginMcpEnable')
+                    ) : (
+                      t('pluginMcpDisable')
+                    )}
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    disabled={installed || busy}
+                    onClick={() => void onAdd(item)}
+                    title={installed ? t('pluginAdded') : t('pluginAdd')}
+                    className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-xl transition ${
+                      installed
+                        ? 'text-ds-faint'
+                        : 'bg-ds-subtle text-ds-ink hover:bg-ds-hover disabled:opacity-60'
+                    }`}
+                  >
+                    {busy ? (
+                      <Loader2 className="h-4 w-4 animate-spin" strokeWidth={2} />
+                    ) : installed ? (
+                      <Check className="h-4 w-4" strokeWidth={2} />
+                    ) : (
+                      <Plus className="h-4 w-4" strokeWidth={2} />
+                    )}
+                  </button>
+                )}
               </div>
             )
           })}

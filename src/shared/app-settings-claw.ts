@@ -31,8 +31,14 @@ type LegacyClawImSettingsPatch = Partial<ClawImSettingsV1> & {
   openClawGatewayUrl?: unknown
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
 function defaultClawChannelLabel(provider: ClawImProvider): string {
-  return provider === 'weixin' ? 'weixin agent' : 'feishu agent'
+  if (provider === 'weixin') return 'weixin agent'
+  if (provider === 'telegram') return 'telegram agent'
+  return 'feishu agent'
 }
 
 function normalizeLegacyDefaultClawChannelName(provider: ClawImProvider, value: string): string {
@@ -42,6 +48,9 @@ function normalizeLegacyDefaultClawChannelName(provider: ClawImProvider, value: 
     return lower === 'weixin agent' || lower === 'wechat agent' || lower === 'wechat'
       ? 'weixin agent'
       : trimmed
+  }
+  if (provider === 'telegram') {
+    return lower === 'telegram agent' || lower === 'telegram bot' ? 'telegram agent' : trimmed
   }
   if (lower === 'feishu agent' || lower === 'feishu / lark') return 'feishu agent'
   if (lower === 'lark agent') return 'lark agent'
@@ -59,6 +68,7 @@ export function defaultClawSettings(): ClawSettingsV1 {
     skills: {
       defaultNames: [],
       extraDirs: [],
+      disabledDirs: [],
       promptPrefix: ''
     },
     im: {
@@ -69,6 +79,7 @@ export function defaultClawSettings(): ClawSettingsV1 {
       secret: '',
       weixinBridgeUrl: DEFAULT_WEIXIN_BRIDGE_RPC_URL,
       workspaceRoot: '',
+      providerId: '',
       model: DEFAULT_CLAW_MODEL,
       mode: 'agent',
       responseTimeoutMs: 120_000
@@ -80,20 +91,22 @@ export function defaultClawSettings(): ClawSettingsV1 {
 
 export function normalizeClawSettings(input: ClawSettingsPatchV1 | undefined): ClawSettingsV1 {
   const defaults = defaultClawSettings()
-  const source = input ?? {}
-  const skills = source.skills ?? defaults.skills
-  const im = (source.im ?? defaults.im) as LegacyClawImSettingsPatch
+  const source = isRecord(input) ? input as ClawSettingsPatchV1 : {}
+  const skills = isRecord(source.skills) ? source.skills : defaults.skills
+  const im = (isRecord(source.im) ? source.im : defaults.im) as LegacyClawImSettingsPatch
   const weixinBridgeUrl = typeof im.weixinBridgeUrl === 'string' ? im.weixinBridgeUrl.trim() : ''
   const legacyOpenClawGatewayUrl =
     typeof im.openClawGatewayUrl === 'string' ? im.openClawGatewayUrl.trim() : ''
   const rawChannels = Array.isArray(source.channels)
     ? source.channels.filter((channel) => {
+        if (!isRecord(channel)) return false
         const raw = channel as Partial<ClawImChannelV1>
         return (
           raw.provider === undefined ||
           raw.provider === null ||
           raw.provider === 'feishu' ||
-          raw.provider === 'weixin'
+          raw.provider === 'weixin' ||
+          raw.provider === 'telegram'
         )
       })
     : []
@@ -103,6 +116,7 @@ export function normalizeClawSettings(input: ClawSettingsPatchV1 | undefined): C
     skills: {
       defaultNames: compactStrings(skills.defaultNames),
       extraDirs: compactStrings(skills.extraDirs),
+      disabledDirs: compactStrings(skills.disabledDirs),
       promptPrefix: typeof skills.promptPrefix === 'string' ? skills.promptPrefix : ''
     },
     im: {
@@ -113,6 +127,7 @@ export function normalizeClawSettings(input: ClawSettingsPatchV1 | undefined): C
       secret: typeof im.secret === 'string' ? im.secret.trim() : '',
       weixinBridgeUrl: weixinBridgeUrl || legacyOpenClawGatewayUrl || defaults.im.weixinBridgeUrl,
       workspaceRoot: typeof im.workspaceRoot === 'string' ? im.workspaceRoot.trim() : '',
+      providerId: typeof im.providerId === 'string' ? im.providerId.trim() : '',
       model: typeof im.model === 'string' && im.model.trim() ? im.model.trim() : DEFAULT_CLAW_MODEL,
       mode: normalizeRunMode(im.mode),
       responseTimeoutMs: normalizePositiveInteger(im.responseTimeoutMs, defaults.im.responseTimeoutMs, 5_000, 600_000)
@@ -132,6 +147,7 @@ export function normalizeClawSettings(input: ClawSettingsPatchV1 | undefined): C
             provider,
             label,
             enabled: normalizeBoolean(raw.enabled, true),
+            providerId: typeof raw.providerId === 'string' ? raw.providerId.trim() : '',
             model: normalizeClawModel(raw.model),
             threadId,
             workspaceRoot: typeof raw.workspaceRoot === 'string' ? raw.workspaceRoot.trim() : '',
@@ -146,8 +162,15 @@ export function normalizeClawSettings(input: ClawSettingsPatchV1 | undefined): C
                   .map((conversation) => normalizeClawImConversation(conversation))
                   .filter((conversation): conversation is ClawImConversationV1 => conversation != null)
               : [],
+            ...(typeof raw.welcomeSentAt === 'string' && raw.welcomeSentAt.trim()
+              ? { welcomeSentAt: raw.welcomeSentAt }
+              : {}),
             createdAt: typeof raw.createdAt === 'string' && raw.createdAt ? raw.createdAt : now,
-            updatedAt: typeof raw.updatedAt === 'string' && raw.updatedAt ? raw.updatedAt : now
+            updatedAt: typeof raw.updatedAt === 'string' && raw.updatedAt ? raw.updatedAt : now,
+            // Per-channel feishuStream. Default is off (false); only flip to
+            // true when the user explicitly enables streaming for this
+            // specific Feishu / Lark channel.
+            feishuStream: normalizeBoolean(raw.feishuStream, false)
           }
         }),
     tasks: Array.isArray(source.tasks)

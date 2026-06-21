@@ -5,6 +5,7 @@ import type {
   UserMessageEventPayload
 } from '../agent/types'
 import { normalizeWorkspaceRoot } from '../lib/workspace-path'
+import { shouldAutoTitleThread } from '../lib/thread-title'
 import type { ChatState } from './chat-store-types'
 
 type ThreadDetailProviderLike = {
@@ -29,11 +30,64 @@ export function hasPendingRuntimeWork(block: ChatBlock): boolean {
   return false
 }
 
+function assistantBlockHasVisibleContent(block: Extract<ChatBlock, { kind: 'assistant' }>): boolean {
+  const withoutThink = block.text.replace(/<think>[\s\S]*?(?:<\/think>|$)/g, '').trim()
+  return withoutThink.length > 0
+}
+
+export function threadHasPendingRuntimeWork(blocks: ChatBlock[]): boolean {
+  let pendingInCurrentTurn = false
+
+  for (const block of blocks) {
+    if (block.kind === 'user') {
+      pendingInCurrentTurn = false
+      continue
+    }
+    if (hasPendingRuntimeWork(block)) {
+      pendingInCurrentTurn = true
+      continue
+    }
+    if (pendingInCurrentTurn && block.kind === 'assistant' && assistantBlockHasVisibleContent(block)) {
+      pendingInCurrentTurn = false
+    }
+  }
+
+  return pendingInCurrentTurn
+}
+
+export function settlePendingRuntimeWorkAfterInterrupt(blocks: ChatBlock[]): ChatBlock[] {
+  let changed = false
+  const next = blocks.map((block): ChatBlock => {
+    if (block.kind === 'tool' && block.status === 'running') {
+      changed = true
+      return { ...block, status: 'error' as const }
+    }
+    if (block.kind === 'compaction' && block.status === 'running') {
+      changed = true
+      return { ...block, status: 'error' as const }
+    }
+    if (block.kind === 'review' && block.status === 'running') {
+      changed = true
+      return { ...block, status: 'error' as const }
+    }
+    if (block.kind === 'approval' && block.status === 'pending') {
+      changed = true
+      return { ...block, status: 'error' as const }
+    }
+    if (block.kind === 'user_input' && block.status === 'pending') {
+      changed = true
+      return { ...block, status: 'cancelled' as const }
+    }
+    return block
+  })
+  return changed ? next : blocks
+}
+
 export function threadSnapshotLooksRunning(blocks: ChatBlock[], threadStatus?: string): boolean {
   if (threadStatus != null && threadStatus.trim()) {
     return runtimeStatusLooksRunning(threadStatus)
   }
-  return blocks.some(hasPendingRuntimeWork)
+  return threadHasPendingRuntimeWork(blocks)
 }
 
 export function findLatestUserBlockId(blocks: ChatBlock[]): string | null {
@@ -48,6 +102,7 @@ export function upsertUserBlock(blocks: ChatBlock[], ev: UserMessageEventPayload
   const nextBlock: ChatBlock = {
     kind: 'user',
     id: ev.itemId,
+    turnId: ev.turnId,
     createdAt: ev.createdAt,
     text: ev.text,
     ...(ev.modelLabel ? { modelLabel: ev.modelLabel } : {}),
@@ -174,6 +229,7 @@ export async function findReusableEmptyThreadId(
   if (
     activeThread &&
     isReusableThread(activeThread) &&
+    shouldAutoTitleThread(activeThread) &&
     normalizeWorkspaceRoot(activeThread.workspace) === normalizedWorkspace &&
     !threadHasUserMessage(state.blocks)
   ) {
@@ -185,6 +241,7 @@ export async function findReusableEmptyThreadId(
       (thread) =>
         thread.id !== activeThread?.id &&
         isReusableThread(thread) &&
+        shouldAutoTitleThread(thread) &&
         normalizeWorkspaceRoot(thread.workspace) === normalizedWorkspace
     )
     .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))

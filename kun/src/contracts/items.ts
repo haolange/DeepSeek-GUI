@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { ReviewOutputSchema, ReviewTargetSchema } from './review.js'
+import { RuntimeErrorSeverity } from './errors.js'
 
 /**
  * Conversation items returned as part of a thread or turn.
@@ -42,11 +43,21 @@ const UserInputQuestionSchema = z.object({
   options: z.array(UserInputOptionSchema)
 })
 
+export const UserFileReferenceSchema = z.object({
+  path: z.string().min(1),
+  relativePath: z.string().min(1),
+  name: z.string().min(1),
+  kind: z.enum(['file', 'directory']).optional()
+})
+export type UserFileReference = z.infer<typeof UserFileReferenceSchema>
+
 export const UserTurnItem = TurnItemBase.extend({
   kind: z.literal('user_message'),
   text: z.string(),
   displayText: z.string().optional(),
-  attachmentIds: z.array(z.string().min(1)).optional()
+  attachmentIds: z.array(z.string().min(1)).optional(),
+  fileReferences: z.array(UserFileReferenceSchema).optional(),
+  workspaceCheckpointId: z.string().min(1).optional()
 })
 export type UserTurnItem = z.infer<typeof UserTurnItem>
 
@@ -104,6 +115,10 @@ export const CompactionTurnItem = TurnItemBase.extend({
   kind: z.literal('compaction'),
   summary: z.string(),
   replacedTokens: z.number().int().nonnegative(),
+  // `false` when the user explicitly ran `/compact`; absent for
+  // loop-triggered (automatic) compaction so legacy items keep rendering
+  // as auto.
+  auto: z.boolean().optional(),
   pinnedConstraints: z.array(z.string()),
   sourceDigest: z.string().min(1).optional(),
   digestMarker: z.string().min(1).optional(),
@@ -123,7 +138,9 @@ export type ReviewTurnItem = z.infer<typeof ReviewTurnItem>
 export const ErrorTurnItem = TurnItemBase.extend({
   kind: z.literal('error'),
   message: z.string(),
-  code: z.string().optional()
+  code: z.string().optional(),
+  details: z.unknown().optional(),
+  severity: RuntimeErrorSeverity.optional()
 })
 export type ErrorTurnItem = z.infer<typeof ErrorTurnItem>
 

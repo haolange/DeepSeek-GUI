@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { CapabilityRegistry } from '../src/adapters/tool/capability-registry.js'
 import { LocalToolHost } from '../src/adapters/tool/local-tool-host.js'
 import { buildWebToolProviders } from '../src/adapters/tool/web-tool-provider.js'
@@ -48,6 +48,10 @@ function deterministicProvider() {
 }
 
 describe('Web tool provider', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
   it('does not advertise web tools when web access is disabled', async () => {
     const config = KunCapabilitiesConfig.parse({})
     const built = buildWebToolProviders(config.web, { provider: deterministicProvider() })
@@ -102,6 +106,156 @@ describe('Web tool provider', () => {
         provider: 'test-search',
         byteCount: 20
       })
+    }
+  })
+
+  it('truncates instead of failing when content-length exceeds max_bytes', async () => {
+    vi.stubGlobal('fetch', async () => new Response('abcdefghijklmnopqrstuvwxyz', {
+      headers: {
+        'content-length': '26',
+        'content-type': 'text/plain'
+      }
+    }))
+    const config = KunCapabilitiesConfig.parse({
+      web: {
+        enabled: true,
+        fetchEnabled: true,
+        allowDomains: ['docs.example.test'],
+        maxFetchBytes: 10
+      }
+    })
+    const host = new LocalToolHost({
+      registry: new CapabilityRegistry(buildWebToolProviders(config.web).providers)
+    })
+
+    const result = await host.execute({
+      callId: 'call_1',
+      toolName: 'web_fetch',
+      arguments: { url: 'https://docs.example.test/large', max_bytes: 10 }
+    }, buildContext())
+
+    expect(result.item).toMatchObject({ kind: 'tool_result', isError: false })
+    if (result.item.kind === 'tool_result') {
+      expect(result.item.output).toMatchObject({
+        text: 'abcdefghij',
+        byteCount: 10,
+        truncated: true
+      })
+    }
+  })
+
+  it('truncates oversized fetch responses via streaming when content-length is unknown', async () => {
+    vi.stubGlobal('fetch', async () => new Response('abcdefghijklmnopqrstuvwxyz', {
+      headers: {
+        'content-type': 'text/plain'
+      }
+    }))
+    const config = KunCapabilitiesConfig.parse({
+      web: {
+        enabled: true,
+        fetchEnabled: true,
+        allowDomains: ['docs.example.test'],
+        maxFetchBytes: 10
+      }
+    })
+    const host = new LocalToolHost({
+      registry: new CapabilityRegistry(buildWebToolProviders(config.web).providers)
+    })
+
+    const result = await host.execute({
+      callId: 'call_1',
+      toolName: 'web_fetch',
+      arguments: { url: 'https://docs.example.test/large', max_bytes: 10 }
+    }, buildContext())
+
+    expect(result.item).toMatchObject({ kind: 'tool_result', isError: false })
+    if (result.item.kind === 'tool_result') {
+      expect(result.item.output).toMatchObject({
+        text: 'abcdefghij',
+        byteCount: 10,
+        truncated: true,
+        telemetry: {
+          policy: 'allowed',
+          provider: 'fetch',
+          byteCount: 10
+        }
+      })
+    }
+  })
+
+  it('raises tiny model-passed max_bytes budgets to a usable floor', async () => {
+    vi.stubGlobal('fetch', async () => new Response('x'.repeat(3000), {
+      headers: {
+        'content-length': '3000',
+        'content-type': 'text/plain'
+      }
+    }))
+    const config = KunCapabilitiesConfig.parse({
+      web: {
+        enabled: true,
+        fetchEnabled: true,
+        allowDomains: ['docs.example.test']
+      }
+    })
+    const host = new LocalToolHost({
+      registry: new CapabilityRegistry(buildWebToolProviders(config.web).providers)
+    })
+
+    const result = await host.execute({
+      callId: 'call_1',
+      toolName: 'web_fetch',
+      arguments: { url: 'https://docs.example.test/page', max_bytes: 2000 }
+    }, buildContext())
+
+    expect(result.item).toMatchObject({ kind: 'tool_result', isError: false })
+    if (result.item.kind === 'tool_result') {
+      expect(result.item.output).toMatchObject({
+        byteCount: 3000,
+        truncated: false
+      })
+    }
+  })
+
+  it('extracts HTML text without turning escaped tags into markup', async () => {
+    vi.stubGlobal('fetch', async () => new Response([
+      '<!doctype html>',
+      '<title>Docs &amp; Safety</title>',
+      '<script>alert("secret")</script>',
+      '<style>body{display:none}</style>',
+      '<h1>Hello&nbsp;World</h1>',
+      '<p>A &lt;script&gt; stays text.</p>',
+      '<div>Next &#60;b&#62; line &amp; more.</div>'
+    ].join(''), {
+      headers: {
+        'content-type': 'text/html'
+      }
+    }))
+    const config = KunCapabilitiesConfig.parse({
+      web: {
+        enabled: true,
+        fetchEnabled: true,
+        allowDomains: ['docs.example.test']
+      }
+    })
+    const host = new LocalToolHost({
+      registry: new CapabilityRegistry(buildWebToolProviders(config.web).providers)
+    })
+
+    const result = await host.execute({
+      callId: 'call_1',
+      toolName: 'web_fetch',
+      arguments: { url: 'https://docs.example.test/html' }
+    }, buildContext())
+
+    expect(result.item).toMatchObject({ kind: 'tool_result', isError: false })
+    if (result.item.kind === 'tool_result') {
+      const output = result.item.output as { title?: string; text: string }
+      expect(output.title).toBe('Docs & Safety')
+      expect(output.text).toContain('Hello World')
+      expect(output.text).not.toContain('alert')
+      expect(output.text).not.toContain('<script>')
+      expect(output.text).toContain('&lt;script&gt; stays text.')
+      expect(output.text).toContain('Next &#60;b&#62; line & more.')
     }
   })
 

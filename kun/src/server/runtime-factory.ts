@@ -9,17 +9,26 @@ import { InMemoryUserInputGate } from '../adapters/in-memory-user-input-gate.js'
 import { InMemoryEventBus } from '../adapters/in-memory-event-bus.js'
 import { FileSessionStore, FileThreadStore } from '../adapters/file/index.js'
 import { HybridSessionStore, HybridThreadStore } from '../adapters/hybrid/index.js'
-import { DeepseekCompatModelClient } from '../adapters/model/deepseek-compat-model-client.js'
+import { CompatModelClient } from '../adapters/model/compat-model-client.js'
+import { MultiProviderModelClient } from '../adapters/model/multi-provider-model-client.js'
 import { CapabilityRegistry } from '../adapters/tool/capability-registry.js'
 import { buildGoalLocalTools } from '../adapters/tool/goal-tools.js'
 import { buildTodoLocalTools } from '../adapters/tool/todo-tools.js'
 import { LocalToolHost, buildDefaultLocalTools } from '../adapters/tool/local-tool-host.js'
 import { buildMcpToolProviders } from '../adapters/tool/mcp-tool-provider.js'
 import { buildMemoryToolProviders } from '../adapters/tool/memory-tool-provider.js'
+import { buildSkillToolProviders } from '../adapters/tool/skill-tool-provider.js'
 import { buildDelegationToolProviders } from '../adapters/tool/delegation-tool-provider.js'
 import { buildWebToolProviders } from '../adapters/tool/web-tool-provider.js'
+import { buildImageGenToolProviders } from '../adapters/tool/image-gen-tool-provider.js'
+import { buildComputerUseToolProviders } from '../adapters/tool/computer-use-tool-provider.js'
+import {
+  buildMusicGenToolProviders,
+  buildSpeechGenToolProviders,
+  buildVideoGenToolProviders
+} from '../adapters/tool/media-gen-tool-provider.js'
 import { LocalWorkspaceInspector } from '../adapters/workspace/local-workspace-inspector.js'
-import { createImmutablePrefix } from '../cache/immutable-prefix.js'
+import { createImmutablePrefix, setSystemPrompt } from '../cache/immutable-prefix.js'
 import {
   buildRuntimeCapabilityManifest,
   type KunCapabilitiesConfig
@@ -35,11 +44,16 @@ import {
   type ModelConfig
 } from '../loop/model-context-profile.js'
 import {
+  DEFAULT_QUALITY_CONFIG,
   DEFAULT_STORAGE_CONFIG,
   expandHomePath,
+  type QualityConfig,
   type RuntimeTuningConfig,
+  type ServeProviderConfig,
   type StorageConfig
 } from '../config/kun-config.js'
+import { buildBuiltinHooks } from '../hooks/builtins/index.js'
+import { mergeBuiltinSubagentProfiles } from '../delegation/builtin-profiles.js'
 import { InflightTracker } from '../loop/inflight-tracker.js'
 import { SteeringQueue } from '../loop/steering-queue.js'
 import { RandomIdGenerator } from '../ports/id-generator.js'
@@ -47,12 +61,18 @@ import type { SessionStore } from '../ports/session-store.js'
 import type { ThreadStore } from '../ports/thread-store.js'
 import { KUN_SYSTEM_PROMPT } from '../prompt/kun-system-prompt.js'
 import { RuntimeEventRecorder } from '../services/runtime-event-recorder.js'
+import { LlmDebugRecorder } from '../services/llm-debug-recorder.js'
 import { ThreadService } from '../services/thread-service.js'
 import { TurnService } from '../services/turn-service.js'
 import { ReviewService } from '../services/review-service.js'
 import { UsageService } from '../services/usage-service.js'
 import type { UsageEvent } from '../contracts/events.js'
+import {
+  DEFAULT_MODEL_ENDPOINT_FORMAT,
+  type ModelEndpointFormat
+} from '../contracts/model-endpoint-format.js'
 import { SkillRuntime } from '../skills/skill-runtime.js'
+import { resolveConfiguredHooks, type HooksConfig } from '../hooks/hook-config.js'
 import { FileMemoryStore } from '../memory/memory-store.js'
 import { DelegationRuntime, FileDelegationStore } from '../delegation/delegation-runtime.js'
 import { createChildAgentExecutor } from '../delegation/child-agent-executor.js'
@@ -65,6 +85,17 @@ export type KunServeRuntimeOptions = {
   runtimeToken: string
   apiKey: string
   baseUrl: string
+  modelProxyUrl?: string
+  endpointFormat?: ModelEndpointFormat
+  /**
+   * Extra providers the runtime can route to per request. Keyed by
+   * provider id (matched against `ModelRequest.providerId`); each entry
+   * supplies its own HTTP credentials. Threads created with a
+   * `providerId` matching a key here route their turns to that client;
+   * any unrecognized id falls back to the default credentials above.
+   * Empty/absent → runtime stays single-provider (current behavior).
+   */
+  providers?: Record<string, ServeProviderConfig>
   model: string
   approvalPolicy: ApprovalPolicy
   sandboxMode: SandboxMode
@@ -76,6 +107,10 @@ export type KunServeRuntimeOptions = {
   runtime?: RuntimeTuningConfig
   storage?: StorageConfig
   capabilities?: KunCapabilitiesConfig
+  /** Command hooks from config.json; resolved and wired into tool hosts and the loop. */
+  hooks?: HooksConfig
+  /** Design-quality linter config; drives the builtin PostToolUse hook. */
+  quality?: QualityConfig
   startedAt?: string
 }
 
@@ -115,7 +150,7 @@ export async function createKunServeRuntime(
   const nowIso = () => new Date().toISOString()
   const allocateSeq = (threadId: string) => eventBus.allocateSeq(threadId)
   const events = new RuntimeEventRecorder({ eventBus, sessionStore, allocateSeq, nowIso })
-  const prefix = createImmutablePrefix({
+  let prefix = createImmutablePrefix({
     systemPrompt: KUN_SYSTEM_PROMPT,
     pinnedConstraints: [
       'system: preserve user intent across compaction',
@@ -123,6 +158,66 @@ export async function createKunServeRuntime(
       'system: keep the stable Kun prefix byte-stable for prompt-cache reuse'
     ]
   })
+  const threadService = new ThreadService({ threadStore, sessionStore, events, ids, nowIso })
+  const modelProfiles = modelContextProfilesFromConfig({
+    contextCompaction: options.contextCompaction,
+    models: options.models
+  })
+  const modelCapabilities = (model: string) => modelCapabilitiesForModel(model, modelProfiles)
+  const llmDebug = new LlmDebugRecorder()
+  const streamIdleOverride =
+    options.runtime?.streamIdleTimeoutMs !== undefined
+      ? { streamIdleTimeoutMs: options.runtime.streamIdleTimeoutMs }
+      : {}
+  const defaultModelClient = new CompatModelClient({
+    baseUrl: options.baseUrl,
+    apiKey: options.apiKey,
+    modelProxyUrl: options.modelProxyUrl,
+    endpointFormat: options.endpointFormat ?? DEFAULT_MODEL_ENDPOINT_FORMAT,
+    model: options.model,
+    modelCapabilities,
+    debugSink: llmDebug,
+    ...streamIdleOverride
+  })
+  // Per-provider HTTP clients (workflow/scheduled task can pick a non-default
+  // provider per request via `ModelRequest.providerId`). The wrapper falls
+  // back to the default client when the id is absent or unknown, so behavior
+  // is unchanged for single-provider deployments.
+  const providerClients = new Map<string, CompatModelClient>()
+  for (const [providerId, provider] of Object.entries(options.providers ?? {})) {
+    const trimmedId = providerId.trim()
+    if (!trimmedId) continue
+    providerClients.set(
+      trimmedId,
+      new CompatModelClient({
+        baseUrl: provider.baseUrl,
+        apiKey: provider.apiKey,
+        modelProxyUrl: provider.modelProxyUrl ?? options.modelProxyUrl,
+        endpointFormat: provider.endpointFormat ?? options.endpointFormat ?? DEFAULT_MODEL_ENDPOINT_FORMAT,
+        model: options.model,
+        modelCapabilities,
+        debugSink: llmDebug,
+        ...streamIdleOverride
+      })
+    )
+  }
+  const modelClient = new MultiProviderModelClient({
+    default: defaultModelClient,
+    providers: providerClients
+  })
+  // Independent I/O; all must still finish before the server listens.
+  const [mcpProviders, skillRuntime] = await Promise.all([
+    buildMcpToolProviders(options.capabilities?.mcp),
+    SkillRuntime.create(options.capabilities?.skills),
+    seedUsageCarryover({ threadStore, sessionStore, usageService })
+  ])
+  // Fold the available-skills catalog into the stable prefix once per session so
+  // the model knows which skills exist (and where to read them) even when no
+  // trigger fires. Stays byte-stable across turns, preserving prompt-cache reuse.
+  const skillCatalog = skillRuntime.catalogInstruction()
+  if (skillCatalog) {
+    prefix = setSystemPrompt(prefix, `${KUN_SYSTEM_PROMPT}\n\n${skillCatalog}`)
+  }
   const turnService = new TurnService({
     threadStore,
     sessionStore,
@@ -130,19 +225,13 @@ export async function createKunServeRuntime(
     inflight,
     steering,
     compactor,
+    model: modelClient,
+    usage: usageService,
+    prefix,
+    defaultModel: options.model,
+    contextCompaction: options.contextCompaction,
     ids,
     nowIso
-  })
-  const threadService = new ThreadService({ threadStore, sessionStore, events, ids, nowIso })
-  await seedUsageCarryover({ threadStore, sessionStore, usageService })
-  const modelClient = new DeepseekCompatModelClient({
-    baseUrl: options.baseUrl,
-    apiKey: options.apiKey,
-    model: options.model
-  })
-  const modelProfiles = modelContextProfilesFromConfig({
-    contextCompaction: options.contextCompaction,
-    models: options.models
   })
   const reviewService = new ReviewService({
     threadStore,
@@ -150,15 +239,13 @@ export async function createKunServeRuntime(
     model: modelClient,
     defaultModel: options.model,
     nowIso,
-    modelCapabilities: (model) => modelCapabilitiesForModel(model, modelProfiles),
+    modelCapabilities,
     ...(options.models ? { models: options.models } : {}),
     ...(options.contextCompaction ? { contextCompaction: options.contextCompaction } : {}),
     ...(tokenEconomy ? { tokenEconomy } : {}),
     ...(options.runtime ? { runtime: options.runtime } : {})
   })
-  const mcpProviders = await buildMcpToolProviders(options.capabilities?.mcp)
   const webProviders = buildWebToolProviders(options.capabilities?.web)
-  const skillRuntime = await SkillRuntime.create(options.capabilities?.skills)
   const attachmentStore = options.capabilities?.attachments.enabled
     ? new FileAttachmentStore({
         rootDir: join(options.dataDir, 'attachments'),
@@ -173,6 +260,14 @@ export async function createKunServeRuntime(
         nowIso
       })
     : undefined
+  const imageGenProviders = buildImageGenToolProviders(options.capabilities?.imageGen, {
+    attachmentStore,
+    nowIso
+  })
+  const speechGenProviders = buildSpeechGenToolProviders(options.capabilities?.speechGen, { nowIso })
+  const musicGenProviders = buildMusicGenToolProviders(options.capabilities?.musicGen, { nowIso })
+  const videoGenProviders = buildVideoGenToolProviders(options.capabilities?.videoGen, { nowIso })
+  const computerUseProviders = await buildComputerUseToolProviders(options.capabilities?.computerUse)
   const baseToolProviders = [
     {
       id: 'builtin',
@@ -183,13 +278,32 @@ export async function createKunServeRuntime(
     },
     ...mcpProviders.providers,
     ...webProviders.providers,
-    ...buildMemoryToolProviders(memoryStore)
+    ...buildMemoryToolProviders(memoryStore),
+    ...buildSkillToolProviders(skillRuntime),
+    ...imageGenProviders.providers,
+    ...speechGenProviders.providers,
+    ...musicGenProviders.providers,
+    ...videoGenProviders.providers
+    // NOTE: computer_use is intentionally NOT in baseToolProviders — host
+    // control must not be delegable to subagents. It is added to the main
+    // registry only (below).
+  ]
+  // Builtin hooks are first-party and always assembled before config hooks.
+  // The design-quality linter folds findings into write/edit results so the
+  // model self-corrects; config-loaded command hooks run after it.
+  const resolvedHooks = [
+    ...buildBuiltinHooks({ quality: options.quality ?? DEFAULT_QUALITY_CONFIG }),
+    ...resolveConfiguredHooks(options.hooks)
   ]
   const childRegistry = new CapabilityRegistry(baseToolProviders)
-  const childToolHost = new LocalToolHost({ registry: childRegistry, readTracker: true })
+  const childToolHost = new LocalToolHost({
+    registry: childRegistry,
+    readTracker: true,
+    ...(resolvedHooks.length ? { hooks: resolvedHooks } : {})
+  })
   const delegationRuntime = options.capabilities?.subagents.enabled
     ? new DelegationRuntime({
-        config: options.capabilities.subagents,
+        config: mergeBuiltinSubagentProfiles(options.capabilities.subagents),
         store: new FileDelegationStore(join(options.dataDir, 'child-runs')),
         events,
         nowIso,
@@ -202,7 +316,7 @@ export async function createKunServeRuntime(
           contextCompaction: options.contextCompaction,
           approvalPolicy: options.approvalPolicy,
           sandboxMode: options.sandboxMode,
-          modelCapabilities: (model) => modelCapabilitiesForModel(model, modelProfiles),
+          modelCapabilities,
           skillRuntime,
           tokenEconomy,
           ...(options.runtime ? { runtime: options.runtime } : {}),
@@ -216,7 +330,7 @@ export async function createKunServeRuntime(
     : undefined
   const capabilities = buildRuntimeCapabilityManifest({
     config: options.capabilities,
-    model: modelCapabilitiesForModel(options.model, modelProfiles),
+    model: modelCapabilities(options.model),
     mcp: {
       configuredServers: Object.keys(options.capabilities?.mcp.servers ?? {}).length,
       connectedServers: mcpProviders.connectedServers,
@@ -247,10 +361,33 @@ export async function createKunServeRuntime(
     },
     subagents: {
       available: Boolean(delegationRuntime)
+    },
+    imageGen: {
+      available: imageGenProviders.available,
+      reason: imageGenProviders.diagnostics.find((diagnostic) => diagnostic.reason)?.reason
+    },
+    speechGen: {
+      available: speechGenProviders.available,
+      reason: speechGenProviders.diagnostics.find((diagnostic) => diagnostic.reason)?.reason
+    },
+    musicGen: {
+      available: musicGenProviders.available,
+      reason: musicGenProviders.diagnostics.find((diagnostic) => diagnostic.reason)?.reason
+    },
+    videoGen: {
+      available: videoGenProviders.available,
+      reason: videoGenProviders.diagnostics.find((diagnostic) => diagnostic.reason)?.reason
+    },
+    computerUse: {
+      available: computerUseProviders.available,
+      reason: computerUseProviders.diagnostics.find((diagnostic) => diagnostic.reason)?.reason
     }
   })
   const registry = new CapabilityRegistry([
     ...baseToolProviders,
+    // Host control is available to the top-level agent only, never to
+    // delegated subagents (which use childRegistry/baseToolProviders).
+    ...computerUseProviders.providers,
     {
       id: 'goal',
       kind: 'gui' as const,
@@ -267,7 +404,27 @@ export async function createKunServeRuntime(
     },
     ...buildDelegationToolProviders(delegationRuntime)
   ])
-  const toolHost = new LocalToolHost({ registry, readTracker: true })
+  const toolHost = new LocalToolHost({
+    registry,
+    readTracker: true,
+    ...(resolvedHooks.length ? { hooks: resolvedHooks } : {})
+  })
+  // Keep retrying MCP servers that lost the fast startup connect race so a slow
+  // npx cold start eventually shows up as connected instead of staying "error"
+  // until the next runtime restart (issue #342). Both registries advertise the
+  // MCP providers, so a late connection must be registered into each.
+  void mcpProviders.startBackgroundReconnect((provider) => {
+    try {
+      registry.registerProvider(provider)
+    } catch {
+      // ignore duplicate/colliding registration
+    }
+    try {
+      childRegistry.registerProvider(provider)
+    } catch {
+      // ignore duplicate/colliding registration
+    }
+  })
   const loop = new AgentLoop({
     threadStore,
     sessionStore,
@@ -284,12 +441,13 @@ export async function createKunServeRuntime(
     prefix,
     ids,
     nowIso,
-    modelCapabilities: (model) => modelCapabilitiesForModel(model, modelProfiles),
+    modelCapabilities,
     skillRuntime,
     tokenEconomy,
     contextCompaction: options.contextCompaction,
     ...(options.runtime?.toolStorm ? { toolStorm: options.runtime.toolStorm } : {}),
     ...(options.runtime?.toolArgumentRepair ? { toolArgumentRepair: options.runtime.toolArgumentRepair } : {}),
+    ...(resolvedHooks.length ? { hooks: resolvedHooks } : {}),
     ...(attachmentStore ? { attachmentStore } : {}),
     ...(memoryStore ? { memoryStore } : {}),
     onPlanWritten: async ({ threadId, planId, relativePath, markdown }) => {
@@ -310,6 +468,7 @@ export async function createKunServeRuntime(
     eventBus,
     sessionStore,
     events,
+    llmDebug,
     approvalGate,
     userInputGate,
     workspaceInspector,
@@ -318,6 +477,9 @@ export async function createKunServeRuntime(
     ...(memoryStore ? { memoryStore } : {}),
     runTurn(threadId, turnId) {
       return loop.runTurn(threadId, turnId)
+    },
+    resumeInterruptedGoals(threadIds) {
+      return loop.resumeInterruptedGoals(threadIds)
     },
     runReview(input) {
       return reviewService.runReview(input)
@@ -332,6 +494,7 @@ export async function createKunServeRuntime(
       configPath: options.configPath,
       dataDir: options.dataDir,
       model: options.model,
+      endpointFormat: options.endpointFormat ?? DEFAULT_MODEL_ENDPOINT_FORMAT,
       approvalPolicy: options.approvalPolicy,
       sandboxMode: options.sandboxMode,
       tokenEconomyMode: options.tokenEconomyMode,
@@ -351,11 +514,16 @@ export async function createKunServeRuntime(
         : { enabled: false, rootDir: '', count: 0, totalBytes: 0 },
       memory: memoryStore
         ? await memoryStore.diagnostics()
-        : { enabled: false, rootDir: '', activeCount: 0, tombstoneCount: 0, lastInjectedIds: [] }
+        : { enabled: false, rootDir: '', activeCount: 0, tombstoneCount: 0, lastInjectedIds: [] },
+      imageGen: imageGenProviders.diagnostics,
+      speechGen: speechGenProviders.diagnostics,
+      musicGen: musicGenProviders.diagnostics,
+      videoGen: videoGenProviders.diagnostics
     }),
     skills: () => skillRuntime.diagnostics(),
     shutdown: async () => {
       try {
+        loop.shutdownGoalResume()
         await mcpProviders.close()
       } finally {
         await stores.shutdown?.()
@@ -409,6 +577,17 @@ export async function seedUsageCarryover(input: {
   sessionStore: SessionStore
   usageService: UsageService
 }): Promise<void> {
+  if (typeof input.sessionStore.loadLatestUsageSnapshots === 'function') {
+    try {
+      const latest = await input.sessionStore.loadLatestUsageSnapshots()
+      for (const record of latest) {
+        input.usageService.seedThread(record.threadId, record.usage)
+      }
+      return
+    } catch {
+      // Fall through to JSONL replay when the optional index is unavailable.
+    }
+  }
   const threadSummaries = await input.threadStore.list()
   await Promise.all(threadSummaries.map(async (thread) => {
     const events = await input.sessionStore.loadEventsSince(thread.id, 0)
@@ -431,6 +610,26 @@ export async function startKunServe(
     host: options.host,
     port: options.port
   })
+  // Background sweep after listen: settle turns orphaned by a crash so
+  // clients stop spinning on them, without delaying readiness. Then resume
+  // goals that were interrupted mid-run so an active goal doesn't sit "in
+  // progress" forever with nothing running (KunAgent/Kun#370).
+  void runtime.turnService
+    .reconcileOrphanedTurns()
+    .then(async (threadIds) => {
+      if (threadIds.length > 0) {
+        console.warn(`[kun] marked orphaned turn(s) on ${threadIds.length} thread(s) as failed after restart`)
+      }
+      if (threadIds.length > 0 && runtime.resumeInterruptedGoals) {
+        const resumed = await runtime.resumeInterruptedGoals(threadIds)
+        if (resumed > 0) {
+          console.warn(`[kun] auto-resumed ${resumed} interrupted goal(s) after restart`)
+        }
+      }
+    })
+    .catch((error) => {
+      console.warn('[kun] orphaned turn reconciliation failed:', error)
+    })
   return {
     ...server,
     runtime,

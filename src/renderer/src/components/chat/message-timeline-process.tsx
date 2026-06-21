@@ -3,7 +3,7 @@ import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { ChevronDown, ChevronRight, Minimize2 } from 'lucide-react'
 import type { ChatBlock, ToolBlock } from '../../agent/types'
-import { looksLikeUnifiedDiff } from '../../lib/diff-stats'
+import { extractUnifiedDiffText } from '../../lib/diff-stats'
 import { useDeferredRender } from '../../hooks/use-deferred-render'
 import { openWorkspacePathInEditor } from '../../lib/open-workspace-path'
 import { previewWorkspaceFile } from '../../lib/workspace-file-preview'
@@ -86,6 +86,26 @@ function isProcessSectionActive(section: ProcessSection, processing: boolean): b
   )
 }
 
+function isRequestUserInputTool(block: ChatBlock): boolean {
+  if (block.kind === 'user_input' && block.status === 'pending') return true
+  if (block.kind !== 'tool' || block.status !== 'running') return false
+  const toolName = typeof block.meta?.toolName === 'string' ? block.meta.toolName.trim() : ''
+  if (toolName === 'request_user_input' || toolName === 'user_input') return true
+  return /^request_user_input\s*:/i.test(block.summary.trim())
+}
+
+function sectionHasRequestUserInput(section: ProcessSection): boolean {
+  return section.blocks.some(isRequestUserInputTool)
+}
+
+function isPendingApproval(block: ChatBlock): boolean {
+  return block.kind === 'approval' && block.status === 'pending'
+}
+
+function sectionHasPendingApproval(section: ProcessSection): boolean {
+  return section.blocks.some(isPendingApproval)
+}
+
 export function ProcessSectionRow({
   section,
   processing,
@@ -113,17 +133,23 @@ export function ProcessSectionRow({
     (block) =>
       (block.kind === 'tool' && block.status === 'error') ||
       (block.kind === 'approval' && block.status === 'error') ||
-      (block.kind === 'user_input' && block.status === 'error')
+      (block.kind === 'user_input' && block.status === 'error') ||
+      (block.kind === 'system' && block.severity === 'error')
   )
-  const defaultExpanded = active || hasError
-  const expanded = hasDetails && (userExpanded ?? defaultExpanded)
+  const defaultExpanded =
+    hasError ||
+    sectionHasPendingApproval(section) ||
+    (active && section.kind === 'reasoning') ||
+    (processing && section.kind === 'execution' && sectionHasRequestUserInput(section))
+  const forceExpanded = sectionHasPendingApproval(section)
+  const expanded = hasDetails && (forceExpanded || (userExpanded ?? defaultExpanded))
   const title = describeProcessSection(section, t, {
     processing,
     reasoningDurationMs,
     singleReasoningSection
   })
   const reasoningText = section.kind === 'reasoning' ? getReasoningSectionText(section) : ''
-  const canToggleSection = hasDetails
+  const canToggleSection = hasDetails && !forceExpanded
   const showActiveError = active && hasError
   const { ref: deferredDetailRef, shouldRender: shouldRenderDetail } = useDeferredRender<HTMLDivElement>({
     enabled: expanded,
@@ -241,7 +267,8 @@ function processBlockHasError(block: ChatBlock): boolean {
     (block.kind === 'tool' && block.status === 'error') ||
     (block.kind === 'compaction' && block.status === 'error') ||
     (block.kind === 'approval' && block.status === 'error') ||
-    (block.kind === 'user_input' && block.status === 'error')
+    (block.kind === 'user_input' && block.status === 'error') ||
+    (block.kind === 'system' && block.severity === 'error')
   )
 }
 
@@ -254,6 +281,7 @@ function ProcessStackRows({
 }): ReactElement {
   const { t } = useTranslation('common')
   const [openBlockId, setOpenBlockId] = useState<string | null>(null)
+  const [closedBlockIds, setClosedBlockIds] = useState<ReadonlySet<string>>(() => new Set())
 
   return (
     <div className="ds-work-stack">
@@ -262,13 +290,40 @@ function ProcessStackRows({
         const detail = getProcessDetail(block, summary)
         const isRunningTool = processBlockIsRunningTool(block, processing)
         const canExpand = detail.kind !== 'none'
-        const open = canExpand && (isRunningTool || processBlockHasError(block) || openBlockId === block.id)
-        const rowActive = processBlockIsActive(block, processing)
+        const autoOpenRequestInput = processing && isRequestUserInputTool(block)
+        const autoOpenPending = processBlockIsAutoOpenPending(block, processing) || isPendingApproval(block)
         const isError = processBlockHasError(block)
-        const canToggle = canExpand && !isRunningTool
+        const defaultOpen = isError
+        const forceOpen = autoOpenPending || autoOpenRequestInput
+        const userClosed = closedBlockIds.has(block.id)
+        const userOpened = openBlockId === block.id
+        const open = canExpand && (forceOpen || userOpened || (defaultOpen && !userClosed))
+        const rowActive = processBlockIsActive(block, processing)
+        const canToggle = canExpand && !forceOpen
         const handleToggle = (): void => {
           if (!canToggle) return
-          setOpenBlockId((id) => (id === block.id ? null : block.id))
+          if (open) {
+            setOpenBlockId((id) => (id === block.id ? null : id))
+            if (defaultOpen) {
+              setClosedBlockIds((ids) => {
+                const next = new Set(ids)
+                next.add(block.id)
+                return next
+              })
+            }
+            return
+          }
+          setClosedBlockIds((ids) => {
+            if (!ids.has(block.id)) return ids
+            const next = new Set(ids)
+            next.delete(block.id)
+            return next
+          })
+          setOpenBlockId(block.id)
+        }
+        const handleToggleButton = (event: ReactMouseEvent<HTMLButtonElement>): void => {
+          event.stopPropagation()
+          handleToggle()
         }
         const handleKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>): void => {
           if (!canToggle) return
@@ -282,6 +337,7 @@ function ProcessStackRows({
             <div
               role={canToggle ? 'button' : undefined}
               tabIndex={canToggle ? 0 : undefined}
+              aria-expanded={canToggle ? open : undefined}
               onClick={handleToggle}
               onKeyDown={handleKeyDown}
               className={`group flex w-full min-w-0 items-center gap-1.5 rounded-md px-1 py-0.5 text-left text-[13.5px] leading-6 transition ${
@@ -293,12 +349,23 @@ function ProcessStackRows({
               <span className={`min-w-0 flex-1 truncate ${rowActive && !isError ? 'ds-shiny-text' : ''}`}>
                 <ProcessSummaryText block={block} summary={summary} />
               </span>
-              {canExpand && !isRunningTool ? (
-                open ? (
-                  <ChevronDown className="h-3 w-3 shrink-0 opacity-35" strokeWidth={2} />
-                ) : (
-                  <ChevronRight className="h-3 w-3 shrink-0 opacity-0 transition group-hover:opacity-35" strokeWidth={2} />
-                )
+              {canExpand ? (
+                <button
+                  type="button"
+                  aria-label={open ? t('processCollapseDetail') : t('processExpandDetail')}
+                  aria-expanded={open}
+                  disabled={!canToggle}
+                  onClick={handleToggleButton}
+                  className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-md transition ${
+                    canToggle ? 'cursor-pointer hover:bg-ds-hover/70' : 'cursor-default'
+                  }`}
+                >
+                  {open ? (
+                    <ChevronDown className="h-3 w-3 opacity-45" strokeWidth={2} />
+                  ) : (
+                    <ChevronRight className="h-3 w-3 opacity-45" strokeWidth={2} />
+                  )}
+                </button>
               ) : null}
             </div>
             {open ? (
@@ -328,26 +395,32 @@ function ProcessEntryRow({
   processing: boolean
 }): ReactElement {
   const { t } = useTranslation('common')
-  const [userOpen, setUserOpen] = useState(false)
+  const [userOpen, setUserOpen] = useState<boolean | null>(null)
   const summary = describeProcessBlock(block, t)
   const detail = getProcessDetail(block, summary)
   const canExpand = detail.kind !== 'none'
   const isAssistantProcessText = block.kind === 'assistant'
   const isRunningTool = processBlockIsRunningTool(block, processing)
-  const isAutoOpenPending = processBlockIsAutoOpenPending(block, processing)
+  const isAutoOpenPending = processBlockIsAutoOpenPending(block, processing) || isPendingApproval(block)
   const isStreamingAssistant = processing && block.kind === 'assistant' && block.id === 'live-assistant'
   const isError = processBlockHasError(block)
+  const forceOpen = isAutoOpenPending || isAssistantProcessText || isStreamingAssistant
+  const defaultOpen = isError
   const open =
     canExpand &&
-    (isRunningTool || isError || isAssistantProcessText || isAutoOpenPending || isStreamingAssistant || userOpen)
+    (forceOpen || (userOpen ?? defaultOpen))
 
   const { verb, rest } = splitVerb(summary)
   const rowActive = isRunningTool || isAutoOpenPending || isStreamingAssistant
   const wrapSummary = (block.kind === 'system' && !canExpand) || isAssistantProcessText
-  const canToggle = canExpand && !isRunningTool && !isAutoOpenPending && !isAssistantProcessText
+  const canToggle = canExpand && !forceOpen
   const handleToggle = (): void => {
     if (!canToggle) return
-    setUserOpen((v) => !v)
+    setUserOpen(!open)
+  }
+  const handleToggleButton = (event: ReactMouseEvent<HTMLButtonElement>): void => {
+    event.stopPropagation()
+    handleToggle()
   }
   const handleKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>): void => {
     if (!canToggle) return
@@ -361,6 +434,7 @@ function ProcessEntryRow({
       <div
         role={canToggle ? 'button' : undefined}
         tabIndex={canToggle ? 0 : undefined}
+        aria-expanded={canToggle ? open : undefined}
         onClick={handleToggle}
         onKeyDown={handleKeyDown}
         className={`group flex w-full items-start gap-2 rounded-md px-2 py-1 text-left text-[13.5px] leading-[1.55] transition ${
@@ -392,12 +466,23 @@ function ProcessEntryRow({
             </span>
           ) : null}
         </span>
-        {canExpand && !isRunningTool ? (
-          open ? (
-            <ChevronDown className="mt-1 h-3 w-3 shrink-0 opacity-40" strokeWidth={2} />
-          ) : (
-            <ChevronRight className="mt-1 h-3 w-3 shrink-0 opacity-0 transition group-hover:opacity-45" strokeWidth={2} />
-          )
+        {canExpand ? (
+          <button
+            type="button"
+            aria-label={open ? t('processCollapseDetail') : t('processExpandDetail')}
+            aria-expanded={open}
+            disabled={!canToggle}
+            onClick={handleToggleButton}
+            className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md transition ${
+              canToggle ? 'cursor-pointer hover:bg-ds-hover/70' : 'cursor-default'
+            }`}
+          >
+            {open ? (
+              <ChevronDown className="h-3 w-3 opacity-45" strokeWidth={2} />
+            ) : (
+              <ChevronRight className="h-3 w-3 opacity-45" strokeWidth={2} />
+            )}
+          </button>
         ) : null}
       </div>
       <RuntimeMetaBadges block={block} t={t} />
@@ -545,7 +630,7 @@ function ProcessFileReference({
     event.stopPropagation()
     void openWorkspacePathInEditor({ path }, workspaceRoot).then((result) => {
       if (!result.ok) {
-        void window.dsGui?.logError?.('editor-open', 'Failed to open process file reference', {
+        void window.kunGui?.logError?.('editor-open', 'Failed to open process file reference', {
           message: result.message,
           target: { path, workspaceRoot }
         })?.catch(() => undefined)
@@ -823,12 +908,14 @@ function getProcessDetail(block: ChatBlock, summaryText?: string): ProcessDetail
       return { kind: 'none' }
     }
     const isError = block.status === 'error'
-    const isPatch =
-      block.toolKind === 'file_change' && !isError && looksLikeUnifiedDiff(detailText)
+    const patchText =
+      block.toolKind === 'file_change' && !isError
+        ? extractUnifiedDiffText(detailText)
+        : undefined
     return {
       kind: 'tool',
-      text: block.detail!,
-      isPatch,
+      text: patchText ?? block.detail!,
+      isPatch: patchText !== undefined,
       isError,
       filePath: block.filePath
     }
@@ -844,6 +931,7 @@ function getProcessDetail(block: ChatBlock, summaryText?: string): ProcessDetail
   if (block.kind === 'approval') return { kind: 'approval' }
   if (block.kind === 'user_input') return { kind: 'user_input' }
   if (block.kind === 'system' && block.text.trim()) {
+    if (block.detail?.trim()) return { kind: 'text', text: block.detail }
     // Short system messages already fit in the summary line — skip the
     // expand affordance so we don't duplicate the same string.
     if (block.text.length <= 140) return { kind: 'none' }
@@ -936,6 +1024,15 @@ function describeProcessBlock(
         before: block.messagesBefore,
         after: block.messagesAfter
       })
+    }
+    // `messagesBefore` carries the folded (released) token estimate. When known,
+    // show it so a manual compaction reads as a concrete, attributable action.
+    const releasedTokens = typeof block.messagesBefore === 'number' ? block.messagesBefore : 0
+    if (releasedTokens > 0) {
+      const tokens = releasedTokens.toLocaleString()
+      return block.auto === true
+        ? t('compactionAutoCompletedWithTokens', { tokens })
+        : t('compactionManualCompletedWithTokens', { tokens })
     }
     return block.auto === true ? t('compactionAutoCompleted') : t('compactionManualCompleted')
   }

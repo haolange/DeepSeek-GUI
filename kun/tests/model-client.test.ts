@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest'
-import { DeepseekCompatModelClient } from '../src/adapters/model/deepseek-compat-model-client.js'
+import { describe, expect, it, vi } from 'vitest'
+import { CompatModelClient } from '../src/adapters/model/compat-model-client.js'
 import {
   makeAssistantReasoningItem,
   makeAssistantTextItem,
@@ -8,7 +8,7 @@ import {
   makeToolResultItem,
   makeUserItem
 } from '../src/domain/item.js'
-import type { ModelRequest } from '../src/ports/model-client.js'
+import type { ModelRequest, ModelStreamChunk } from '../src/ports/model-client.js'
 
 function buildRequest(abortSignal: AbortSignal): ModelRequest {
   return {
@@ -33,7 +33,68 @@ function buildRequest(abortSignal: AbortSignal): ModelRequest {
   }
 }
 
-describe('DeepseekCompatModelClient', () => {
+const READ_IMAGE_BASE64 = 'aW1hZ2UtYnl0ZXM='
+
+function readImageToolRequest(model: string): ModelRequest {
+  const request = buildRequest(new AbortController().signal)
+  request.model = model
+  request.tools = [{
+    name: 'read',
+    description: 'Read a file from the workspace.',
+    inputSchema: {
+      type: 'object',
+      properties: { path: { type: 'string' } },
+      required: ['path']
+    }
+  }]
+  request.history = [
+    makeToolCallItem({
+      id: 'item_call_read',
+      threadId: 'thr_1',
+      turnId: 'turn_1',
+      callId: 'call_read',
+      toolName: 'read',
+      arguments: { path: 'img/diagram.png' }
+    }),
+    makeToolResultItem({
+      id: 'item_result_read',
+      threadId: 'thr_1',
+      turnId: 'turn_1',
+      callId: 'call_read',
+      toolName: 'read',
+      output: {
+        path: '/workspace/img/diagram.png',
+        relative_path: 'img/diagram.png',
+        kind: 'image',
+        mime_type: 'image/png',
+        width: 16,
+        height: 8,
+        byte_size: 11,
+        data_base64: READ_IMAGE_BASE64,
+        note: 'Read image file [image/png]'
+      }
+    })
+  ]
+  return request
+}
+
+function collectKinds(chunks: ModelStreamChunk[]): string[] {
+  return chunks.map((chunk) => chunk.kind)
+}
+
+function sseStream(payloads: Array<Record<string, unknown> | '[DONE]'>): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder()
+  return new ReadableStream({
+    start(controller) {
+      for (const payload of payloads) {
+        controller.enqueue(encoder.encode(`data: ${payload === '[DONE]' ? payload : JSON.stringify(payload)}\n\n`))
+      }
+      controller.close()
+    }
+  })
+}
+
+describe('CompatModelClient', () => {
   it('uses request.model over client default model', async () => {
     const response = {
       id: 'r2',
@@ -62,7 +123,7 @@ describe('DeepseekCompatModelClient', () => {
         headers: { 'content-type': 'application/json' }
       })
     }
-    const client = new DeepseekCompatModelClient({
+    const client = new CompatModelClient({
       baseUrl: 'https://example.com/beta',
       apiKey: 'k',
       model: 'deepseek-chat',
@@ -75,6 +136,856 @@ describe('DeepseekCompatModelClient', () => {
       // drain
     }
     expect(sentBodies[0]?.model).toBe('deepseek-v4-pro')
+  })
+
+  it('builds chat completions URLs for base URLs with and without version segments', async () => {
+    const cases = [
+      ['https://zenmux.ai/api', 'https://zenmux.ai/api/v1/chat/completions'],
+      ['https://zenmux.ai/api/v1', 'https://zenmux.ai/api/v1/chat/completions'],
+      ['https://zenmux.ai/api/v1/', 'https://zenmux.ai/api/v1/chat/completions'],
+      ['https://zenmux.ai/api/v2', 'https://zenmux.ai/api/v2/chat/completions'],
+      ['https://api.deepseek.com/beta', 'https://api.deepseek.com/v1/chat/completions'],
+      ['https://api.deepseek.com', 'https://api.deepseek.com/v1/chat/completions']
+    ]
+
+    for (const [baseUrl, expectedUrl] of cases) {
+      const sentUrls: string[] = []
+      const fetchImpl: typeof fetch = async (url) => {
+        sentUrls.push(String(url))
+        return new Response(JSON.stringify({
+          id: 'url',
+          model: 'deepseek-chat',
+          choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: 'done' } }]
+        }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        })
+      }
+      const client = new CompatModelClient({
+        baseUrl,
+        apiKey: 'k',
+        model: 'deepseek-chat',
+        fetchImpl,
+        nonStreaming: true
+      })
+
+      for await (const _chunk of client.stream(buildRequest(new AbortController().signal))) {
+        // drain
+      }
+
+      expect(sentUrls[0]).toBe(expectedUrl)
+    }
+  })
+
+  it('uses the Responses API format when selected', async () => {
+    const sentUrls: string[] = []
+    const sentBodies: Array<Record<string, unknown>> = []
+    const fetchImpl: typeof fetch = async (url, init) => {
+      sentUrls.push(String(url))
+      sentBodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+      return new Response(JSON.stringify({
+        id: 'resp_1',
+        status: 'completed',
+        output_text: 'done',
+        usage: { input_tokens: 2, output_tokens: 3, total_tokens: 5 }
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    }
+    const client = new CompatModelClient({
+      baseUrl: 'https://example.com/api/v1',
+      apiKey: 'k',
+      model: 'gpt-5-mini',
+      endpointFormat: 'responses',
+      fetchImpl,
+      nonStreaming: true
+    })
+    const request = buildRequest(new AbortController().signal)
+    request.maxTokens = 128
+    request.responseFormat = 'json_object'
+    const chunks: ModelStreamChunk[] = []
+    for await (const chunk of client.stream(request)) {
+      chunks.push(chunk)
+    }
+
+    expect(sentUrls[0]).toBe('https://example.com/api/v1/responses')
+    expect(sentBodies[0]).toMatchObject({
+      model: 'deepseek-chat',
+      max_output_tokens: 128,
+      text: { format: { type: 'json_object' } }
+    })
+    expect(sentBodies[0]?.input).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: 'system', content: 'You are a helpful assistant.' })
+    ]))
+    expect(sentBodies[0]?.tools).toEqual([
+      expect.objectContaining({
+        type: 'function',
+        name: 'echo',
+        parameters: expect.objectContaining({ type: 'object' })
+      })
+    ])
+    expect(chunks).toEqual([
+      { kind: 'assistant_text_delta', text: 'done' },
+      expect.objectContaining({ kind: 'usage', usage: expect.objectContaining({ promptTokens: 2, completionTokens: 3 }) }),
+      { kind: 'completed', stopReason: 'stop' }
+    ])
+  })
+
+  it('injects read-tool images as chat completions image parts for vision models', async () => {
+    const sentBodies: Array<Record<string, unknown>> = []
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      sentBodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+      return new Response(JSON.stringify({
+        id: 'cmpl_read_image',
+        model: 'vision-model',
+        choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: 'ok' } }]
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    }
+    const client = new CompatModelClient({
+      baseUrl: 'https://example.com/v1',
+      apiKey: 'k',
+      model: 'vision-model',
+      endpointFormat: 'chat_completions',
+      fetchImpl,
+      nonStreaming: true,
+      modelCapabilities: (model) => ({
+        id: model,
+        inputModalities: ['text', 'image'],
+        outputModalities: ['text'],
+        supportsToolCalling: true,
+        messageParts: ['text', 'image_url']
+      })
+    })
+
+    for await (const _chunk of client.stream(readImageToolRequest('vision-model'))) {
+      // drain
+    }
+
+    const messages = sentBodies[0]?.messages as Array<{ role: string; content: unknown }> | undefined
+    const toolMessage = messages?.find((message) => message.role === 'tool')
+    const imageMessage = messages?.find((message) =>
+      message.role === 'user' && Array.isArray(message.content)
+    )
+
+    expect(String(toolMessage?.content ?? '')).toContain('"kind":"image"')
+    expect(String(toolMessage?.content ?? '')).not.toContain(READ_IMAGE_BASE64)
+    expect(imageMessage?.content).toEqual([
+      expect.objectContaining({ type: 'text', text: expect.stringContaining('tool call(s) above returned the following image') }),
+      { type: 'image_url', image_url: { url: `data:image/png;base64,${READ_IMAGE_BASE64}` } }
+    ])
+  })
+
+  it('keeps read-tool image results as text for text-only models', async () => {
+    const sentBodies: Array<Record<string, unknown>> = []
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      sentBodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+      return new Response(JSON.stringify({
+        id: 'cmpl_text_read_image',
+        model: 'text-model',
+        choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: 'ok' } }]
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    }
+    const client = new CompatModelClient({
+      baseUrl: 'https://example.com/v1',
+      apiKey: 'k',
+      model: 'text-model',
+      endpointFormat: 'chat_completions',
+      fetchImpl,
+      nonStreaming: true,
+      modelCapabilities: (model) => ({
+        id: model,
+        inputModalities: ['text'],
+        outputModalities: ['text'],
+        supportsToolCalling: true,
+        messageParts: ['text']
+      })
+    })
+
+    for await (const _chunk of client.stream(readImageToolRequest('text-model'))) {
+      // drain
+    }
+
+    const messages = sentBodies[0]?.messages as Array<{ role: string; content: unknown }> | undefined
+    expect(messages?.some((message) => Array.isArray(message.content))).toBe(false)
+    const toolContent = String(messages?.find((message) => message.role === 'tool')?.content ?? '')
+    expect(toolContent).toContain('"kind":"image"')
+    expect(toolContent).not.toContain(READ_IMAGE_BASE64)
+  })
+
+  it('injects read-tool images as Responses API input_image parts for vision models', async () => {
+    const sentBodies: Array<Record<string, unknown>> = []
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      sentBodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+      return new Response(JSON.stringify({
+        id: 'resp_read_image',
+        status: 'completed',
+        output_text: 'ok'
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    }
+    const client = new CompatModelClient({
+      baseUrl: 'https://example.com/v1',
+      apiKey: 'k',
+      model: 'vision-model',
+      endpointFormat: 'responses',
+      fetchImpl,
+      nonStreaming: true,
+      modelCapabilities: (model) => ({
+        id: model,
+        inputModalities: ['text', 'image'],
+        outputModalities: ['text'],
+        supportsToolCalling: true,
+        messageParts: ['text', 'input_image']
+      })
+    })
+
+    for await (const _chunk of client.stream(readImageToolRequest('vision-model'))) {
+      // drain
+    }
+
+    const input = sentBodies[0]?.input as Array<Record<string, unknown>> | undefined
+    expect(input).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'function_call_output',
+        call_id: 'call_read',
+        output: expect.stringContaining('"kind":"image"')
+      })
+    ]))
+    expect(String(input?.find((item) => item.type === 'function_call_output')?.output ?? '')).not.toContain(READ_IMAGE_BASE64)
+    expect(input).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        role: 'user',
+        content: expect.arrayContaining([
+          { type: 'input_image', image_url: `data:image/png;base64,${READ_IMAGE_BASE64}` }
+        ])
+      })
+    ]))
+  })
+
+  it('injects read-tool images as Anthropic image blocks for vision models', async () => {
+    const sentBodies: Array<Record<string, unknown>> = []
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      sentBodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+      return new Response(JSON.stringify({
+        id: 'msg_read_image',
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'ok' }],
+        stop_reason: 'end_turn'
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    }
+    const client = new CompatModelClient({
+      baseUrl: 'https://example.com/v1',
+      apiKey: 'k',
+      model: 'vision-model',
+      endpointFormat: 'messages',
+      fetchImpl,
+      nonStreaming: true,
+      modelCapabilities: (model) => ({
+        id: model,
+        inputModalities: ['text', 'image'],
+        outputModalities: ['text'],
+        supportsToolCalling: true,
+        messageParts: ['text', 'image_url']
+      })
+    })
+
+    for await (const _chunk of client.stream(readImageToolRequest('vision-model'))) {
+      // drain
+    }
+
+    const messages = sentBodies[0]?.messages as Array<{ role: string; content: Array<Record<string, unknown>> }> | undefined
+    const userMessage = messages?.find((message) => message.role === 'user')
+    expect(userMessage?.content).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'tool_result',
+        tool_use_id: 'call_read',
+        content: expect.stringContaining('"kind":"image"')
+      }),
+      expect.objectContaining({
+        type: 'image',
+        source: {
+          type: 'base64',
+          media_type: 'image/png',
+          data: READ_IMAGE_BASE64
+        }
+      })
+    ]))
+    const toolResult = userMessage?.content.find((part) => part.type === 'tool_result')
+    expect(String(toolResult?.content ?? '')).not.toContain(READ_IMAGE_BASE64)
+  })
+
+  it('maps Responses API cached input token details into cache telemetry', async () => {
+    const fetchImpl: typeof fetch = async () =>
+      new Response(JSON.stringify({
+        id: 'resp_cache',
+        status: 'completed',
+        output_text: 'cached',
+        usage: {
+          input_tokens: 400,
+          output_tokens: 20,
+          total_tokens: 420,
+          input_tokens_details: { cached_tokens: 300 }
+        }
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    const client = new CompatModelClient({
+      baseUrl: 'https://example.com/api/v1',
+      apiKey: 'k',
+      model: 'gpt-5-mini',
+      endpointFormat: 'responses',
+      fetchImpl,
+      nonStreaming: true
+    })
+
+    const chunks: ModelStreamChunk[] = []
+    for await (const chunk of client.stream(buildRequest(new AbortController().signal))) {
+      chunks.push(chunk)
+    }
+
+    const usageChunk = chunks.find((chunk) => chunk.kind === 'usage')
+    const usage = usageChunk && usageChunk.kind === 'usage' ? usageChunk.usage : null
+    expect(usage).not.toBeNull()
+    expect(usage).toMatchObject({
+      promptTokens: 400,
+      completionTokens: 20,
+      totalTokens: 420,
+      cachedTokens: 300,
+      cacheHitTokens: 300,
+      cacheMissTokens: 100
+    })
+    expect(usage?.cacheHitRate).toBeCloseTo(0.75)
+  })
+
+  it('uses the Anthropic Messages API format when selected', async () => {
+    const sentUrls: string[] = []
+    const sentBodies: Array<Record<string, unknown>> = []
+    const sentHeaders: Array<Record<string, string>> = []
+    const fetchImpl: typeof fetch = async (url, init) => {
+      sentUrls.push(String(url))
+      sentBodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+      sentHeaders.push(init?.headers as Record<string, string>)
+      return new Response(JSON.stringify({
+        id: 'msg_1',
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'hello' }],
+        stop_reason: 'end_turn',
+        usage: { input_tokens: 4, output_tokens: 2 }
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    }
+    const client = new CompatModelClient({
+      baseUrl: 'https://claude.example',
+      apiKey: 'anthropic-key',
+      model: 'claude-sonnet-4-5',
+      endpointFormat: 'messages',
+      fetchImpl,
+      nonStreaming: true
+    })
+    const chunks: ModelStreamChunk[] = []
+    for await (const chunk of client.stream(buildRequest(new AbortController().signal))) {
+      chunks.push(chunk)
+    }
+
+    expect(sentUrls[0]).toBe('https://claude.example/v1/messages')
+    expect(sentHeaders[0]).toMatchObject({
+      Authorization: 'Bearer anthropic-key',
+      'x-api-key': 'anthropic-key',
+      'anthropic-version': '2023-06-01'
+    })
+    expect(sentBodies[0]).toMatchObject({
+      model: 'deepseek-chat',
+      max_tokens: 4096,
+      system: [{
+        type: 'text',
+        text: 'You are a helpful assistant.',
+        cache_control: { type: 'ephemeral' }
+      }],
+      messages: [],
+      tools: [{
+        name: 'echo',
+        description: 'Echo a string back to the model.',
+        input_schema: expect.objectContaining({ type: 'object' })
+      }]
+    })
+    expect(chunks).toEqual([
+      { kind: 'assistant_text_delta', text: 'hello' },
+      expect.objectContaining({ kind: 'usage', usage: expect.objectContaining({ promptTokens: 4, completionTokens: 2 }) }),
+      { kind: 'completed', stopReason: 'stop' }
+    ])
+  })
+
+  it('keeps volatile context out of the Anthropic system block and marks cache breakpoints', async () => {
+    const sentBodies: Array<Record<string, unknown>> = []
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      sentBodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+      return new Response(JSON.stringify({
+        id: 'msg_2',
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'ok' }],
+        stop_reason: 'end_turn',
+        usage: { input_tokens: 4, output_tokens: 2 }
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    }
+    const client = new CompatModelClient({
+      baseUrl: 'https://api.minimaxi.com/anthropic',
+      apiKey: 'k',
+      model: 'MiniMax-M2.5',
+      endpointFormat: 'messages',
+      fetchImpl,
+      nonStreaming: true
+    })
+    const request = buildRequest(new AbortController().signal)
+    request.contextInstructions = ['Tokens used: 4321 — continue the goal.']
+    request.history = [
+      makeUserItem({ id: 'user_1', turnId: 'turn_1', threadId: 'thr_1', text: 'hello' }),
+      makeAssistantTextItem({ id: 'asst_1', turnId: 'turn_1', threadId: 'thr_1', text: 'hi there' }),
+      makeUserItem({ id: 'user_2', turnId: 'turn_2', threadId: 'thr_1', text: 'continue' })
+    ]
+    for await (const _chunk of client.stream(request)) {
+      // drain
+    }
+
+    const body = sentBodies[0]
+    // The volatile per-turn instruction must not invalidate the cached
+    // system prefix: it trails the history inside the final user turn.
+    expect(body.system).toEqual([{
+      type: 'text',
+      text: 'You are a helpful assistant.',
+      cache_control: { type: 'ephemeral' }
+    }])
+    const messages = body.messages as Array<{ role: string; content: Array<Record<string, unknown>> }>
+    const lastMessage = messages[messages.length - 1]
+    expect(lastMessage.role).toBe('user')
+    const lastBlocks = lastMessage.content
+    expect(lastBlocks.some((block) => String(block.text ?? '').includes('Tokens used: 4321'))).toBe(true)
+    // Explicit-cache providers (MiniMax) only cache content before
+    // cache_control breakpoints: the last two messages carry one.
+    expect(lastBlocks[lastBlocks.length - 1].cache_control).toEqual({ type: 'ephemeral' })
+    const previousMessage = messages[messages.length - 2]
+    const previousBlocks = previousMessage.content
+    expect(previousBlocks[previousBlocks.length - 1].cache_control).toEqual({ type: 'ephemeral' })
+  })
+
+  it('enables MiniMax M3 adaptive thinking from a model reasoning profile', async () => {
+    const sentBodies: Array<Record<string, unknown>> = []
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      sentBodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+      return new Response(JSON.stringify({
+        id: 'msg_m3',
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'ok' }],
+        stop_reason: 'end_turn'
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    }
+    const client = new CompatModelClient({
+      baseUrl: 'https://api.minimaxi.com/anthropic',
+      apiKey: 'k',
+      model: 'MiniMax-M3',
+      endpointFormat: 'messages',
+      fetchImpl,
+      nonStreaming: true,
+      modelCapabilities: (model) => ({
+        id: model,
+        inputModalities: ['text', 'image'],
+        outputModalities: ['text'],
+        supportsToolCalling: true,
+        contextWindowTokens: 1_000_000,
+        messageParts: ['text', 'image_url'],
+        reasoning: {
+          supportedEfforts: ['auto', 'off'],
+          defaultEffort: 'auto',
+          requestProtocol: 'anthropic-thinking'
+        }
+      })
+    })
+    const request = buildRequest(new AbortController().signal)
+    request.model = 'MiniMax-M3'
+    request.reasoningEffort = 'max'
+    for await (const _chunk of client.stream(request)) {
+      // drain
+    }
+
+    expect(sentBodies[0]?.thinking).toEqual({ type: 'adaptive' })
+  })
+
+  it('sends Anthropic Messages effort with adaptive thinking from a model reasoning profile', async () => {
+    const sentBodies: Array<Record<string, unknown>> = []
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      sentBodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+      return new Response(JSON.stringify({
+        id: 'msg_effort',
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'ok' }],
+        stop_reason: 'end_turn'
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    }
+    const client = new CompatModelClient({
+      baseUrl: 'https://example.com/anthropic',
+      apiKey: 'k',
+      model: 'deepseek-v4-pro',
+      endpointFormat: 'messages',
+      fetchImpl,
+      nonStreaming: true,
+      modelCapabilities: (model) => ({
+        id: model,
+        inputModalities: ['text'],
+        outputModalities: ['text'],
+        supportsToolCalling: true,
+        contextWindowTokens: 1_000_000,
+        messageParts: ['text'],
+        reasoning: {
+          supportedEfforts: ['off', 'low', 'medium', 'high', 'max'],
+          defaultEffort: 'max',
+          requestProtocol: 'anthropic-thinking'
+        }
+      })
+    })
+    const request = buildRequest(new AbortController().signal)
+    request.model = 'deepseek-v4-pro'
+    request.reasoningEffort = 'max'
+    for await (const _chunk of client.stream(request)) {
+      // drain
+    }
+
+    expect(sentBodies[0]?.thinking).toEqual({ type: 'adaptive' })
+    expect(sentBodies[0]?.output_config).toEqual({ effort: 'max' })
+  })
+
+  it('does not send thinking controls for MiniMax M2.x built-in reasoning profiles', async () => {
+    const sentBodies: Array<Record<string, unknown>> = []
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      sentBodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+      return new Response(JSON.stringify({
+        id: 'msg_m25',
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'ok' }],
+        stop_reason: 'end_turn'
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    }
+    const client = new CompatModelClient({
+      baseUrl: 'https://api.minimaxi.com/anthropic',
+      apiKey: 'k',
+      model: 'MiniMax-M2.5',
+      endpointFormat: 'messages',
+      fetchImpl,
+      nonStreaming: true,
+      modelCapabilities: (model) => ({
+        id: model,
+        inputModalities: ['text'],
+        outputModalities: ['text'],
+        supportsToolCalling: true,
+        contextWindowTokens: 204_800,
+        messageParts: ['text'],
+        reasoning: {
+          supportedEfforts: ['auto'],
+          defaultEffort: 'auto',
+          requestProtocol: 'none'
+        }
+      })
+    })
+    const request = buildRequest(new AbortController().signal)
+    request.model = 'MiniMax-M2.5'
+    request.reasoningEffort = 'off'
+    for await (const _chunk of client.stream(request)) {
+      // drain
+    }
+
+    expect(sentBodies[0]).not.toHaveProperty('thinking')
+  })
+
+  it('maps GLM reasoning profiles to GLM thinking request controls', async () => {
+    const sentBodies: Array<Record<string, unknown>> = []
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      sentBodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+      return new Response(JSON.stringify({
+        id: 'glm_1',
+        model: 'glm-5.2',
+        choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: 'ok' } }]
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    }
+    const client = new CompatModelClient({
+      baseUrl: 'https://open.bigmodel.cn/api/coding/paas/v4',
+      apiKey: 'k',
+      model: 'glm-5.2',
+      fetchImpl,
+      nonStreaming: true,
+      modelCapabilities: (model) => ({
+        id: model,
+        inputModalities: ['text'],
+        outputModalities: ['text'],
+        supportsToolCalling: true,
+        contextWindowTokens: 1_000_000,
+        messageParts: ['text'],
+        reasoning: {
+          supportedEfforts: ['off', 'high', 'max'],
+          defaultEffort: 'max',
+          requestProtocol: 'glm-chat-completions'
+        }
+      })
+    })
+    const request = buildRequest(new AbortController().signal)
+    request.model = 'glm-5.2'
+    request.reasoningEffort = 'max'
+    for await (const _chunk of client.stream(request)) {
+      // drain
+    }
+
+    expect(sentBodies[0]?.thinking).toEqual({ type: 'enabled', clear_thinking: true })
+    expect(sentBodies[0]).not.toHaveProperty('reasoning_effort')
+  })
+
+  it('maps Anthropic usage where input_tokens excludes cache reads and writes', async () => {
+    const fetchImpl: typeof fetch = async () =>
+      new Response(JSON.stringify({
+        id: 'msg_3',
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'ok' }],
+        stop_reason: 'end_turn',
+        usage: {
+          input_tokens: 50,
+          output_tokens: 10,
+          cache_read_input_tokens: 1000,
+          cache_creation_input_tokens: 200
+        }
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    const client = new CompatModelClient({
+      baseUrl: 'https://api.minimaxi.com/anthropic',
+      apiKey: 'k',
+      model: 'MiniMax-M2.5',
+      endpointFormat: 'messages',
+      fetchImpl,
+      nonStreaming: true
+    })
+    const chunks: ModelStreamChunk[] = []
+    const request = buildRequest(new AbortController().signal)
+    request.model = 'MiniMax-M2.5'
+    for await (const chunk of client.stream(request)) {
+      chunks.push(chunk)
+    }
+    const usageChunk = chunks.find((chunk) => chunk.kind === 'usage')
+    const usage = usageChunk && usageChunk.kind === 'usage' ? usageChunk.usage : null
+    expect(usage).not.toBeNull()
+    expect(usage!.promptTokens).toBe(1250)
+    expect(usage!.cacheHitTokens).toBe(1000)
+    expect(usage!.cacheMissTokens).toBe(250)
+    expect(usage!.totalTokens).toBe(1260)
+    expect(usage!.cacheHitRate).toBeCloseTo(0.8)
+    expect(usage!.costCny).toBeCloseTo(0.000924)
+    expect(usage!.costUsd).toBeUndefined()
+  })
+
+  it('streams Responses API text and function calls', async () => {
+    const fetchImpl: typeof fetch = async () => new Response(sseStream([
+      { type: 'response.output_text.delta', delta: 'hi' },
+      {
+        type: 'response.output_item.added',
+        output_index: 1,
+        item: { type: 'function_call', call_id: 'call_echo', name: 'echo', arguments: '' }
+      },
+      { type: 'response.function_call_arguments.delta', output_index: 1, delta: '{"text":"ok"}' },
+      {
+        type: 'response.output_item.done',
+        output_index: 1,
+        item: { type: 'function_call', call_id: 'call_echo', name: 'echo', arguments: '{"text":"ok"}' }
+      },
+      {
+        type: 'response.completed',
+        response: {
+          status: 'completed',
+          output: [{ type: 'function_call', call_id: 'call_echo', name: 'echo', arguments: '{"text":"ok"}' }],
+          usage: { input_tokens: 3, output_tokens: 4 }
+        }
+      }
+    ]), {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' }
+    })
+    const client = new CompatModelClient({
+      baseUrl: 'https://example.com',
+      apiKey: 'k',
+      model: 'gpt-5-mini',
+      endpointFormat: 'responses',
+      fetchImpl
+    })
+    const chunks: ModelStreamChunk[] = []
+    for await (const chunk of client.stream(buildRequest(new AbortController().signal))) {
+      chunks.push(chunk)
+    }
+
+    expect(collectKinds(chunks)).toEqual([
+      'assistant_text_delta',
+      'tool_call_delta',
+      'tool_call_complete',
+      'usage',
+      'completed'
+    ])
+    expect(chunks.find((chunk) => chunk.kind === 'tool_call_complete')).toMatchObject({
+      callId: 'call_echo',
+      toolName: 'echo',
+      arguments: { text: 'ok' }
+    })
+  })
+
+  it('streams Anthropic Messages API text and tool calls', async () => {
+    const fetchImpl: typeof fetch = async () => new Response(sseStream([
+      {
+        type: 'message_start',
+        message: { usage: { input_tokens: 5, output_tokens: 1 } }
+      },
+      {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'text_delta', text: 'hi' }
+      },
+      {
+        type: 'content_block_start',
+        index: 1,
+        content_block: { type: 'tool_use', id: 'toolu_1', name: 'echo', input: {} }
+      },
+      {
+        type: 'content_block_delta',
+        index: 1,
+        delta: { type: 'input_json_delta', partial_json: '{"text":"ok"}' }
+      },
+      { type: 'content_block_stop', index: 1 },
+      { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 8 } },
+      { type: 'message_stop' }
+    ]), {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' }
+    })
+    const client = new CompatModelClient({
+      baseUrl: 'https://claude.example',
+      apiKey: 'k',
+      model: 'claude-sonnet-4-5',
+      endpointFormat: 'messages',
+      fetchImpl
+    })
+    const chunks: ModelStreamChunk[] = []
+    for await (const chunk of client.stream(buildRequest(new AbortController().signal))) {
+      chunks.push(chunk)
+    }
+
+    expect(collectKinds(chunks)).toEqual([
+      'assistant_text_delta',
+      'tool_call_delta',
+      'tool_call_complete',
+      'usage',
+      'completed'
+    ])
+    expect(chunks.find((chunk) => chunk.kind === 'tool_call_complete')).toMatchObject({
+      callId: 'toolu_1',
+      toolName: 'echo',
+      arguments: { text: 'ok' }
+    })
+    expect(chunks.find((chunk) => chunk.kind === 'usage')).toMatchObject({
+      usage: expect.objectContaining({ promptTokens: 5, completionTokens: 8, totalTokens: 13 })
+    })
+  })
+
+  it('does not inject body.thinking on non-DeepSeek host (issue #26)', async () => {
+    const response = {
+      id: 'r3',
+      model: 'deepseek-chat',
+      choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: 'ok' } }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }
+    }
+    const sentBodies: Array<Record<string, unknown>> = []
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      sentBodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+      return new Response(JSON.stringify(response), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    }
+    const client = new CompatModelClient({
+      baseUrl: 'https://openrouter.ai/api/v1',   // NOT api.deepseek.com
+      apiKey: 'k',
+      model: 'deepseek-v4-pro',
+      fetchImpl,
+      nonStreaming: true
+    })
+    const request = buildRequest(new AbortController().signal)
+    request.model = 'deepseek-v4-pro'
+    for await (const _chunk of client.stream(request)) {
+      // drain
+    }
+    // The DeepSeek-specific `thinking` protocol extension must not be sent
+    // to third-party OpenAI-compat providers — they may reject it. See issue #26.
+    expect(sentBodies[0]).not.toHaveProperty('thinking')
+  })
+
+  it('injects body.thinking on the official DeepSeek host (issue #26 regression guard)', async () => {
+    const response = {
+      id: 'r4',
+      model: 'deepseek-chat',
+      choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: 'ok' } }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }
+    }
+    const sentBodies: Array<Record<string, unknown>> = []
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      sentBodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+      return new Response(JSON.stringify(response), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    }
+    const client = new CompatModelClient({
+      baseUrl: 'https://api.deepseek.com',
+      apiKey: 'k',
+      model: 'deepseek-v4-pro',
+      fetchImpl,
+      nonStreaming: true
+    })
+    const request = buildRequest(new AbortController().signal)
+    request.model = 'deepseek-v4-pro'
+    for await (const _chunk of client.stream(request)) {
+      // drain
+    }
+    // On the official host, the `thinking` field must still be set for v4 models.
+    expect(sentBodies[0]).toHaveProperty('thinking')
+    expect((sentBodies[0] as { thinking: { type: string } }).thinking).toMatchObject({ type: 'enabled' })
   })
 
   it('sends per-request router controls when requested', async () => {
@@ -102,7 +1013,7 @@ describe('DeepseekCompatModelClient', () => {
         headers: { 'content-type': 'application/json' }
       })
     }
-    const client = new DeepseekCompatModelClient({
+    const client = new CompatModelClient({
       baseUrl: 'https://example.com/beta',
       apiKey: 'k',
       model: 'deepseek-chat',
@@ -130,6 +1041,40 @@ describe('DeepseekCompatModelClient', () => {
     })
   })
 
+  it('requests usage in streaming responses', async () => {
+    const sentBodies: Array<Record<string, unknown>> = []
+    const sentHeaders: Array<Record<string, string>> = []
+    const encoder = new TextEncoder()
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n'))
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+        controller.close()
+      }
+    })
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      sentBodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+      sentHeaders.push(init?.headers as Record<string, string>)
+      return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    }
+    const client = new CompatModelClient({
+      baseUrl: 'https://example.com/beta',
+      apiKey: 'k',
+      model: 'deepseek-chat',
+      fetchImpl
+    })
+
+    for await (const _chunk of client.stream(buildRequest(new AbortController().signal))) {
+      // drain
+    }
+
+    expect(sentBodies[0]).toMatchObject({
+      stream: true,
+      stream_options: { include_usage: true }
+    })
+    expect(sentHeaders[0]?.Accept).toBeUndefined()
+  })
+
   it('keeps requiredToolName as loop metadata instead of sending provider tool_choice', async () => {
     const response = {
       id: 'required-tool-metadata',
@@ -150,7 +1095,7 @@ describe('DeepseekCompatModelClient', () => {
         headers: { 'content-type': 'application/json' }
       })
     }
-    const client = new DeepseekCompatModelClient({
+    const client = new CompatModelClient({
       baseUrl: 'https://example.com/beta',
       apiKey: 'k',
       model: 'deepseek-chat',
@@ -180,7 +1125,7 @@ describe('DeepseekCompatModelClient', () => {
         headers: { 'content-type': 'application/json' }
       })
     }
-    const client = new DeepseekCompatModelClient({
+    const client = new CompatModelClient({
       baseUrl: 'https://example.com/beta',
       apiKey: 'k',
       model: 'deepseek-chat',
@@ -213,7 +1158,7 @@ describe('DeepseekCompatModelClient', () => {
         headers: { 'content-type': 'application/json' }
       })
     }
-    const client = new DeepseekCompatModelClient({
+    const client = new CompatModelClient({
       baseUrl: 'https://example.openai.azure.com/openai/deployments/demo',
       apiKey: 'k',
       model: 'gpt-4.1',
@@ -228,6 +1173,57 @@ describe('DeepseekCompatModelClient', () => {
     }
     expect(sentBodies[0]?.reasoning_effort).toBe('high')
     expect(sentBodies[0]).not.toHaveProperty('thinking')
+  })
+
+  it('maps Xiaomi max reasoning to the highest supported Xiaomi effort from model profiles', async () => {
+    const response = {
+      id: 'xiaomi',
+      model: 'mimo-v2.5-pro',
+      choices: [
+        {
+          index: 0,
+          finish_reason: 'stop',
+          message: { role: 'assistant', content: 'done' }
+        }
+      ]
+    }
+    const sentBodies: Array<Record<string, unknown>> = []
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      sentBodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+      return new Response(JSON.stringify(response), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    }
+    const client = new CompatModelClient({
+      baseUrl: 'https://api.xiaomimimo.com/v1',
+      apiKey: 'k',
+      model: 'mimo-v2.5-pro',
+      fetchImpl,
+      nonStreaming: true,
+      modelCapabilities: (model) => ({
+        id: model,
+        inputModalities: ['text'],
+        outputModalities: ['text'],
+        supportsToolCalling: true,
+        contextWindowTokens: 1_000_000,
+        messageParts: ['text'],
+        reasoning: {
+          supportedEfforts: ['off', 'low', 'medium', 'high'],
+          defaultEffort: 'high',
+          requestProtocol: 'mimo-chat-completions'
+        }
+      })
+    })
+    const request = buildRequest(new AbortController().signal)
+    request.model = 'mimo-v2.5-pro'
+    request.reasoningEffort = 'max'
+    for await (const _chunk of client.stream(request)) {
+      // drain
+    }
+
+    expect(sentBodies[0]?.reasoning_effort).toBe('high')
+    expect(sentBodies[0]?.thinking).toEqual({ type: 'enabled' })
   })
 
   it('parses a non-streaming JSON response into chunks', async () => {
@@ -267,8 +1263,8 @@ describe('DeepseekCompatModelClient', () => {
         status: 200,
         headers: { 'content-type': 'application/json' }
       })
-    const client = new DeepseekCompatModelClient({
-      baseUrl: 'https://example.com/beta',
+    const client = new CompatModelClient({
+      baseUrl: 'https://api.deepseek.com',
       apiKey: 'k',
       model: 'deepseek-chat',
       fetchImpl,
@@ -293,9 +1289,10 @@ describe('DeepseekCompatModelClient', () => {
       callChunk && callChunk.kind === 'tool_call_complete' ? callChunk.arguments : {}
     ).toEqual({ text: 'hi' })
     expect(usageChunk && usageChunk.kind === 'usage' ? usageChunk.usage.cacheHitTokens : 0).toBe(30)
+    expect(usageChunk && usageChunk.kind === 'usage' ? usageChunk.usage.cacheMissTokens : 0).toBe(20)
     expect(usageChunk && usageChunk.kind === 'usage' ? usageChunk.usage.costUsd : 0).toBeGreaterThan(0)
     expect(usageChunk && usageChunk.kind === 'usage' ? usageChunk.usage.costCny : 0).toBeGreaterThan(0)
-    expect(usageChunk && usageChunk.kind === 'usage' ? usageChunk.usage.cacheSavingsUsd : 0).toBeGreaterThan(0)
+    expect(usageChunk && usageChunk.kind === 'usage' ? usageChunk.usage.cacheSavingsUsd : undefined).toBeUndefined()
     expect(
       completionChunk && completionChunk.kind === 'completed' ? completionChunk.stopReason : ''
     ).toBe('tool_calls')
@@ -331,7 +1328,7 @@ describe('DeepseekCompatModelClient', () => {
         status: 200,
         headers: { 'content-type': 'application/json' }
       })
-    const client = new DeepseekCompatModelClient({
+    const client = new CompatModelClient({
       baseUrl: 'https://example.com/beta',
       apiKey: 'k',
       model: 'deepseek-chat',
@@ -372,8 +1369,8 @@ describe('DeepseekCompatModelClient', () => {
         status: 200,
         headers: { 'content-type': 'application/json' }
       })
-    const client = new DeepseekCompatModelClient({
-      baseUrl: 'https://example.com/beta',
+    const client = new CompatModelClient({
+      baseUrl: 'https://api.deepseek.com',
       apiKey: 'k',
       model: 'deepseek-chat',
       fetchImpl,
@@ -412,7 +1409,7 @@ describe('DeepseekCompatModelClient', () => {
         headers: { 'content-type': 'application/json' }
       })
     }
-    const client = new DeepseekCompatModelClient({
+    const client = new CompatModelClient({
       baseUrl: 'https://example.com/beta',
       apiKey: 'k',
       model: 'deepseek-chat',
@@ -454,7 +1451,7 @@ describe('DeepseekCompatModelClient', () => {
         headers: { 'content-type': 'application/json' }
       })
     }
-    const client = new DeepseekCompatModelClient({
+    const client = new CompatModelClient({
       baseUrl: 'https://example.com/beta',
       apiKey: 'k',
       model: 'deepseek-chat',
@@ -535,7 +1532,7 @@ describe('DeepseekCompatModelClient', () => {
         headers: { 'content-type': 'application/json' }
       })
     }
-    const client = new DeepseekCompatModelClient({
+    const client = new CompatModelClient({
       baseUrl: 'https://example.com/beta',
       apiKey: 'k',
       model: 'deepseek-chat',
@@ -623,7 +1620,7 @@ describe('DeepseekCompatModelClient', () => {
         headers: { 'content-type': 'application/json' }
       })
     }
-    const client = new DeepseekCompatModelClient({
+    const client = new CompatModelClient({
       baseUrl: 'https://example.com/beta',
       apiKey: 'k',
       model: 'deepseek-chat',
@@ -712,7 +1709,7 @@ describe('DeepseekCompatModelClient', () => {
         headers: { 'content-type': 'application/json' }
       })
     }
-    const client = new DeepseekCompatModelClient({
+    const client = new CompatModelClient({
       baseUrl: 'https://example.com/beta',
       apiKey: 'k',
       model: 'deepseek-chat',
@@ -781,8 +1778,8 @@ describe('DeepseekCompatModelClient', () => {
         headers: { 'content-type': 'application/json' }
       })
     }
-    const client = new DeepseekCompatModelClient({
-      baseUrl: 'https://example.com/beta',
+    const client = new CompatModelClient({
+      baseUrl: 'https://api.deepseek.com',
       apiKey: 'k',
       model: 'deepseek-chat',
       fetchImpl,
@@ -833,7 +1830,7 @@ describe('DeepseekCompatModelClient', () => {
         headers: { 'content-type': 'application/json' }
       })
     }
-    const client = new DeepseekCompatModelClient({
+    const client = new CompatModelClient({
       baseUrl: 'https://example.com/beta',
       apiKey: 'k',
       model: 'deepseek-chat',
@@ -908,7 +1905,7 @@ describe('DeepseekCompatModelClient', () => {
         headers: { 'content-type': 'application/json' }
       })
     }
-    const client = new DeepseekCompatModelClient({
+    const client = new CompatModelClient({
       baseUrl: 'https://example.com/beta',
       apiKey: 'k',
       model: 'deepseek-chat',
@@ -965,7 +1962,7 @@ describe('DeepseekCompatModelClient', () => {
         headers: { 'content-type': 'application/json' }
       })
     }
-    const client = new DeepseekCompatModelClient({
+    const client = new CompatModelClient({
       baseUrl: 'https://example.com/beta',
       apiKey: 'k',
       model: 'deepseek-chat',
@@ -998,6 +1995,53 @@ describe('DeepseekCompatModelClient', () => {
     expect(messages[2]).toMatchObject({ role: 'user', content: 'continue' })
   })
 
+  it('sends volatile context instructions after the history for cache prefix stability', async () => {
+    const sentBodies: Array<{ messages?: Array<Record<string, unknown>> }> = []
+    const response = {
+      id: 'r1',
+      model: 'deepseek-chat',
+      choices: [
+        {
+          index: 0,
+          finish_reason: 'stop',
+          message: { role: 'assistant', content: 'done' }
+        }
+      ],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }
+    }
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      sentBodies.push(JSON.parse(String(init?.body ?? '{}')))
+      return new Response(JSON.stringify(response), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    }
+    const client = new CompatModelClient({
+      baseUrl: 'https://example.com/beta',
+      apiKey: 'k',
+      model: 'deepseek-chat',
+      fetchImpl,
+      nonStreaming: true
+    })
+    const request = buildRequest(new AbortController().signal)
+    request.contextInstructions = ['Tokens used: 4321 — continue the goal.']
+    request.history = [
+      makeUserItem({ id: 'user_1', turnId: 'turn_1', threadId: 'thr_1', text: 'hello' })
+    ]
+
+    for await (const _chunk of client.stream(request)) {
+      // drain
+    }
+
+    const messages = sentBodies[0]?.messages ?? []
+    const instructionIndex = messages.findIndex(
+      (message) => typeof message.content === 'string' && message.content.includes('Tokens used: 4321')
+    )
+    const userIndex = messages.findIndex((message) => message.role === 'user')
+    expect(instructionIndex).toBeGreaterThan(userIndex)
+    expect(messages[instructionIndex]).toMatchObject({ role: 'system' })
+  })
+
   it('preserves the latest compaction summary when applying history limits', async () => {
     const sentBodies: Array<{ messages?: Array<Record<string, unknown>> }> = []
     const response = {
@@ -1019,7 +2063,7 @@ describe('DeepseekCompatModelClient', () => {
         headers: { 'content-type': 'application/json' }
       })
     }
-    const client = new DeepseekCompatModelClient({
+    const client = new CompatModelClient({
       baseUrl: 'https://example.com/beta',
       apiKey: 'k',
       model: 'deepseek-chat',
@@ -1053,9 +2097,12 @@ describe('DeepseekCompatModelClient', () => {
   })
 
   it('reports an error when the HTTP response is not OK', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    const providerMessage = `Not supported model ${'mimo-v2.5-pro-ultraspeed'.repeat(40)}`
+    const body = JSON.stringify({ error: { code: '400', message: providerMessage } })
     const fetchImpl: typeof fetch = async () =>
-      new Response('upstream failure', { status: 500 })
-    const client = new DeepseekCompatModelClient({
+      new Response(body, { status: 400 })
+    const client = new CompatModelClient({
       baseUrl: 'https://example.com/beta',
       apiKey: 'k',
       model: 'deepseek-chat',
@@ -1065,7 +2112,114 @@ describe('DeepseekCompatModelClient', () => {
     for await (const chunk of client.stream(buildRequest(new AbortController().signal))) {
       chunks.push(chunk)
     }
+    warn.mockRestore()
     expect(chunks[0].kind).toBe('error')
+    expect(chunks[0]).toMatchObject({
+      kind: 'error',
+      message: `model request failed with status 400: ${body}`,
+      code: 'http_400'
+    })
+    expect(JSON.stringify(chunks[0])).toContain(providerMessage)
+  })
+
+  it('adds a provider configuration hint and logs request context for HTTP 404', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    const fetchImpl: typeof fetch = async () => new Response('', { status: 404 })
+    const client = new CompatModelClient({
+      baseUrl: 'https://api.example.com/chat/completions?api_key=secret',
+      apiKey: 'k',
+      model: 'deepseek-chat',
+      endpointFormat: 'custom_endpoint',
+      fetchImpl
+    })
+    const chunks: ModelStreamChunk[] = []
+    for await (const chunk of client.stream(buildRequest(new AbortController().signal))) {
+      chunks.push(chunk)
+    }
+
+    expect(chunks[0]).toMatchObject({
+      kind: 'error',
+      message: 'model request failed with status 404: Check your model provider configuration, especially Base URL and Endpoint format.',
+      code: 'http_404'
+    })
+    expect(warn).toHaveBeenCalledWith('[kun:model] model HTTP request failed', expect.objectContaining({
+      provider: 'compat',
+      status: 404,
+      model: 'deepseek-chat',
+      configuredModel: 'deepseek-chat',
+      baseUrl: 'https://api.example.com/chat/completions?api_key=%5Bredacted%5D',
+      requestUrl: 'https://api.example.com/chat/completions?api_key=%5Bredacted%5D',
+      endpointFormat: 'chat_completions',
+      configuredEndpointFormat: 'custom_endpoint',
+      responseBody: ''
+    }))
+    warn.mockRestore()
+  })
+
+  it('reports provider JSON error payloads returned with HTTP 200', async () => {
+    const fetchImpl: typeof fetch = async () =>
+      new Response(JSON.stringify({
+        error: {
+          message: 'model mimo-v2.5-pro-ultraspeed is not available for this account',
+          code: 'model_not_available'
+        }
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      })
+    const client = new CompatModelClient({
+      baseUrl: 'https://api.xiaomimimo.com/v1',
+      apiKey: 'k',
+      model: 'mimo-v2.5-pro-ultraspeed',
+      fetchImpl,
+      nonStreaming: true
+    })
+    const chunks: ModelStreamChunk[] = []
+    for await (const chunk of client.stream(buildRequest(new AbortController().signal))) {
+      chunks.push(chunk)
+    }
+
+    expect(chunks).toEqual([
+      {
+        kind: 'error',
+        message: 'model mimo-v2.5-pro-ultraspeed is not available for this account',
+        code: 'model_not_available'
+      }
+    ])
+  })
+
+  it('reports streamed provider error payloads returned with HTTP 200', async () => {
+    const body = sseStream([
+      {
+        error: {
+          message: 'no permission to access model mimo-v2.5-pro-ultraspeed',
+          type: 'permission_denied'
+        }
+      },
+      '[DONE]'
+    ])
+    const fetchImpl: typeof fetch = async () =>
+      new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    const client = new CompatModelClient({
+      baseUrl: 'https://api.xiaomimimo.com/v1',
+      apiKey: 'k',
+      model: 'mimo-v2.5-pro-ultraspeed',
+      fetchImpl
+    })
+    const chunks: ModelStreamChunk[] = []
+    for await (const chunk of client.stream(buildRequest(new AbortController().signal))) {
+      chunks.push(chunk)
+    }
+
+    expect(chunks.find((chunk) => chunk.kind === 'error')).toMatchObject({
+      kind: 'error',
+      message: 'no permission to access model mimo-v2.5-pro-ultraspeed',
+      code: 'permission_denied'
+    })
+    expect(chunks.find((chunk) => chunk.kind === 'completed')).toMatchObject({
+      kind: 'completed',
+      stopReason: 'error'
+    })
   })
 
   it('parses streamed SSE events with tool call deltas', async () => {
@@ -1086,7 +2240,7 @@ describe('DeepseekCompatModelClient', () => {
     })
     const fetchImpl: typeof fetch = async () =>
       new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
-    const client = new DeepseekCompatModelClient({
+    const client = new CompatModelClient({
       baseUrl: 'https://example.com/beta',
       apiKey: 'k',
       model: 'deepseek-chat',
@@ -1107,6 +2261,84 @@ describe('DeepseekCompatModelClient', () => {
     expect(chunks.find((c) => c.kind === 'usage')).toBeDefined()
   })
 
+  it('keeps reading streamed usage sent after finish_reason', async () => {
+    const frames = [
+      'data: {"choices":[{"delta":{"content":"done"}}]}\n\n',
+      'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+      'data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}\n\n',
+      'data: [DONE]\n\n'
+    ]
+    const encoder = new TextEncoder()
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const frame of frames) controller.enqueue(encoder.encode(frame))
+        controller.close()
+      }
+    })
+    const fetchImpl: typeof fetch = async () =>
+      new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    const client = new CompatModelClient({
+      baseUrl: 'https://example.com/beta',
+      apiKey: 'k',
+      model: 'deepseek-chat',
+      fetchImpl
+    })
+    const chunks = []
+    for await (const chunk of client.stream(buildRequest(new AbortController().signal))) {
+      chunks.push(chunk)
+    }
+
+    const usage = chunks.find((c) => c.kind === 'usage')
+    const completed = chunks.find((c) => c.kind === 'completed')
+    expect(usage && usage.kind === 'usage' ? usage.usage.totalTokens : 0).toBe(10)
+    expect(completed && completed.kind === 'completed' ? completed.stopReason : '').toBe('stop')
+  })
+
+  it('retries without stream usage options when a provider rejects them', async () => {
+    const sentBodies: Array<Record<string, unknown>> = []
+    const encoder = new TextEncoder()
+    const retryBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"retried"}}]}\n\n'))
+        controller.enqueue(
+          encoder.encode(
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}\n\n'
+          )
+        )
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+        controller.close()
+      }
+    })
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      sentBodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+      if (sentBodies.length === 1) {
+        return new Response('unknown field stream_options.include_usage', { status: 400 })
+      }
+      return new Response(retryBody, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    }
+    const client = new CompatModelClient({
+      baseUrl: 'https://example.com/beta',
+      apiKey: 'k',
+      model: 'deepseek-chat',
+      fetchImpl
+    })
+    const chunks = []
+    for await (const chunk of client.stream(buildRequest(new AbortController().signal))) {
+      chunks.push(chunk)
+    }
+
+    const text = chunks
+      .filter((c) => c.kind === 'assistant_text_delta')
+      .map((c) => (c as { text: string }).text)
+      .join('')
+    const usage = chunks.find((c) => c.kind === 'usage')
+    expect(sentBodies).toHaveLength(2)
+    expect(sentBodies[0]).toHaveProperty('stream_options')
+    expect(sentBodies[1]).not.toHaveProperty('stream_options')
+    expect(text).toBe('retried')
+    expect(usage && usage.kind === 'usage' ? usage.usage.totalTokens : 0).toBe(7)
+  })
+
   it('merges streamed tool-call deltas by index when the provider id arrives later', async () => {
     const frames = [
       'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"echo","arguments":"{\\"text\\":"}}]}}]}\n\n',
@@ -1123,7 +2355,7 @@ describe('DeepseekCompatModelClient', () => {
     })
     const fetchImpl: typeof fetch = async () =>
       new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
-    const client = new DeepseekCompatModelClient({
+    const client = new CompatModelClient({
       baseUrl: 'https://example.com/beta',
       apiKey: 'k',
       model: 'deepseek-chat',
@@ -1148,7 +2380,7 @@ describe('DeepseekCompatModelClient', () => {
     })
     const fetchImpl: typeof fetch = async () =>
       new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
-    const client = new DeepseekCompatModelClient({
+    const client = new CompatModelClient({
       baseUrl: 'https://example.com/beta',
       apiKey: 'k',
       model: 'deepseek-chat',

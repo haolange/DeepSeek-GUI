@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { BrowserStorageLike } from '../lib/browser-storage'
 import {
+  isEmptySddAssistantThreadCandidate,
   isSddAssistantThread,
   markSddAssistantThread,
   normalizeSddThreadRegistry,
@@ -10,7 +11,7 @@ import {
 } from './sdd-thread-registry'
 import type { SddDraft } from './sdd-draft-store'
 
-const SDD_THREAD_REGISTRY_KEY = 'deepseekgui.sdd.threadRegistry.v1'
+const SDD_THREAD_REGISTRY_KEY = 'kun.sdd.threadRegistry.v1'
 
 function createMemoryStorage(): BrowserStorageLike {
   const items = new Map<string, string>()
@@ -100,10 +101,30 @@ describe('sdd-thread-registry', () => {
       workspace: '/tmp/app/.kunsdd/draft/draft-1'
     }, registry)).toBe(true)
     expect(isSddAssistantThread({
+      id: 'thread-unit-layout',
+      title: '下一步: .kunsdd/requirements/123e4567-e89b-12d3-a456-426614174000/requirement.md'
+    }, registry)).toBe(true)
+    expect(isSddAssistantThread({
       id: 'thread-normal',
       title: '需求 AI',
       workspace: '/tmp/app'
     }, registry)).toBe(false)
+  })
+
+  it('detects only empty private thread candidates for disk-meta fallback', () => {
+    expect(isEmptySddAssistantThreadCandidate({ id: 'thread-empty' })).toBe(true)
+    expect(isEmptySddAssistantThreadCandidate({
+      id: 'thread-preview',
+      preview: 'Planning the implementation.'
+    })).toBe(false)
+    expect(isEmptySddAssistantThreadCandidate({
+      id: 'thread-turn',
+      latestTurnId: 'turn-1'
+    })).toBe(false)
+    expect(isEmptySddAssistantThreadCandidate({
+      id: 'thread-running',
+      status: 'running'
+    })).toBe(false)
   })
 
   it('normalizes malformed persisted data', () => {

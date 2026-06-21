@@ -1,14 +1,62 @@
 import type { ReactElement } from 'react'
-import { FileQuestion, Lightbulb, PanelRightClose, Plus, Search, Sparkles } from 'lucide-react'
+import {
+  AlertTriangle,
+  FileQuestion,
+  FileText,
+  FlaskConical,
+  Inbox,
+  LayoutList,
+  Lightbulb,
+  ListChecks,
+  type LucideIcon,
+  Network,
+  PanelRightClose,
+  Plus,
+  Quote,
+  Search,
+  ShieldAlert,
+  SlidersHorizontal,
+  Sparkles,
+  SpellCheck,
+  Users
+} from 'lucide-react'
 import { useTranslation } from 'react-i18next'
-import type { ChatBlock, RuntimeConnectionStatus } from '../../agent/types'
+import {
+  SDD_ASSISTANT_FRAMEWORK_GROUPS,
+  frameworksForStage,
+  type SddWorkflowStage
+} from '../../sdd/pm-skill-frameworks'
+import type { AttachmentReference, ChatBlock, RuntimeConnectionStatus } from '../../agent/types'
 import type { QueuedUserMessage } from '../../store/chat-store-types'
-import type { ModelProviderModelGroup } from '@shared/ds-gui-api'
+import type { ModelProviderModelGroup } from '@shared/kun-gui-api'
 import type { SddDraft } from '../../sdd/sdd-draft-store'
 import { MessageTimeline } from '../chat/MessageTimeline'
 import { FloatingComposer } from '../chat/FloatingComposer'
 import type { ComposerReasoningEffort } from '../chat/FloatingComposerModelPicker'
 import { SidebarTitlebarToggleButton } from '../sidebar/SidebarPrimitives'
+
+const FRAMEWORK_ICONS: Record<string, LucideIcon> = {
+  clarify: Lightbulb,
+  research: Search,
+  'brainstorm-ideas': Users,
+  'opportunity-tree': Network,
+  'triage-requests': Inbox,
+  structure: ListChecks,
+  wwa: LayoutList,
+  'job-stories': Quote,
+  prd: FileText,
+  polish: SpellCheck,
+  assumptions: ShieldAlert,
+  'prioritize-assumptions': SlidersHorizontal,
+  'pre-mortem': AlertTriangle,
+  experiments: FlaskConical
+}
+
+const STAGE_ACCENT: Record<Extract<SddWorkflowStage, 'discover' | 'structure' | 'risk'>, string> = {
+  discover: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-300',
+  structure: 'bg-violet-500/10 text-violet-600 dark:text-violet-300',
+  risk: 'bg-amber-500/10 text-amber-600 dark:text-amber-300'
+}
 
 type Props = {
   draft: SddDraft
@@ -23,18 +71,28 @@ type Props = {
   liveReasoning: string
   liveAssistant: string
   composerModel: string
+  composerProviderId?: string
   composerPickList: string[]
   composerModelGroups?: ModelProviderModelGroup[]
   composerReasoningEffort: ComposerReasoningEffort
-  setComposerModel: (modelId: string) => void
+  setComposerModel: (modelId: string, providerId?: string) => void
   setComposerReasoningEffort: (effort: ComposerReasoningEffort) => void
   queuedMessages: QueuedUserMessage[]
   removeQueuedMessage: (id: string) => void
+  attachments?: AttachmentReference[]
+  attachmentUploadEnabled?: boolean
+  attachmentUploadBusy?: boolean
+  attachmentUploadError?: string | null
+  onPickAttachments?: (files: File[]) => void
+  onPasteClipboardImage?: (options?: { silentNoImage?: boolean }) => void | Promise<void>
+  onRemoveAttachment?: (id: string) => void
   onSend: () => void
   onInterrupt: (options?: { discard?: boolean }) => void
   onRetryConnection: () => void
   onOpenSettings: () => void
+  onConfigureProviders?: () => void
   onNewConversation: () => void
+  onApplyFramework: (frameworkId: string) => void
   onCollapse: () => void
   className?: string
 }
@@ -52,6 +110,7 @@ export function SddAssistantPanel({
   liveReasoning,
   liveAssistant,
   composerModel,
+  composerProviderId,
   composerPickList,
   composerModelGroups = [],
   composerReasoningEffort,
@@ -59,11 +118,20 @@ export function SddAssistantPanel({
   setComposerReasoningEffort,
   queuedMessages,
   removeQueuedMessage,
+  attachments = [],
+  attachmentUploadEnabled = false,
+  attachmentUploadBusy = false,
+  attachmentUploadError = null,
+  onPickAttachments,
+  onPasteClipboardImage,
+  onRemoveAttachment,
   onSend,
   onInterrupt,
   onRetryConnection,
   onOpenSettings,
+  onConfigureProviders,
   onNewConversation,
+  onApplyFramework,
   onCollapse,
   className = ''
 }: Props): ReactElement {
@@ -71,10 +139,6 @@ export function SddAssistantPanel({
   const hasTimeline =
     blocks.length > 0 || liveReasoning.trim().length > 0 || liveAssistant.trim().length > 0
   const canCreateConversation = runtimeConnection === 'ready' && !busy
-
-  const setAssistantPrompt = (prompt: string): void => {
-    setInput(input.trim() ? `${input.trim()}\n\n${prompt}` : prompt)
-  }
 
   return (
     <aside
@@ -142,33 +206,45 @@ export function SddAssistantPanel({
               </p>
             </div>
 
-            <div className="mt-3 grid gap-2">
-              <button
-                type="button"
-                onClick={() => setAssistantPrompt(t('sddAssistantClarifyPrompt'))}
-                className="sdd-assistant-action flex items-center gap-3 rounded-2xl border border-ds-border bg-ds-card px-3 py-3 text-left transition hover:border-accent/25 hover:bg-ds-hover"
-              >
-                <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-emerald-500/10 text-emerald-600 dark:text-emerald-300">
-                  <Lightbulb className="h-4 w-4" strokeWidth={1.9} />
-                </span>
-                <span className="min-w-0">
-                  <span className="block text-[13.5px] font-semibold text-ds-ink">{t('sddAssistantClarify')}</span>
-                  <span className="mt-0.5 block truncate text-[12px] text-ds-faint">{t('sddAssistantClarifySub')}</span>
-                </span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setAssistantPrompt(t('sddAssistantResearchPrompt'))}
-                className="sdd-assistant-action flex items-center gap-3 rounded-2xl border border-ds-border bg-ds-card px-3 py-3 text-left transition hover:border-accent/25 hover:bg-ds-hover"
-              >
-                <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-sky-500/10 text-sky-600 dark:text-sky-300">
-                  <Search className="h-4 w-4" strokeWidth={1.9} />
-                </span>
-                <span className="min-w-0">
-                  <span className="block text-[13.5px] font-semibold text-ds-ink">{t('sddAssistantResearch')}</span>
-                  <span className="mt-0.5 block truncate text-[12px] text-ds-faint">{t('sddAssistantResearchSub')}</span>
-                </span>
-              </button>
+            <div className="mt-3 space-y-4">
+              {SDD_ASSISTANT_FRAMEWORK_GROUPS.map((group) => {
+                const frameworks = frameworksForStage(group.stage).filter(
+                  (framework) => framework.titleKey && framework.promptKey
+                )
+                if (frameworks.length === 0) return null
+                return (
+                  <div key={group.stage} className="grid gap-2">
+                    <span className="px-1 text-[11px] font-semibold uppercase tracking-wide text-ds-faint">
+                      {t(group.titleKey)}
+                    </span>
+                    {frameworks.map((framework) => {
+                      const Icon = FRAMEWORK_ICONS[framework.id] ?? Sparkles
+                      return (
+                        <button
+                          key={framework.id}
+                          type="button"
+                          onClick={() => onApplyFramework(framework.id)}
+                          className="sdd-assistant-action flex items-center gap-3 rounded-2xl border border-ds-border bg-ds-card px-3 py-3 text-left transition hover:border-accent/25 hover:bg-ds-hover"
+                        >
+                          <span
+                            className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-xl ${STAGE_ACCENT[group.stage]}`}
+                          >
+                            <Icon className="h-4 w-4" strokeWidth={1.9} />
+                          </span>
+                          <span className="min-w-0">
+                            <span className="block text-[13.5px] font-semibold text-ds-ink">
+                              {t(framework.titleKey as string)}
+                            </span>
+                            <span className="mt-0.5 block truncate text-[12px] text-ds-faint">
+                              {t(framework.subtitleKey as string)}
+                            </span>
+                          </span>
+                        </button>
+                      )
+                    })}
+                  </div>
+                )
+              })}
             </div>
           </div>
         )}
@@ -186,6 +262,7 @@ export function SddAssistantPanel({
           runtimeReady={runtimeConnection === 'ready'}
           hasActiveThread={Boolean(activeThreadId)}
           composerModel={composerModel}
+          composerProviderId={composerProviderId}
           composerPickList={composerPickList}
           composerModelGroups={composerModelGroups}
           composerReasoningEffort={composerReasoningEffort}
@@ -194,8 +271,16 @@ export function SddAssistantPanel({
           modelPickerMode="combobox"
           queuedMessages={queuedMessages}
           onRemoveQueuedMessage={removeQueuedMessage}
+          attachments={attachments}
+          attachmentUploadEnabled={attachmentUploadEnabled}
+          attachmentUploadBusy={attachmentUploadBusy}
+          attachmentUploadError={attachmentUploadError}
+          onPickAttachments={onPickAttachments}
+          onPasteClipboardImage={onPasteClipboardImage}
+          onRemoveAttachment={onRemoveAttachment}
           onSend={onSend}
           onInterrupt={onInterrupt}
+          onConfigureProviders={onConfigureProviders}
         />
       </div>
     </aside>

@@ -4,15 +4,29 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { InMemoryEventBus } from '../src/adapters/in-memory-event-bus.js'
 import { LocalToolHost, buildDefaultLocalTools } from '../src/adapters/tool/local-tool-host.js'
+import { CapabilityRegistry } from '../src/adapters/tool/capability-registry.js'
 import { CREATE_PLAN_TOOL_NAME } from '../src/adapters/tool/create-plan-tool.js'
 import { GET_GOAL_TOOL_NAME, UPDATE_GOAL_TOOL_NAME } from '../src/adapters/tool/goal-tools.js'
 import { FileThreadStore, FileSessionStore } from '../src/adapters/file/index.js'
 import { RuntimeEventRecorder } from '../src/services/runtime-event-recorder.js'
 import { ContextCompactor } from '../src/loop/context-compactor.js'
+import { effectiveHistoryAfterLatestCompaction } from '../src/loop/compaction-history.js'
 import { resolveModelContextProfile } from '../src/loop/model-context-profile.js'
-import { makeAssistantTextItem, makeToolCallItem, makeUserItem } from '../src/domain/item.js'
+import {
+  makeApprovalItem,
+  makeAssistantReasoningItem,
+  makeAssistantTextItem,
+  makeToolCallItem,
+  makeToolResultItem,
+  makeUserInputItem,
+  makeUserItem
+} from '../src/domain/item.js'
 import { createThreadRecord } from '../src/domain/thread.js'
 import { createImmutablePrefix, setSystemPrompt } from '../src/cache/immutable-prefix.js'
+import { InflightTracker } from '../src/loop/inflight-tracker.js'
+import { SteeringQueue } from '../src/loop/steering-queue.js'
+import { SequentialIdGenerator } from '../src/ports/id-generator.js'
+import { TurnService } from '../src/services/turn-service.js'
 import type { TurnItem } from '../src/contracts/items.js'
 import type { ModelRequest, ModelStreamChunk } from '../src/ports/model-client.js'
 import {
@@ -49,8 +63,8 @@ describe('AgentLoop', () => {
     const request = observedRequest as ModelRequest | null
     if (!request) throw new Error('expected model request')
     expect(request.tools.map((tool) => tool.name)).toContain('bash')
-    expect(request.contextInstructions?.join('\n')).toContain('Shell runtime:')
-    expect(request.contextInstructions?.join('\n')).toContain('shell commands appropriate for the host platform')
+    expect(request.contextInstructions?.join('\n')).toContain('<shell_environment>')
+    expect(request.contextInstructions?.join('\n')).toContain('<syntax>')
   })
 
   it('records elapsed seconds for active goals after a turn finishes', async () => {
@@ -99,8 +113,9 @@ describe('AgentLoop', () => {
     expect(status).toBe('failed')
     expect(failed).toMatchObject({
       kind: 'turn_failed',
-      message: 'model stream exploded'
+      message: expect.stringContaining('model stream exploded')
     })
+    expect(failed?.kind === 'turn_failed' ? failed.message : '').toContain('[Kun turn failed]')
   })
 
   it('fails the turn when the model stream yields an error chunk', async () => {
@@ -122,7 +137,13 @@ describe('AgentLoop', () => {
       event.message === 'model request failed with status 400' &&
       event.code === 'http_400'
     )).toBe(true)
-    expect(events.some((event) => event.kind === 'turn_failed')).toBe(true)
+    const failed = events.find((event) => event.kind === 'turn_failed')
+    expect(failed).toMatchObject({
+      kind: 'turn_failed',
+      message: 'model request failed with status 400',
+      code: 'http_400',
+      severity: 'error'
+    })
   })
 
   it('emits named pipeline lifecycle stages for a model request', async () => {
@@ -148,6 +169,54 @@ describe('AgentLoop', () => {
       'post_send',
       'response_received'
     ])
+  })
+
+  it('records provider endpoint diagnostics for model send stages', async () => {
+    const model = {
+      provider: 'compat',
+      model: 'MiniMax-M2',
+      config: {
+        baseUrl: 'https://user:secret@api.minimaxi.com/anthropic?token=hidden#debug',
+        endpointFormat: 'messages',
+        model: 'MiniMax-M2'
+      },
+      async *stream(): AsyncIterable<ModelStreamChunk> {
+        yield { kind: 'completed', stopReason: 'stop' }
+      }
+    }
+    const h = makeHarness(model)
+    await bootstrapThread(h, {
+      request: { prompt: 'hello', model: 'mimo-v2.5-pro-ultraspeed' }
+    })
+
+    await h.loop.runTurn(h.threadId, h.turnId)
+    const events = await h.sessionStore.loadEventsSince(h.threadId, 0)
+    const preSend = events.find((event) =>
+      event.kind === 'pipeline_stage' && event.stage === 'pre_send'
+    )
+    const postSend = events.find((event) =>
+      event.kind === 'pipeline_stage' && event.stage === 'post_send'
+    )
+
+    expect(preSend).toMatchObject({
+      kind: 'pipeline_stage',
+      stage: 'pre_send',
+      details: {
+        model: 'mimo-v2.5-pro-ultraspeed',
+        provider: 'compat',
+        providerBaseUrl: 'https://api.minimaxi.com/anthropic',
+        endpointFormat: 'messages',
+        configuredModel: 'MiniMax-M2'
+      }
+    })
+    expect(postSend).toMatchObject({
+      kind: 'pipeline_stage',
+      stage: 'post_send',
+      details: {
+        model: 'mimo-v2.5-pro-ultraspeed',
+        providerBaseUrl: 'https://api.minimaxi.com/anthropic'
+      }
+    })
   })
 
   it('aborts the turn when the abort signal fires', async () => {
@@ -195,6 +264,58 @@ describe('AgentLoop', () => {
     expect(turnItems.map((item) => item.kind)).toEqual(['user_message'])
   })
 
+  it('keeps partial assistant text when interrupting a foreground turn', async () => {
+    let resolveDelta: (() => void) | undefined
+    const sawDelta = new Promise<void>((resolve) => {
+      resolveDelta = resolve
+    })
+    const h = makeHarness({
+      provider: 'partial-abort',
+      model: 'partial-abort',
+      async *stream(request: ModelRequest): AsyncIterable<ModelStreamChunk> {
+        yield { kind: 'assistant_text_delta', text: 'partial answer' }
+        resolveDelta?.()
+        await new Promise<void>((resolve) => {
+          if (request.abortSignal.aborted) {
+            resolve()
+            return
+          }
+          request.abortSignal.addEventListener('abort', () => resolve(), { once: true })
+        })
+        yield { kind: 'completed', stopReason: 'stop' }
+      }
+    })
+    await bootstrapThread(h)
+
+    const run = h.loop.runTurn(h.threadId, h.turnId)
+    await sawDelta
+    await h.turns.interruptTurn({ threadId: h.threadId, turnId: h.turnId })
+    const status = await run
+    const sessionItems = await h.sessionStore.loadItems(h.threadId)
+    const thread = await h.threadStore.get(h.threadId)
+    const turnItems = thread?.turns.find((turn) => turn.id === h.turnId)?.items ?? []
+
+    expect(status).toBe('aborted')
+    expect(sessionItems).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'assistant_text',
+          text: 'partial answer',
+          status: 'completed'
+        })
+      ])
+    )
+    expect(turnItems).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'assistant_text',
+          text: 'partial answer',
+          status: 'completed'
+        })
+      ])
+    )
+  })
+
   it('runs a tool call and surfaces its result item', async () => {
     let calls = 0
     const h = makeHarness({
@@ -212,6 +333,7 @@ describe('AgentLoop', () => {
           yield { kind: 'completed', stopReason: 'tool_calls' }
           return
         }
+        yield { kind: 'assistant_text_delta', text: 'done' }
         yield { kind: 'completed', stopReason: 'stop' }
       }
     })
@@ -234,6 +356,106 @@ describe('AgentLoop', () => {
       .flatMap((turn) => turn.items)
       .find((item) => item.kind === 'tool_call' && item.callId === 'call_echo')
     expect(toolCall).toMatchObject({ kind: 'tool_call', status: 'completed' })
+  })
+
+  it('retries an empty model continuation after a file change', async () => {
+    let calls = 0
+    const requests: ModelRequest[] = []
+    const writeHelper = LocalToolHost.defineTool({
+      name: 'write_helper',
+      description: 'Write a helper script.',
+      inputSchema: { type: 'object', properties: {} },
+      policy: 'auto',
+      toolKind: 'file_change',
+      execute: async () => ({ output: { ok: true } })
+    })
+    const h = makeHarness(
+      {
+        provider: 'empty-after-tool',
+        model: 'empty-after-tool',
+        async *stream(request): AsyncIterable<ModelStreamChunk> {
+          requests.push(request)
+          calls += 1
+          if (calls === 1) {
+            yield {
+              kind: 'tool_call_complete',
+              callId: 'call_write_helper',
+              toolName: 'write_helper',
+              arguments: {}
+            }
+            yield { kind: 'completed', stopReason: 'tool_calls' }
+            return
+          }
+          if (calls === 2) {
+            yield { kind: 'completed', stopReason: 'stop' }
+            return
+          }
+          yield { kind: 'assistant_text_delta', text: 'analysis complete' }
+          yield { kind: 'completed', stopReason: 'stop' }
+        }
+      },
+      { tools: [writeHelper] }
+    )
+    await bootstrapThread(h)
+
+    const status = await h.loop.runTurn(h.threadId, h.turnId)
+    const items = await h.sessionStore.loadItems(h.threadId)
+
+    expect(status).toBe('completed')
+    expect(calls).toBe(3)
+    expect(requests[2]?.contextInstructions?.join('\n')).toContain('Tool continuation recovery')
+    expect(items).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'assistant_text',
+        text: 'analysis complete'
+      })
+    ]))
+  })
+
+  it('fails visibly when the model repeats an empty post-tool continuation', async () => {
+    let calls = 0
+    const writeHelper = LocalToolHost.defineTool({
+      name: 'write_helper',
+      description: 'Write a helper script.',
+      inputSchema: { type: 'object', properties: {} },
+      policy: 'auto',
+      toolKind: 'file_change',
+      execute: async () => ({ output: { ok: true } })
+    })
+    const h = makeHarness(
+      {
+        provider: 'repeated-empty-after-tool',
+        model: 'repeated-empty-after-tool',
+        async *stream(): AsyncIterable<ModelStreamChunk> {
+          calls += 1
+          if (calls === 1) {
+            yield {
+              kind: 'tool_call_complete',
+              callId: 'call_write_helper',
+              toolName: 'write_helper',
+              arguments: {}
+            }
+            yield { kind: 'completed', stopReason: 'tool_calls' }
+            return
+          }
+          yield { kind: 'completed', stopReason: 'stop' }
+        }
+      },
+      { tools: [writeHelper] }
+    )
+    await bootstrapThread(h)
+
+    const status = await h.loop.runTurn(h.threadId, h.turnId)
+    const items = await h.sessionStore.loadItems(h.threadId)
+
+    expect(status).toBe('failed')
+    expect(calls).toBe(3)
+    expect(items).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'error',
+        code: 'empty_post_tool_continuation'
+      })
+    ]))
   })
 
   it('keeps running past the legacy eight-step ceiling until the model stops', async () => {
@@ -523,6 +745,82 @@ describe('AgentLoop', () => {
     expect(status).toBe('completed')
     expect(started).toEqual(['read', 'grep'])
     expect(resultCallIds).toEqual(['call_read', 'call_grep'])
+  })
+
+  it('fans out multiple delegate_task calls from one message in a single parallel batch', async () => {
+    const started: string[] = []
+    let resolveBothStarted!: () => void
+    let releaseChildren!: () => void
+    const bothStarted = new Promise<void>((resolve) => {
+      resolveBothStarted = resolve
+    })
+    const release = new Promise<void>((resolve) => {
+      releaseChildren = resolve
+    })
+    // A single delegation-kind tool invoked twice in one assistant message.
+    // If the loop ran these sequentially, only the first would start and the
+    // second would never reach `bothStarted` before the release.
+    const delegateTool = LocalToolHost.defineTool({
+      name: 'delegate_task',
+      description: 'fake delegation tool',
+      inputSchema: { type: 'object', properties: { prompt: { type: 'string' } } },
+      policy: 'auto',
+      execute: async (args) => {
+        started.push(String(args.prompt))
+        if (started.length === 2) resolveBothStarted()
+        await release
+        return { output: { summary: `done ${String(args.prompt)}` } }
+      }
+    })
+    const toolHost = new LocalToolHost({
+      registry: new CapabilityRegistry([
+        { id: 'delegation', kind: 'delegation', enabled: true, available: true, tools: [delegateTool] }
+      ])
+    })
+    let calls = 0
+    const h = makeHarness(
+      {
+        provider: 'delegation-model',
+        model: 'delegation-model',
+        async *stream(): AsyncIterable<ModelStreamChunk> {
+          calls += 1
+          if (calls === 1) {
+            yield { kind: 'tool_call_complete', callId: 'call_a', toolName: 'delegate_task', arguments: { prompt: 'a' } }
+            yield { kind: 'tool_call_complete', callId: 'call_b', toolName: 'delegate_task', arguments: { prompt: 'b' } }
+            yield { kind: 'completed', stopReason: 'tool_calls' }
+            return
+          }
+          yield { kind: 'completed', stopReason: 'stop' }
+        }
+      },
+      { toolHost }
+    )
+    await bootstrapThread(h)
+
+    const run = h.loop.runTurn(h.threadId, h.turnId)
+    let startupError: Error | undefined
+    try {
+      await Promise.race([
+        bothStarted,
+        new Promise<void>((_resolve, reject) => {
+          setTimeout(() => reject(new Error(`only started ${started.join(',') || 'none'}`)), 200)
+        })
+      ])
+    } catch (error) {
+      startupError = error instanceof Error ? error : new Error(String(error))
+    } finally {
+      releaseChildren()
+    }
+    const status = await run
+    if (startupError) throw startupError
+
+    const resultCallIds = (await h.sessionStore.loadItems(h.threadId))
+      .filter((item) => item.kind === 'tool_result')
+      .map((item) => item.kind === 'tool_result' ? item.callId : '')
+
+    expect(status).toBe('completed')
+    expect(started.sort()).toEqual(['a', 'b'])
+    expect(resultCallIds).toEqual(['call_a', 'call_b'])
   })
 
 	  it('repairs wrapped tool arguments before persisting and dispatching calls', async () => {
@@ -870,28 +1168,46 @@ describe('AgentLoop', () => {
         return { output: { done: true } }
       }
     })
-    const h = makeHarness(makeFakeModel([
-      {
-        kind: 'tool_call_complete',
-        callId: 'call_streamer',
-        toolName: 'streamer',
-        arguments: {}
-      },
-      { kind: 'completed', stopReason: 'tool_calls' },
-      { kind: 'completed', stopReason: 'stop' }
-    ]), { tools: [streamingTool] })
+    let calls = 0
+    const h = makeHarness({
+      provider: 'streaming-tool',
+      model: 'streaming-tool',
+      async *stream(): AsyncIterable<ModelStreamChunk> {
+        calls += 1
+        if (calls === 1) {
+          yield {
+            kind: 'tool_call_complete',
+            callId: 'call_streamer',
+            toolName: 'streamer',
+            arguments: {}
+          }
+          yield { kind: 'completed', stopReason: 'tool_calls' }
+          return
+        }
+        yield { kind: 'completed', stopReason: 'stop' }
+      }
+    }, { tools: [streamingTool] })
     await bootstrapThread(h)
     const status = await h.loop.runTurn(h.threadId, h.turnId)
     expect(status).toBe('completed')
     const events = await h.sessionStore.loadEventsSince(h.threadId, 0)
-    expect(events.some((event) => event.kind === 'item_updated')).toBe(true)
     const partialUpdate = events.find(
       (event) =>
-        event.kind === 'item_updated' &&
+        (event.kind === 'item_created' || event.kind === 'item_updated') &&
         event.item.kind === 'tool_result' &&
+        event.item.status === 'running' &&
         (event.item.output as { partial?: string }).partial === 'hello'
     )
     expect(partialUpdate).toBeDefined()
+    const thread = await h.threadStore.get(h.threadId)
+    const finalResult = thread?.turns
+      .flatMap((turn) => turn.items)
+      .find((item) => item.kind === 'tool_result' && item.callId === 'call_streamer')
+    expect(finalResult).toMatchObject({
+      kind: 'tool_result',
+      status: 'completed',
+      output: { done: true }
+    })
   })
 
   it('waits for GUI user input tool responses and resumes the turn', async () => {
@@ -1056,6 +1372,7 @@ describe('AgentLoop', () => {
             yield { kind: 'completed', stopReason: 'tool_calls' }
             return
           }
+          yield { kind: 'assistant_text_delta', text: 'done' }
           yield { kind: 'completed', stopReason: 'stop' }
         }
       },
@@ -1089,6 +1406,59 @@ describe('AgentLoop', () => {
     await bootstrapThread(h)
     await h.loop.runTurn(h.threadId, h.turnId)
     expect(observedTools).not.toContain(CREATE_PLAN_TOOL_NAME)
+  })
+
+  it('continues after a normal agent turn attempts a non-advertised create_plan call', async () => {
+    const observedRequests: ModelRequest[] = []
+    let calls = 0
+    const h = makeHarness(
+      {
+        provider: 'overeager-planner',
+        model: 'overeager-planner',
+        async *stream(request: ModelRequest): AsyncIterable<ModelStreamChunk> {
+          observedRequests.push(request)
+          calls += 1
+          if (calls === 1) {
+            yield {
+              kind: 'tool_call_complete',
+              callId: 'call_plan',
+              toolName: CREATE_PLAN_TOOL_NAME,
+              arguments: {
+                markdown: '# Plan',
+                operation: 'draft'
+              }
+            }
+            yield { kind: 'completed', stopReason: 'tool_calls' }
+            return
+          }
+          yield { kind: 'assistant_text_delta', text: 'I will continue without the plan tool.' }
+          yield { kind: 'completed', stopReason: 'stop' }
+        }
+      },
+      { tools: buildDefaultLocalTools() }
+    )
+    await bootstrapThread(h)
+
+    const status = await h.loop.runTurn(h.threadId, h.turnId)
+    const items = await h.sessionStore.loadItems(h.threadId)
+    const events = await h.sessionStore.loadEventsSince(h.threadId, 0)
+    const planCall = items.find(
+      (item) => item.kind === 'tool_call' && item.toolName === CREATE_PLAN_TOOL_NAME
+    )
+    const planResult = items.find(
+      (item) => item.kind === 'tool_result' && item.toolName === CREATE_PLAN_TOOL_NAME
+    )
+
+    expect(status).toBe('completed')
+    expect(observedRequests[0]?.tools.map((tool) => tool.name)).not.toContain(CREATE_PLAN_TOOL_NAME)
+    expect(observedRequests.length).toBe(2)
+    expect(planCall).toMatchObject({ kind: 'tool_call', status: 'failed' })
+    expect(planResult).toMatchObject({ kind: 'tool_result', isError: true })
+    expect(planResult?.kind === 'tool_result' ? JSON.stringify(planResult.output) : '')
+      .toContain('not advertised in this turn context')
+    expect(events.some((event) =>
+      event.kind === 'error' && event.code === 'tool_dispatch_rejected'
+    )).toBe(true)
   })
 
   it('injects active goal guidance and goal status tools into model requests', async () => {
@@ -1386,6 +1756,120 @@ describe('AgentLoop', () => {
     }
   })
 
+  it('rejects forged write calls during plan mode without touching workspace files', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'kun-loop-plan-forged-write-'))
+    const observedToolLists: string[][] = []
+    let calls = 0
+    try {
+      const h = makeHarness(
+        {
+          provider: 'planner',
+          model: 'planner',
+          async *stream(request: ModelRequest): AsyncIterable<ModelStreamChunk> {
+            observedToolLists.push(request.tools.map((tool) => tool.name))
+            calls += 1
+            if (calls === 1) {
+              yield {
+                kind: 'tool_call_complete',
+                callId: 'call_write',
+                toolName: 'write',
+                arguments: {
+                  path: 'forbidden.txt',
+                  content: 'should not exist'
+                }
+              }
+              yield { kind: 'completed', stopReason: 'tool_calls' }
+              return
+            }
+            yield { kind: 'assistant_text_delta', text: '## Plan\nStay read-only until build mode.\n' }
+            yield { kind: 'completed', stopReason: 'stop' }
+          }
+        },
+        { tools: buildDefaultLocalTools() }
+      )
+      await bootstrapThread(h, {
+        workspace,
+        request: {
+          prompt: 'Plan a safe change',
+          mode: 'plan'
+        }
+      })
+
+      const status = await h.loop.runTurn(h.threadId, h.turnId)
+      const items = await h.sessionStore.loadItems(h.threadId)
+      const writeCall = items.find((item) => item.kind === 'tool_call' && item.toolName === 'write')
+      const writeResult = items.find((item) => item.kind === 'tool_result' && item.toolName === 'write')
+
+      expect(status).toBe('completed')
+      expect(observedToolLists[0]).not.toEqual(expect.arrayContaining(['write', 'edit', 'bash']))
+      expect(writeCall).toMatchObject({ kind: 'tool_call', status: 'failed' })
+      expect(writeResult).toMatchObject({ kind: 'tool_result', isError: true })
+      expect(writeResult?.kind === 'tool_result' ? JSON.stringify(writeResult.output) : '')
+        .toContain('not advertised by active tool policy')
+      await expect(readFile(join(workspace, 'forbidden.txt'), 'utf8')).rejects.toThrow()
+      await expect(readFile(join(workspace, '.kunsdd/plan/plan-a-safe-change.md'), 'utf8')).resolves.toBe(
+        '## Plan\nStay read-only until build mode.'
+      )
+    } finally {
+      await rm(workspace, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects forged bash calls during plan mode without running mutating commands', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'kun-loop-plan-forged-bash-'))
+    let calls = 0
+    try {
+      const h = makeHarness(
+        {
+          provider: 'planner',
+          model: 'planner',
+          async *stream(): AsyncIterable<ModelStreamChunk> {
+            calls += 1
+            if (calls === 1) {
+              yield {
+                kind: 'tool_call_complete',
+                callId: 'call_bash',
+                toolName: 'bash',
+                arguments: {
+                  command: 'touch forbidden.txt'
+                }
+              }
+              yield { kind: 'completed', stopReason: 'tool_calls' }
+              return
+            }
+            yield { kind: 'assistant_text_delta', text: '## Plan\nUse read-only inspection only.\n' }
+            yield { kind: 'completed', stopReason: 'stop' }
+          }
+        },
+        { tools: buildDefaultLocalTools() }
+      )
+      await bootstrapThread(h, {
+        workspace,
+        request: {
+          prompt: 'Plan without shell mutations',
+          mode: 'plan'
+        }
+      })
+
+      const status = await h.loop.runTurn(h.threadId, h.turnId)
+      const items = await h.sessionStore.loadItems(h.threadId)
+      const bashCall = items.find((item) => item.kind === 'tool_call' && item.toolName === 'bash')
+      const bashResult = items.find((item) => item.kind === 'tool_result' && item.toolName === 'bash')
+
+      expect(status).toBe('completed')
+      expect(bashCall).toMatchObject({ kind: 'tool_call', status: 'failed' })
+      expect(bashResult).toMatchObject({ kind: 'tool_result', isError: true })
+      expect(bashResult?.kind === 'tool_result' ? JSON.stringify(bashResult.output) : '')
+        .toContain('not advertised by active tool policy')
+      await expect(readFile(join(workspace, 'forbidden.txt'), 'utf8')).rejects.toThrow()
+      await expect(readFile(join(workspace, '.kunsdd/plan/plan-without-shell-mutations.md'), 'utf8')).resolves.toBe(
+        '## Plan\nUse read-only inspection only.'
+      )
+    } finally {
+      await rm(workspace, { recursive: true, force: true })
+    }
+  })
+
   it('fails GUI plan turns only when neither create_plan nor plan text is returned', async () => {
     const workspace = await mkdtemp(join(tmpdir(), 'kun-loop-plan-empty-'))
     try {
@@ -1522,7 +2006,10 @@ describe('AgentLoop', () => {
         id: 'long_history',
         turnId: 'turn_1',
         threadId: 'thr_1',
-        text: 'x'.repeat(80_000)
+        // ~125k estimated tokens: above the default soft threshold (96k) so a
+        // model-less check compacts, but below the DeepSeek v4 soft threshold
+        // (750k = 0.75 * 1M) so the v4 profiles do not.
+        text: 'x'.repeat(500_000)
       })
     ]
 
@@ -1533,7 +2020,7 @@ describe('AgentLoop', () => {
     expect(compactor.shouldCompact(items)).toBe(true)
     expect(compactor.shouldCompact(items, { model: 'deepseek-v4-pro' })).toBe(false)
     expect(compactor.shouldCompact(items, { model: 'deepseek-v4-flash' })).toBe(false)
-    expect(compactor.hardCap('deepseek-v4-flash')).toBe(990_000)
+    expect(compactor.hardCap('deepseek-v4-flash')).toBe(850_000)
   })
 
   it('uses reported prompt tokens as a compaction pressure signal', () => {
@@ -1548,7 +2035,50 @@ describe('AgentLoop', () => {
     ]
 
     expect(compactor.shouldCompact(tinyHistory)).toBe(false)
-    expect(compactor.shouldCompact(tinyHistory, { promptTokens: 120 })).toBe(true)
+    // A reported count within PROMPT_TOKEN_TRUST_FACTOR of the estimate (here
+    // the per-request system/tool overhead) is honoured and drives compaction.
+    expect(compactor.shouldCompact(tinyHistory, { promptTokens: 120, overheadTokens: 40 })).toBe(true)
+  })
+
+  it('ignores prompt tokens inflated far beyond the local estimate', () => {
+    // Regression: MiniMax-M3 folds cumulative cache reads into prompt_tokens and
+    // reported ~1.2M for a thread whose real content was ~33k, stranding it at
+    // "100%" and firing compaction that folded almost nothing. An implausibly
+    // large reported count must be ignored in favour of the local estimate.
+    const compactor = new ContextCompactor({ softThreshold: 100, hardThreshold: 200 })
+    const history = [
+      makeUserItem({ id: 'h', turnId: 'turn_1', threadId: 'thr_1', text: 'x'.repeat(360) })
+    ]
+
+    // ~90 estimated tokens of real content, below the soft threshold.
+    expect(compactor.shouldCompact(history)).toBe(false)
+    // A plausible provider count (within the trust factor) still triggers.
+    expect(compactor.shouldCompact(history, { promptTokens: 300 })).toBe(true)
+    // An order-of-magnitude-inflated count is dropped; the estimate wins, so a
+    // genuinely small thread is not pinned at the threshold compacting nothing.
+    expect(compactor.shouldCompact(history, { promptTokens: 1_000_000 })).toBe(false)
+    expect(compactor.planCompaction(history, { promptTokens: 1_000_000 })).toBeNull()
+  })
+
+  it('adds per-request overhead to the estimate-only compaction trigger', () => {
+    const compactor = new ContextCompactor({ softThreshold: 100, hardThreshold: 200 })
+    const tinyHistory = [
+      makeUserItem({
+        id: 'tiny_history',
+        turnId: 'turn_1',
+        threadId: 'thr_1',
+        text: 'short'
+      })
+    ]
+
+    // Item text alone is far below the soft threshold and would skip
+    // compaction when no provider usage count is available.
+    expect(compactor.shouldCompact(tinyHistory)).toBe(false)
+    // The system prompt + tool schemas sent every turn (overheadTokens)
+    // are added as a floor, so the estimate-only path still triggers.
+    expect(compactor.shouldCompact(tinyHistory, { overheadTokens: 500 })).toBe(true)
+    expect(compactor.planCompaction(tinyHistory, { overheadTokens: 500 })?.reason)
+      .toContain('estimated prompt tokens')
   })
 
   it('plans normal, aggressive, and force compaction levels', () => {
@@ -1562,15 +2092,17 @@ describe('AgentLoop', () => {
       })
     ]
 
-    expect(compactor.planCompaction(tinyHistory, { promptTokens: 120 })).toMatchObject({
+    // overheadTokens keeps the reported counts within the trust factor of the
+    // estimate (mirroring the real per-request system/tool floor).
+    expect(compactor.planCompaction(tinyHistory, { promptTokens: 120, overheadTokens: 40 })).toMatchObject({
       mode: 'normal',
       keepRecent: 4
     })
-    expect(compactor.planCompaction(tinyHistory, { promptTokens: 160 })).toMatchObject({
+    expect(compactor.planCompaction(tinyHistory, { promptTokens: 160, overheadTokens: 40 })).toMatchObject({
       mode: 'aggressive',
       keepRecent: 2
     })
-    expect(compactor.planCompaction(tinyHistory, { promptTokens: 220 })).toMatchObject({
+    expect(compactor.planCompaction(tinyHistory, { promptTokens: 220, overheadTokens: 40 })).toMatchObject({
       mode: 'force',
       keepRecent: 1
     })
@@ -1607,6 +2139,62 @@ describe('AgentLoop', () => {
     expect(result.next.some((item) => item.kind === 'tool_call')).toBe(false)
     expect(result.summaryItem.kind === 'compaction' ? result.summaryItem.summary : '')
       .toContain('Active Skill: documents (documents)')
+  })
+
+  it('keeps the latest user turn when force compaction would orphan a tool result', () => {
+    const compactor = new ContextCompactor({ softThreshold: 1, hardThreshold: 2 })
+    const prefix = createImmutablePrefix({ systemPrompt: 'system' })
+    const result = compactor.compact({
+      threadId: 'thr_1',
+      turnId: 'turn_2',
+      prefix,
+      keepRecent: 1,
+      history: [
+        makeUserItem({ id: 'u1', turnId: 'turn_1', threadId: 'thr_1', text: 'fold this old request' }),
+        makeAssistantTextItem({
+          id: 'a1',
+          turnId: 'turn_1',
+          threadId: 'thr_1',
+          text: 'old answer',
+          status: 'completed'
+        }),
+        makeUserItem({ id: 'u2', turnId: 'turn_2', threadId: 'thr_1', text: 'keep this current request' }),
+        makeAssistantReasoningItem({
+          id: 'r2',
+          turnId: 'turn_2',
+          threadId: 'thr_1',
+          text: 'need read before answering',
+          status: 'completed'
+        }),
+        makeToolCallItem({
+          id: 'call_2',
+          turnId: 'turn_2',
+          threadId: 'thr_1',
+          callId: 'call_2',
+          toolName: 'read',
+          arguments: { path: 'current.ts' },
+          status: 'completed'
+        }),
+        makeToolResultItem({
+          id: 'result_2',
+          turnId: 'turn_2',
+          threadId: 'thr_1',
+          callId: 'call_2',
+          toolName: 'read',
+          output: 'current file content'
+        })
+      ]
+    })
+
+    expect(result.next.map((item) => item.id)).toEqual([
+      result.summaryItem.id,
+      'u2',
+      'r2',
+      'call_2',
+      'result_2'
+    ])
+    expect(result.summaryItem.kind === 'compaction' ? result.summaryItem.sourceItemIds : [])
+      .toEqual(['u1', 'a1'])
   })
 
   it('embeds a digest marker and skips frozen messages when compacting history', () => {
@@ -1661,9 +2249,12 @@ describe('AgentLoop', () => {
     })
 
     expect(compactor.thresholds()).toEqual({ softThreshold: 123, hardThreshold: 456 })
+    // No contextWindowTokens is configured, so the window is inferred as
+    // max(soft, hard) = 2000 and the safety cap clamps the hard threshold to
+    // floor(0.85 * 2000) = 1700.
     expect(compactor.thresholds('vendor/custom-model')).toEqual({
       softThreshold: 1_000,
-      hardThreshold: 2_000
+      hardThreshold: 1_700
     })
   })
 
@@ -1680,7 +2271,15 @@ describe('AgentLoop', () => {
     }
     await h.loop.runTurn(h.threadId, h.turnId)
     const items = await h.sessionStore.loadItems(h.threadId)
+    const effectiveItems = effectiveHistoryAfterLatestCompaction(items)
     expect(items.some((item) => item.kind === 'compaction')).toBe(true)
+    // The visible transcript remains complete, while the model-visible
+    // projection starts at the latest compaction marker followed by the recent
+    // tail kept verbatim.
+    expect(items.some((item) => item.id === 'hist_0')).toBe(true)
+    expect(effectiveItems[0]?.kind).toBe('compaction')
+    expect(effectiveItems.some((item) => item.id === 'hist_0')).toBe(false)
+    expect(effectiveItems.length).toBeLessThan(items.length)
   })
 
   it('can use a model summary for history compaction while reusing the main prefix', async () => {
@@ -1759,7 +2358,7 @@ describe('AgentLoop', () => {
     expect(summaryRequest.contextInstructions?.join('\n')).toContain('history fold')
     expect(summaryPromptItem?.kind).toBe('user_message')
     expect(summaryPromptItem?.kind === 'user_message' ? summaryPromptItem.text : '')
-      .toContain('History excerpt to fold')
+      .toContain('Conversation history to fold')
     expect(mainSummary?.kind === 'compaction' ? mainSummary.summary : '')
       .toContain('Model summary: preserve alpha.txt')
     expect(persistedSummary?.kind === 'compaction' ? persistedSummary.summary : '')
@@ -2257,6 +2856,111 @@ describe('FileSessionStore', () => {
     })
     const event = await recorder.record({ kind: 'heartbeat', threadId: 'thr_seq' })
     expect(event.seq).toBe(8)
+  })
+
+  it.each([
+    ['aborted', 'aborted'],
+    ['failed', 'failed']
+  ] as const)('finalizes open turn items in messages.jsonl when a turn is %s', async (finalStatus, expectedToolStatus) => {
+    const nowIso = () => '2026-06-05T00:00:00.000Z'
+    const threadId = `thr_finalize_${finalStatus}`
+    const threadStore = new FileThreadStore({ dataDir, now: () => new Date(nowIso()) })
+    const sessionStore = new FileSessionStore({ dataDir })
+    const bus = new InMemoryEventBus()
+    const turns = new TurnService({
+      threadStore,
+      sessionStore,
+      events: new RuntimeEventRecorder({
+        eventBus: bus,
+        sessionStore,
+        allocateSeq: (id) => bus.allocateSeq(id),
+        nowIso
+      }),
+      inflight: new InflightTracker(),
+      steering: new SteeringQueue(),
+      compactor: new ContextCompactor({ softThreshold: 64, hardThreshold: 128 }),
+      ids: new SequentialIdGenerator(),
+      nowIso
+    })
+
+    await threadStore.upsert(
+      createThreadRecord({ id: threadId, title: 'demo', workspace: '/tmp', model: 'm' })
+    )
+    const { turnId } = await turns.startTurn({
+      threadId,
+      request: { prompt: 'run a tool' }
+    })
+    await turns.applyItem(
+      threadId,
+      makeToolCallItem({
+        id: 'item_tool_open',
+        turnId,
+        threadId,
+        callId: 'call_open',
+        toolName: 'echo',
+        arguments: { text: 'hi' }
+      })
+    )
+    await turns.applyItem(
+      threadId,
+      makeToolResultItem({
+        id: 'item_result_open',
+        turnId,
+        threadId,
+        callId: 'call_open',
+        toolName: 'echo',
+        output: { partial: true },
+        status: 'running'
+      })
+    )
+    await turns.applyItem(
+      threadId,
+      makeApprovalItem({
+        id: 'item_approval_open',
+        turnId,
+        threadId,
+        approvalId: 'approval_open',
+        toolName: 'echo',
+        summary: 'Approve echo'
+      })
+    )
+    await turns.applyItem(
+      threadId,
+      makeUserInputItem({
+        id: 'item_input_open',
+        turnId,
+        threadId,
+        inputId: 'input_open',
+        prompt: 'Need input'
+      })
+    )
+
+    if (finalStatus === 'aborted') {
+      await turns.interruptTurn({ threadId, turnId })
+    } else {
+      await turns.finishTurn({ threadId, turnId, status: 'failed', error: 'boom' })
+    }
+
+    const latestById = new Map((await sessionStore.loadItems(threadId)).map((item) => [item.id, item]))
+    expect(latestById.get('item_tool_open')?.status).toBe(expectedToolStatus)
+    expect(latestById.get('item_result_open')?.status).toBe(expectedToolStatus)
+    expect(latestById.get('item_approval_open')?.status).toBe('expired')
+    expect(latestById.get('item_input_open')?.status).toBe('cancelled')
+    expect(
+      [...latestById.values()].some((item) =>
+        item.turnId === turnId && (item.status === 'pending' || item.status === 'running')
+      )
+    ).toBe(false)
+
+    const rawMessages = await readFile(join(dataDir, 'threads', threadId, 'messages.jsonl'), 'utf-8')
+    const messageLines = rawMessages
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as TurnItem)
+    expect(messageLines.filter((item) => item.id === 'item_tool_open').map((item) => item.status))
+      .toEqual(['pending', expectedToolStatus])
+    expect(messageLines.filter((item) => item.id === 'item_result_open').map((item) => item.status))
+      .toEqual(['running', expectedToolStatus])
   })
 
   it('survives a malformed JSONL line', async () => {

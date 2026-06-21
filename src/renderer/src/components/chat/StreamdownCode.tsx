@@ -100,7 +100,7 @@ function PlainTextBlock({ code }: { code: string }): ReactNode {
   if (!trimmedCode.trim()) return null
 
   return (
-    <div className="ds-plain-text-block" data-streamdown="plain-text-block">
+    <div className="ds-plain-text-block ds-plain-code-block" data-streamdown="plain-text-block">
       {trimmedCode}
     </div>
   )
@@ -147,7 +147,7 @@ function InlineFileReferenceCode({
   const handleOpenEditor = (): void => {
     void openWorkspacePathInEditor(resolvedTarget, workspaceRoot).then((result) => {
       if (!result.ok) {
-        void window.dsGui?.logError?.('editor-open', 'Failed to open inline file reference', {
+        void window.kunGui?.logError?.('editor-open', 'Failed to open inline file reference', {
           message: result.message,
           target: resolvedTarget
         })?.catch(() => undefined)

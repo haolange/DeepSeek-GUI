@@ -17,19 +17,26 @@ import {
   normalizeTimeOfDay
 } from './app-settings-normalizers'
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
 export function normalizeScheduledTask(
   task: Partial<ScheduledTaskV1>,
   index: number,
   now: string
 ): ScheduledTaskV1 {
   const schedule = task.schedule
+  const model = normalizeScheduleModel(task.model)
   return {
     id: typeof task.id === 'string' && task.id.trim() ? task.id.trim() : `task-${index + 1}`,
     title: typeof task.title === 'string' && task.title.trim() ? task.title.trim() : `Task ${index + 1}`,
     enabled: normalizeBoolean(task.enabled, true),
     prompt: typeof task.prompt === 'string' ? task.prompt : '',
     workspaceRoot: typeof task.workspaceRoot === 'string' ? task.workspaceRoot.trim() : '',
-    model: typeof task.model === 'string' && task.model.trim() ? task.model.trim() : DEFAULT_SCHEDULE_MODEL,
+    clawChannelId: typeof task.clawChannelId === 'string' ? task.clawChannelId.trim() : '',
+    providerId: typeof task.providerId === 'string' ? task.providerId.trim() : '',
+    model,
     reasoningEffort: normalizeScheduleReasoningEffort(task.reasoningEffort),
     mode: normalizeRunMode(task.mode),
     schedule: {
@@ -52,12 +59,14 @@ export function defaultScheduleSettings(): ScheduleSettingsV1 {
   return {
     enabled: false,
     defaultWorkspaceRoot: '',
+    providerId: '',
     model: DEFAULT_SCHEDULE_MODEL,
     mode: 'agent',
     promptPrefix: '',
     skills: {
       defaultNames: [],
-      extraDirs: []
+      extraDirs: [],
+      disabledDirs: []
     },
     keepAwake: false,
     internal: {
@@ -72,20 +81,22 @@ export function normalizeScheduleSettings(
   input: ScheduleSettingsPatchV1 | undefined
 ): ScheduleSettingsV1 {
   const defaults = defaultScheduleSettings()
-  const source = input ?? {}
-  const skills = source.skills ?? defaults.skills
-  const internal = source.internal ?? defaults.internal
+  const source = isRecord(input) ? input as ScheduleSettingsPatchV1 : {}
+  const skills = isRecord(source.skills) ? source.skills : defaults.skills
+  const internal = isRecord(source.internal) ? source.internal : defaults.internal
   const now = new Date().toISOString()
   return {
     enabled: normalizeBoolean(source.enabled, defaults.enabled),
     defaultWorkspaceRoot:
       typeof source.defaultWorkspaceRoot === 'string' ? source.defaultWorkspaceRoot.trim() : '',
-    model: typeof source.model === 'string' && source.model.trim() ? source.model.trim() : DEFAULT_SCHEDULE_MODEL,
+    providerId: typeof source.providerId === 'string' ? source.providerId.trim() : '',
+    model: normalizeScheduleModel(source.model),
     mode: normalizeRunMode(source.mode),
     promptPrefix: typeof source.promptPrefix === 'string' ? source.promptPrefix : '',
     skills: {
       defaultNames: compactStrings(skills.defaultNames),
-      extraDirs: compactStrings(skills.extraDirs)
+      extraDirs: compactStrings(skills.extraDirs),
+      disabledDirs: compactStrings(skills.disabledDirs)
     },
     keepAwake: normalizeBoolean(source.keepAwake, defaults.keepAwake),
     internal: {
@@ -93,9 +104,17 @@ export function normalizeScheduleSettings(
       secret: typeof internal.secret === 'string' ? internal.secret.trim() : ''
     },
     tasks: Array.isArray(source.tasks)
-      ? source.tasks.map((task, index) => normalizeScheduledTask(task as Partial<ScheduledTaskV1>, index, now))
+      ? source.tasks
+        .filter(isRecord)
+        .map((task, index) => normalizeScheduledTask(task as Partial<ScheduledTaskV1>, index, now))
       : []
   }
+}
+
+function normalizeScheduleModel(value: unknown): string {
+  if (typeof value !== 'string') return DEFAULT_SCHEDULE_MODEL
+  const trimmed = value.trim()
+  return trimmed && trimmed.toLowerCase() !== 'auto' ? trimmed : DEFAULT_SCHEDULE_MODEL
 }
 
 export function mergeScheduleSettings(

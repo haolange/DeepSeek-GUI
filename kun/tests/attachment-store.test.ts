@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { FileAttachmentStore } from '../src/attachments/attachment-store.js'
-import { DeepseekCompatModelClient } from '../src/adapters/model/deepseek-compat-model-client.js'
+import { CompatModelClient } from '../src/adapters/model/compat-model-client.js'
 import {
   KunCapabilitiesConfig,
   type AttachmentsCapabilityConfig,
@@ -11,6 +11,7 @@ import {
 } from '../src/contracts/capabilities.js'
 import { modelCapabilitiesForModel } from '../src/loop/model-context-profile.js'
 import type { ModelClient, ModelRequest } from '../src/ports/model-client.js'
+import type { LocalTool } from '../src/adapters/tool/local-tool-host.js'
 import { dispatchRequest } from '../src/server/http-server.js'
 import { bootstrapThread, makeHarness } from './loop-test-harness.js'
 import { buildHarness, readJson } from './http-server-test-harness.js'
@@ -33,6 +34,7 @@ describe('Attachment store and multimodal input', () => {
       name: 'shot.png',
       data,
       mimeType: 'image/png',
+      localFilePath: '/tmp/picked/shot.png',
       threadId: 'thr_1',
       workspace: '/tmp/ws'
     })
@@ -43,7 +45,13 @@ describe('Attachment store and multimodal input', () => {
     })
 
     expect(second.id).toBe(first.id)
-    expect(first).toMatchObject({ mimeType: 'image/png', width: 2, height: 3, byteSize: data.byteLength })
+    expect(first).toMatchObject({
+      mimeType: 'image/png',
+      width: 2,
+      height: 3,
+      byteSize: data.byteLength,
+      localFilePath: '/tmp/picked/shot.png'
+    })
     await expect(store.resolveContent(first.id, { threadId: 'thr_2' })).rejects.toThrow(/not authorized/)
     await expect(store.resolveContent(first.id, { workspace: '/tmp/ws' })).resolves.toMatchObject({ id: first.id })
   })
@@ -113,6 +121,7 @@ describe('Attachment store and multimodal input', () => {
           name: 'shot.png',
           mimeType: 'image/png',
           dataBase64: png(1, 1).toString('base64'),
+          localFilePath: '/tmp/picked/shot.png',
           threadId: 'thr_1',
           textFallback: {
             dataBase64: 'abcd',
@@ -137,6 +146,7 @@ describe('Attachment store and multimodal input', () => {
     expect(metadata.status).toBe(200)
     expect(await readJson(metadata)).toMatchObject({
       attachment: {
+        localFilePath: '/tmp/picked/shot.png',
         textFallback: {
           dataBase64: 'abcd',
           mimeType: 'image/png'
@@ -164,11 +174,14 @@ describe('Attachment store and multimodal input', () => {
 
   it('resolves image attachments for vision models and text fallbacks for text-only models', async () => {
     const store = createStore()
+    const workspace = join(dir, 'workspace')
+    const localFilePath = join(workspace, 'assets', 'shot.png')
     const attachment = await store.create({
       name: 'shot.png',
       data: png(1, 1),
+      localFilePath,
       threadId: 'thr_1',
-      workspace: '/tmp/ws'
+      workspace
     })
     const seenRequests: ModelRequest[] = []
     const model: ModelClient = {
@@ -181,10 +194,11 @@ describe('Attachment store and multimodal input', () => {
     }
     const h = makeHarness(model, {
       attachmentStore: store,
-      modelCapabilities: () => visionCapabilities()
+      modelCapabilities: () => visionCapabilities(),
+      tools: [generateImageTool()]
     })
     await bootstrapThread(h, {
-      workspace: '/tmp/ws',
+      workspace,
       request: { prompt: 'look', attachmentIds: [attachment.id], model: 'vision-model' }
     })
 
@@ -193,15 +207,18 @@ describe('Attachment store and multimodal input', () => {
     expect(seenRequests.at(-1)?.attachments?.[0]).toMatchObject({
       id: attachment.id,
       mimeType: 'image/png',
-      dataBase64: expect.any(String)
+      dataBase64: expect.any(String),
+      localFilePath
     })
+    expect(seenRequests.at(-1)?.contextInstructions?.join('\n')).toContain('reference_image_paths')
+    expect(seenRequests.at(-1)?.contextInstructions?.join('\n')).toContain('assets/shot.png')
 
     const textOnly = makeHarness(model, {
       attachmentStore: store,
       modelCapabilities: () => ({ ...visionCapabilities(), inputModalities: ['text'] })
     })
     await bootstrapThread(textOnly, {
-      workspace: '/tmp/ws',
+      workspace,
       request: { prompt: 'look', attachmentIds: [attachment.id], model: 'text-only' }
     })
     expect(await textOnly.loop.runTurn(textOnly.threadId, textOnly.turnId)).toBe('completed')
@@ -210,8 +227,46 @@ describe('Attachment store and multimodal input', () => {
       id: attachment.id,
       mimeType: 'image/png',
       dataBase64: expect.any(String),
+      localFilePath,
       wasCompressed: false
     })
+    expect(seenRequests.at(-1)?.contextInstructions?.join('\n') ?? '').not.toContain('reference_image_paths')
+  })
+
+  it('does not expose image reference paths outside the active workspace', async () => {
+    const store = createStore()
+    const workspace = join(dir, 'workspace')
+    const localFilePath = join(dir, 'outside', 'secret.png')
+    const attachment = await store.create({
+      name: 'secret.png',
+      data: png(1, 1),
+      localFilePath,
+      threadId: 'thr_1',
+      workspace
+    })
+    const seenRequests: ModelRequest[] = []
+    const model: ModelClient = {
+      provider: 'fake',
+      model: 'fake',
+      async *stream(request) {
+        seenRequests.push(request)
+        yield { kind: 'completed', stopReason: 'stop' }
+      }
+    }
+    const h = makeHarness(model, {
+      attachmentStore: store,
+      modelCapabilities: () => visionCapabilities(),
+      tools: [generateImageTool()]
+    })
+    await bootstrapThread(h, {
+      workspace,
+      request: { prompt: 'look', attachmentIds: [attachment.id], model: 'vision-model' }
+    })
+
+    expect(await h.loop.runTurn(h.threadId, h.turnId)).toBe('completed')
+    const instructions = seenRequests.at(-1)?.contextInstructions?.join('\n') ?? ''
+    expect(instructions).not.toContain('reference_image_paths')
+    expect(instructions).not.toContain(localFilePath)
   })
 
   it('routes built-in DeepSeek v4 image attachments as text fallbacks', async () => {
@@ -219,6 +274,7 @@ describe('Attachment store and multimodal input', () => {
     const attachment = await store.create({
       name: 'shot.png',
       data: png(1, 1),
+      localFilePath: '/tmp/picked/shot.png',
       threadId: 'thr_1',
       workspace: '/tmp/ws'
     })
@@ -252,6 +308,7 @@ describe('Attachment store and multimodal input', () => {
       id: attachment.id,
       mimeType: 'image/png',
       dataBase64: expect.any(String),
+      localFilePath: '/tmp/picked/shot.png',
       wasCompressed: false
     })
     const preSend = (await h.sessionStore.loadEventsSince(h.threadId, 0))
@@ -302,7 +359,7 @@ describe('Attachment store and multimodal input', () => {
 
   it('maps image attachments to DeepSeek-compatible message parts', async () => {
     let body: { messages?: Array<{ role: string; content: unknown }> } | undefined
-    const client = new DeepseekCompatModelClient({
+    const client = new CompatModelClient({
       baseUrl: 'https://model.example.test',
       apiKey: '',
       model: 'vision-model',
@@ -353,7 +410,7 @@ describe('Attachment store and multimodal input', () => {
 
   it('maps text attachment fallbacks to structured DeepSeek-compatible user text', async () => {
     let body: { messages?: Array<{ role: string; content: unknown }> } | undefined
-    const client = new DeepseekCompatModelClient({
+    const client = new CompatModelClient({
       baseUrl: 'https://model.example.test',
       apiKey: '',
       model: 'text-model',
@@ -392,6 +449,7 @@ describe('Attachment store and multimodal input', () => {
         byteSize: 3,
         width: 1280,
         height: 720,
+        localFilePath: '/tmp/picked/shot.png',
         wasCompressed: true
       }],
       tools: [],
@@ -402,6 +460,7 @@ describe('Attachment store and multimodal input', () => {
 
     expect(body?.messages?.[0]?.content).toContain('describe')
     expect(body?.messages?.[0]?.content).toContain('[Attached image as base64 text]')
+    expect(body?.messages?.[0]?.content).toContain('FilePath: /tmp/picked/shot.png')
     expect(body?.messages?.[0]?.content).toContain('MIME: image/webp')
     expect(body?.messages?.[0]?.content).toContain('Dimensions: 1280x720')
     expect(body?.messages?.[0]?.content).toContain('```base64\nYWJj\n```')
@@ -448,5 +507,18 @@ function visionCapabilities(): ModelCapabilityMetadata {
     supportsToolCalling: true,
     contextWindowTokens: 128_000,
     messageParts: ['text', 'image_url']
+  }
+}
+
+function generateImageTool(): LocalTool {
+  return {
+    name: 'generate_image',
+    description: 'Generate or edit an image.',
+    inputSchema: { type: 'object' },
+    toolKind: 'tool_call',
+    policy: 'auto',
+    async execute() {
+      return { output: { ok: true } }
+    }
   }
 }

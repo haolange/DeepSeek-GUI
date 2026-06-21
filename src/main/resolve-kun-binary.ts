@@ -3,7 +3,7 @@ import { join } from 'node:path'
 
 /**
  * Resolve the Kun executable. Kun ships as a TypeScript
- * package inside the DeepSeek-GUI workspace (`kun/`) and is
+ * package inside the Kun workspace (`kun/`) and is
  * executed through the bundled Node.js runtime that Electron carries.
  *
  * Resolution order:
@@ -106,6 +106,8 @@ export function buildKunServeArgs(input: {
   port: number
   dataDir: string
   baseUrl?: string
+  modelProxyUrl?: string
+  endpointFormat?: string
   model: string
   approvalPolicy: string
   sandboxMode: string
@@ -121,6 +123,8 @@ export function buildKunServeArgs(input: {
     '--data-dir',
     input.dataDir,
     ...(input.baseUrl ? ['--base-url', input.baseUrl] : []),
+    ...(input.modelProxyUrl ? ['--model-proxy-url', input.modelProxyUrl] : []),
+    ...(input.endpointFormat ? ['--endpoint-format', input.endpointFormat] : []),
     '--model',
     input.model,
     '--approval-policy',

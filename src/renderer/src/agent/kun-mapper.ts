@@ -1,11 +1,13 @@
 import type {
   ChatBlock,
   CompactionEventPayload,
+  GeneratedFileReference,
   NormalizedThread,
   ReviewBlock,
   ReviewEventPayload,
   ReviewOutput,
   ReviewTarget,
+  RuntimeErrorEventPayload,
   RuntimeStatusEventPayload,
   ThreadGoal,
   ThreadTodoList,
@@ -18,6 +20,7 @@ import type {
   ToolEventPayload,
   UserInputQuestion
 } from './types'
+import { redactSecrets, redactSecretText } from '@shared/secret-redaction'
 import type {
   CoreChildRuntimeMetadataJson,
   CoreRuntimeEventJson,
@@ -50,6 +53,8 @@ export function threadFromCore(thread: CoreThreadSummaryJson): NormalizedThread 
     mode: thread.mode,
     workspace: thread.workspace,
     status: thread.status,
+    approvalPolicy: normalizeApprovalPolicy(thread.approvalPolicy),
+    sandboxMode: normalizeSandboxMode(thread.sandboxMode),
     archived: thread.status === 'archived',
     relation: thread.relation,
     parentThreadId: thread.parentThreadId,
@@ -60,6 +65,31 @@ export function threadFromCore(thread: CoreThreadSummaryJson): NormalizedThread 
     forkedFromTurnCount: thread.forkedFromTurnCount,
     goal: thread.goal ? goalFromCore(thread.goal) : null,
     todos: thread.todos ? todosFromCore(thread.todos) : null
+  }
+}
+
+function normalizeApprovalPolicy(value: string | undefined): NormalizedThread['approvalPolicy'] {
+  switch (value) {
+    case 'auto':
+    case 'on-request':
+    case 'untrusted':
+    case 'suggest':
+    case 'never':
+      return value
+    default:
+      return undefined
+  }
+}
+
+function normalizeSandboxMode(value: string | undefined): NormalizedThread['sandboxMode'] {
+  switch (value) {
+    case 'read-only':
+    case 'workspace-write':
+    case 'danger-full-access':
+    case 'external-sandbox':
+      return value
+    default:
+      return undefined
   }
 }
 
@@ -213,20 +243,51 @@ function normalizeWebSources(value: unknown): Array<Record<string, string>> | un
   return sources.length > 0 ? sources : undefined
 }
 
+function normalizeUserFileReferences(value: unknown): Array<{
+  path: string
+  relativePath: string
+  name: string
+  kind?: 'file' | 'directory'
+}> | undefined {
+  if (!Array.isArray(value)) return undefined
+  const references = value
+    .map((entry) => {
+      if (!entry || typeof entry !== 'object') return null
+      const raw = entry as Record<string, unknown>
+      const path = typeof raw.path === 'string' && raw.path.trim() ? raw.path.trim() : ''
+      const relativePath =
+        typeof raw.relativePath === 'string' && raw.relativePath.trim() ? raw.relativePath.trim() : ''
+      const name = typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim() : ''
+      const kind = raw.kind === 'directory' ? 'directory' : 'file'
+      if (!path || !relativePath || !name) return null
+      return { path, relativePath, name, kind }
+    })
+    .filter((entry): entry is { path: string; relativePath: string; name: string; kind: 'file' | 'directory' } =>
+      entry !== null
+    )
+  return references.length > 0 ? references : undefined
+}
+
 function applyRuntimeDisclosureMeta(
   meta: Record<string, unknown>,
   item: CoreTurnItemJson,
   child?: CoreChildRuntimeMetadataJson
 ): void {
+  if (item.turnId) meta.turnId = item.turnId
+  if (typeof item.workspaceCheckpointId === 'string' && item.workspaceCheckpointId.trim()) {
+    meta.workspaceCheckpointId = item.workspaceCheckpointId.trim()
+  }
   const attachmentIds = stringArray(item.attachmentIds)
   const activeSkillIds = stringArray(item.activeSkillIds)
   const injectedMemoryIds = stringArray(item.injectedMemoryIds)
+  const fileReferences = normalizeUserFileReferences(item.fileReferences)
   const normalizedChild = normalizeChildMetadata(child)
   const displayText = typeof item.displayText === 'string' ? item.displayText.trim() : ''
   if (displayText && displayText !== item.text?.trim()) {
     meta.displayText = displayText
   }
   if (attachmentIds) meta.attachmentIds = attachmentIds
+  if (fileReferences) meta.fileReferences = fileReferences
   if (activeSkillIds) meta.activeSkillIds = activeSkillIds
   if (injectedMemoryIds) meta.injectedMemoryIds = injectedMemoryIds
   if (typeof item.skillInjectionBytes === 'number') {
@@ -238,6 +299,103 @@ function applyRuntimeDisclosureMeta(
 function extractToolSources(item: CoreTurnItemJson): Array<Record<string, string>> | undefined {
   const payload = payloadFor(item)
   return normalizeWebSources(payload.sources) ?? normalizeWebSources(payload.citations)
+}
+
+type ToolAttachmentReference = {
+  id: string
+  name?: string
+  mimeType?: string
+  byteSize?: number
+  width?: number
+  height?: number
+  previewUrl?: string
+}
+
+function extractToolAttachments(item: CoreTurnItemJson): ToolAttachmentReference[] | undefined {
+  if (item.kind !== 'tool_result') return undefined
+  const payload = payloadFor(item)
+  if (!Array.isArray(payload.attachments)) return undefined
+  const attachments = payload.attachments
+    .map((entry): ToolAttachmentReference | null => {
+      if (!entry || typeof entry !== 'object') return null
+      const raw = entry as Record<string, unknown>
+      const id = typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim() : ''
+      if (!id) return null
+      return {
+        id,
+        ...(typeof raw.name === 'string' && raw.name.trim() ? { name: raw.name.trim() } : {}),
+        ...(typeof raw.mimeType === 'string' && raw.mimeType.trim() ? { mimeType: raw.mimeType.trim() } : {}),
+        ...(typeof raw.byteSize === 'number' && Number.isFinite(raw.byteSize) ? { byteSize: raw.byteSize } : {}),
+        ...(typeof raw.width === 'number' && Number.isFinite(raw.width) ? { width: raw.width } : {}),
+        ...(typeof raw.height === 'number' && Number.isFinite(raw.height) ? { height: raw.height } : {}),
+        ...(typeof raw.previewUrl === 'string' && raw.previewUrl.trim() ? { previewUrl: raw.previewUrl.trim() } : {}),
+        ...(typeof raw.dataUrl === 'string' && raw.dataUrl.trim() ? { previewUrl: raw.dataUrl.trim() } : {})
+      }
+    })
+    .filter((entry): entry is ToolAttachmentReference => entry !== null)
+  return attachments.length > 0 ? attachments : undefined
+}
+
+function readGeneratedFileString(raw: Record<string, unknown>, ...keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = raw[key]
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+  return undefined
+}
+
+function normalizeGeneratedFileReference(entry: unknown): GeneratedFileReference | null {
+  if (!entry || typeof entry !== 'object') return null
+  const raw = entry as Record<string, unknown>
+  const id = readGeneratedFileString(raw, 'id', 'attachmentId')
+  const name = readGeneratedFileString(raw, 'name', 'fileName', 'filename')
+  const mimeType = readGeneratedFileString(raw, 'mimeType', 'type', 'mediaType')
+  const previewUrl = readGeneratedFileString(raw, 'previewUrl', 'dataUrl', 'url')
+  const path = readGeneratedFileString(raw, 'path', 'file')
+  const relativePath = readGeneratedFileString(raw, 'relativePath', 'relative_path')
+  const absolutePath = readGeneratedFileString(raw, 'absolutePath', 'absolute_path')
+  const byteSize = raw.byteSize
+  const width = raw.width
+  const height = raw.height
+  const normalized: GeneratedFileReference = {
+    ...(id ? { id } : {}),
+    ...(name ? { name } : {}),
+    ...(mimeType ? { mimeType } : {}),
+    ...(typeof byteSize === 'number' && Number.isFinite(byteSize) ? { byteSize } : {}),
+    ...(typeof width === 'number' && Number.isFinite(width) ? { width } : {}),
+    ...(typeof height === 'number' && Number.isFinite(height) ? { height } : {}),
+    ...(previewUrl ? { previewUrl } : {}),
+    ...(path ? { path } : {}),
+    ...(relativePath ? { relativePath } : {}),
+    ...(absolutePath ? { absolutePath } : {})
+  }
+  return Object.keys(normalized).length > 0 ? normalized : null
+}
+
+function extractToolGeneratedFiles(item: CoreTurnItemJson): GeneratedFileReference[] | undefined {
+  if (item.kind !== 'tool_result') return undefined
+  const payload = payloadFor(item)
+  const candidates = [
+    ...(Array.isArray(payload.files) ? payload.files : []),
+    ...(Array.isArray(payload.generatedFiles) ? payload.generatedFiles : [])
+  ]
+  const generatedFiles: GeneratedFileReference[] = []
+  const seen = new Set<string>()
+  for (const candidate of candidates) {
+    const normalized = normalizeGeneratedFileReference(candidate)
+    if (!normalized) continue
+    const key =
+      normalized.id ??
+      normalized.absolutePath ??
+      normalized.relativePath ??
+      normalized.path ??
+      normalized.previewUrl ??
+      normalized.name
+    if (key && seen.has(key)) continue
+    if (key) seen.add(key)
+    generatedFiles.push(normalized)
+  }
+  return generatedFiles.length > 0 ? generatedFiles : undefined
 }
 
 function applyCommandResultMeta(meta: Record<string, unknown>, item: CoreTurnItemJson): void {
@@ -349,6 +507,10 @@ function toolBlockFromItem(item: CoreTurnItemJson, child?: CoreChildRuntimeMetad
   applyRuntimeDisclosureMeta(meta, item, child)
   const sources = extractToolSources(item)
   if (sources) meta.sources = sources
+  const attachments = extractToolAttachments(item)
+  if (attachments) meta.attachments = attachments
+  const generatedFiles = extractToolGeneratedFiles(item)
+  if (generatedFiles) meta.generatedFiles = generatedFiles
   const presentation = inferToolPresentation(item)
   if (presentation.command) meta.command = presentation.command
   if (presentation.toolKind === 'command_execution') applyCommandResultMeta(meta, item)
@@ -421,7 +583,7 @@ function questionsFromCore(
       header: 'Input',
       id: fallbackId,
       question: prompt?.trim() || 'Input requested',
-      options: [{ label: 'Submit', description: 'Send the typed response.' }]
+      options: []
     }
   ]
 }
@@ -476,11 +638,7 @@ function usageFromCore(usage: CoreUsageSnapshotJson): ThreadUsageSnapshot {
     totalTokens: usage.totalTokens ?? inputTokens + outputTokens,
     costUsd: usage.costUsd ?? 0,
     costCny: usage.costCny ?? null,
-    cacheSavingsUsd: usage.cacheSavingsUsd ?? 0,
-    cacheSavingsCny: usage.cacheSavingsCny ?? null,
     tokenEconomySavingsTokens: usage.tokenEconomySavingsTokens ?? 0,
-    tokenEconomySavingsUsd: usage.tokenEconomySavingsUsd ?? 0,
-    tokenEconomySavingsCny: usage.tokenEconomySavingsCny ?? null,
     turns: usage.turns ?? 0
   }
 }
@@ -491,6 +649,7 @@ function userMessageBlockFromItem(item: CoreTurnItemJson): ChatBlock | null {
   return {
     kind: 'user',
     id: item.id,
+    turnId: item.turnId,
     createdAt: itemCreatedAt(item),
     text: item.text ?? '',
     ...(Object.keys(meta).length > 0 ? { meta } : {})
@@ -511,7 +670,7 @@ function userMessageEventFromItem(item: CoreTurnItemJson): UserMessageEventPaylo
 
 function assistantTextBlockFromItem(item: CoreTurnItemJson): ChatBlock | null {
   if (!item.text?.trim()) return null
-  return { kind: 'assistant', id: item.id, createdAt: itemCreatedAt(item), text: item.text }
+  return { kind: 'assistant', id: item.id, turnId: item.turnId, createdAt: itemCreatedAt(item), text: item.text }
 }
 
 function reasoningBlockFromItem(item: CoreTurnItemJson): ChatBlock | null {
@@ -579,7 +738,7 @@ function compactionBlockFromItem(item: CoreTurnItemJson): ChatBlock {
     status: item.status === 'failed' ? 'error' : 'success',
     messagesBefore: item.replacedTokens,
     detail: item.pinnedConstraints?.join('\n'),
-    auto: true
+    auto: item.auto ?? true
   }
 }
 
@@ -653,13 +812,79 @@ function reviewBlockFromItem(item: CoreTurnItemJson): ReviewBlock {
   }
 }
 
+function errorSeverity(
+  explicit: CoreTurnItemJson['severity'] | CoreRuntimeEventJson['severity'],
+  code?: string
+): 'info' | 'warning' | 'error' {
+  if (explicit === 'info' || explicit === 'warning' || explicit === 'error') return explicit
+  if (code === 'budget_warning' || code === 'compaction_summary_fallback') return 'warning'
+  if (code === 'tool_catalog_changed' || code === 'tool_storm_suppressed') return 'info'
+  return 'error'
+}
+
+function runtimeErrorDetail(message: string, code?: string, details?: unknown): string | undefined {
+  const parts: string[] = []
+  if (code) parts.push(`Code: ${code}`)
+  if (message.trim()) parts.push(`Message:\n${redactSecretText(message)}`)
+  if (details !== undefined) {
+    try {
+      parts.push(`Details:\n${JSON.stringify(redactSecrets(details), null, 2)}`)
+    } catch {
+      parts.push(`Details:\n${redactSecretText(String(details))}`)
+    }
+  }
+  return parts.length > 0 ? parts.join('\n\n') : undefined
+}
+
 function systemErrorBlockFromItem(item: CoreTurnItemJson): ChatBlock {
+  const message = item.message ?? 'Runtime error'
+  const detail = runtimeErrorDetail(message, item.code, item.details)
   return {
     kind: 'system',
     id: item.id,
     createdAt: itemCreatedAt(item),
-    text: item.message ?? 'Runtime error'
+    text: redactSecretText(message),
+    ...(item.code ? { code: item.code } : {}),
+    ...(detail ? { detail } : {}),
+    severity: errorSeverity(item.severity, item.code)
   }
+}
+
+function runtimeErrorFromItem(item: CoreTurnItemJson): RuntimeErrorEventPayload {
+  const message = item.message ?? 'Runtime error'
+  return {
+    itemId: item.id,
+    createdAt: itemCreatedAt(item),
+    message: redactSecretText(message),
+    ...(item.code ? { code: item.code } : {}),
+    ...(item.details !== undefined ? { details: item.details } : {}),
+    severity: errorSeverity(item.severity, item.code)
+  }
+}
+
+function runtimeErrorFromEvent(
+  event: CoreRuntimeEventJson,
+  fallback: string
+): RuntimeErrorEventPayload {
+  const message = event.message ?? fallback
+  const itemId = event.itemId ?? `runtime_error_${event.turnId ?? event.threadId ?? event.seq ?? Date.now()}`
+  return {
+    itemId,
+    createdAt: event.timestamp,
+    message: redactSecretText(message),
+    ...(event.code ? { code: event.code } : {}),
+    ...(event.details !== undefined ? { details: event.details } : {}),
+    severity: errorSeverity(event.severity, event.code)
+  }
+}
+
+function errorForRuntimeEvent(payload: RuntimeErrorEventPayload): Error {
+  return new Error(JSON.stringify({
+    ...(payload.code ? { code: payload.code } : {}),
+    message: payload.message,
+    ...(payload.details !== undefined ? { details: payload.details } : {}),
+    ...(payload.severity ? { severity: payload.severity } : {})
+  }))
 }
 
 /**
@@ -714,7 +939,7 @@ function compactionFromItem(item: CoreTurnItemJson): CompactionEventPayload {
     createdAt: itemCreatedAt(item),
     messagesBefore: item.replacedTokens,
     detail: item.pinnedConstraints?.length ? item.pinnedConstraints.join('\n') : undefined,
-    auto: true
+    auto: item.auto ?? true
   }
 }
 
@@ -766,7 +991,7 @@ function emitItem(
       sink.onReview?.(reviewFromItem(item))
       return
     case 'error':
-      sink.onError(new Error(item.message ?? 'Kun item failed'))
+      sink.onRuntimeError?.(runtimeErrorFromItem(item))
       return
   }
 }
@@ -792,7 +1017,7 @@ function compactionFromEvent(
     createdAt: event.timestamp,
     messagesBefore: event.replacedTokens,
     detail: event.pinnedConstraints?.join('\n'),
-    auto: true
+    auto: event.auto ?? true
   }
 }
 
@@ -863,6 +1088,40 @@ function runtimeStatusFromEvent(event: CoreRuntimeEventJson): RuntimeStatusEvent
 	  }
 	  return null
 	}
+
+/**
+ * Dispatches a batch of runtime events, coalescing consecutive text and
+ * reasoning deltas into a single sink.onDeltas call so one network chunk
+ * costs one store update instead of one per token.
+ */
+export async function dispatchKunRuntimeEvents(
+  events: CoreRuntimeEventJson[],
+  sink: ThreadEventSink,
+  handleApprovalRequest: (event: CoreRuntimeEventJson, sink: ThreadEventSink) => Promise<void>
+): Promise<void> {
+  let pendingDeltas: ThreadDeltaEvent[] = []
+  const flushDeltas = (): void => {
+    if (pendingDeltas.length === 0) return
+    sink.onDeltas(pendingDeltas)
+    pendingDeltas = []
+  }
+  for (const event of events) {
+    if (event.kind === 'assistant_text_delta' || event.kind === 'assistant_reasoning_delta') {
+      const text = event.item?.text ?? ''
+      if (text) {
+        pendingDeltas.push({
+          text,
+          kind: event.kind === 'assistant_text_delta' ? 'agent_message' : 'agent_reasoning',
+          seq: event.seq
+        })
+      }
+      continue
+    }
+    flushDeltas()
+    await dispatchKunRuntimeEvent(event, sink, handleApprovalRequest)
+  }
+  flushDeltas()
+}
 
 export async function dispatchKunRuntimeEvent(
   event: CoreRuntimeEventJson,
@@ -966,14 +1225,19 @@ export async function dispatchKunRuntimeEvent(
     case 'turn_aborted':
       sink.onTurnComplete()
       return
-    case 'turn_failed':
+    case 'turn_failed': {
+      const payload = runtimeErrorFromEvent(event, 'Kun turn failed')
+      sink.onRuntimeError?.(payload)
+      sink.onError(errorForRuntimeEvent(payload), { terminal: true })
+      return
+    }
     case 'error':
       if (event.code === 'compaction_summary_fallback') {
         const status = runtimeStatusFromEvent(event)
         if (status) sink.onRuntimeStatus?.(status)
         return
       }
-      sink.onError(new Error(event.message ?? 'Kun turn failed'))
+      sink.onRuntimeError?.(runtimeErrorFromEvent(event, 'Runtime error'))
       return
     default:
       return

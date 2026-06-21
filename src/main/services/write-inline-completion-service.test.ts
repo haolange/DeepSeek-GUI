@@ -4,9 +4,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   defaultClawSettings,
+  defaultKeyboardShortcuts,
   defaultKunRuntimeSettings,
   defaultModelProviderSettings,
   defaultScheduleSettings,
+  defaultWorkflowSettings,
   defaultWriteSettings,
   type AppSettingsV1
 } from '../../shared/app-settings'
@@ -42,6 +44,8 @@ function createSettings(patch: Partial<AppSettingsV1['write']['inlineCompletion'
     notifications: {
       turnComplete: true
     },
+    appBehavior: { openAtLogin: false, startMinimized: false, closeToTray: false },
+    keyboardShortcuts: defaultKeyboardShortcuts(),
     write: {
       ...write,
       inlineCompletion: {
@@ -50,9 +54,12 @@ function createSettings(patch: Partial<AppSettingsV1['write']['inlineCompletion'
       }
     },
     schedule: defaultScheduleSettings(),
+    workflow: defaultWorkflowSettings(),
     guiUpdate: {
       channel: 'stable'
     },
+    codePromptPrefix: '',
+    disabledSkillIds: [],
     claw: defaultClawSettings()
   }
 }
@@ -141,7 +148,7 @@ describe('requestWriteInlineCompletion', () => {
       suffix: ' a test.',
       max_tokens: 64
     })
-    expect(body.prompt).toContain('DeepSeek GUI inline completion')
+    expect(body.prompt).toContain('Kun inline completion')
     expect(body.prompt).toContain('Return only the text to insert at the cursor')
     expect(body.prompt).not.toContain('<<<SHORT')
     expect(body.prompt).toContain('<<<PREFIX')
@@ -155,6 +162,37 @@ describe('requestWriteInlineCompletion', () => {
       mode: 'short',
       model: 'deepseek-v4-flash'
     })
+  })
+
+  it('does not route lookalike DeepSeek hosts to FIM completions', async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({
+        choices: [{
+          message: {
+            content: '<<<SHORT\n from chat\n>>>'
+          }
+        }]
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+      })
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await requestWriteInlineCompletion(
+      createSettings({ baseUrl: 'https://deepseek.com.evil.test/beta' }),
+      createRequest()
+    )
+
+    expect(result).toMatchObject({
+      ok: true,
+      completion: ' from chat'
+    })
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+    expect(url).toBe('https://deepseek.com.evil.test/v1/chat/completions')
+    const body = JSON.parse(String(init.body)) as { messages?: unknown[]; prompt?: string }
+    expect(body.messages).toBeDefined()
+    expect(body.prompt).toBeUndefined()
   })
 
   it('does not request the API when inline completion is disabled', async () => {
@@ -194,7 +232,7 @@ describe('requestWriteInlineCompletion', () => {
       suffix: ' a test.',
       responseChars: 0
     })
-    expect(debugEntries[0].prompt).toContain('DeepSeek GUI inline completion')
+    expect(debugEntries[0].prompt).toContain('Kun inline completion')
     expect(debugEntries[0].prompt.endsWith('# Draft\n\nThis is')).toBe(true)
   })
 
@@ -253,6 +291,65 @@ describe('requestWriteInlineCompletion', () => {
     expect(JSON.parse(String(init.body))).toMatchObject({
       model: 'deepseek-chat'
     })
+  })
+
+  it('uses /completions as a Chat Completions-shaped custom endpoint', async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ choices: [{ message: { content: ' custom text' } }] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+      })
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    const settings = createSettings()
+    settings.provider.apiKey = 'sk-custom'
+    settings.provider.baseUrl = 'https://gateway.example/custom-path/completions'
+    settings.provider.providers[0] = {
+      ...settings.provider.providers[0],
+      apiKey: 'sk-custom',
+      baseUrl: 'https://gateway.example/custom-path/completions',
+      endpointFormat: 'custom_endpoint'
+    }
+
+    const result = await requestWriteInlineCompletion(settings, {
+      ...createRequest(),
+      model: 'custom-model'
+    })
+
+    expect(result).toMatchObject({
+      ok: true,
+      model: 'custom-model'
+    })
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+    expect(url).toBe('https://gateway.example/custom-path/completions')
+    expect(JSON.parse(String(init.body))).toMatchObject({
+      model: 'custom-model',
+      messages: expect.any(Array)
+    })
+  })
+
+  it('rejects custom full endpoint URLs that do not end with a known endpoint path', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+
+    const settings = createSettings()
+    settings.provider.apiKey = 'sk-custom'
+    settings.provider.baseUrl = 'https://gateway.example/custom-path'
+    settings.provider.providers[0] = {
+      ...settings.provider.providers[0],
+      apiKey: 'sk-custom',
+      baseUrl: 'https://gateway.example/custom-path',
+      endpointFormat: 'custom_endpoint'
+    }
+
+    const result = await requestWriteInlineCompletion(settings, createRequest())
+
+    expect(result).toMatchObject({
+      ok: false,
+      message: 'Custom full endpoint URL must end with /chat/completions, /completions, /responses, or /messages.'
+    })
+    expect(fetchMock).not.toHaveBeenCalled()
   })
 
   it('uses an explicit flash override when write disables model inheritance', async () => {
@@ -577,7 +674,7 @@ describe('requestWriteInlineCompletion', () => {
     const request = createRequest()
 
     const prompt = buildWriteInlineCompletionPrompt(request, null)
-    expect(prompt).toContain('DeepSeek GUI inline completion')
+    expect(prompt).toContain('Kun inline completion')
     expect(prompt).toContain('<<<PREFIX')
     expect(prompt).toContain('<<<SUFFIX')
     expect(prompt).not.toContain('<<<SHORT')
@@ -718,6 +815,62 @@ describe('parseWriteInlineAction', () => {
       to: 15,
       original: 'old text',
       scopeKind: 'selection'
+    })
+  })
+
+  it('returns an empty completion for a malformed marker skeleton instead of leaking markers', () => {
+    // Regression: a degenerate single-line skeleton used to fall through to the
+    // plain-text fallback and render ">>> <<<LONG >>> <<<EDIT" as ghost text.
+    expect(parseWriteInlineAction('>>> <<<LONG >>> <<<EDIT')).toEqual({
+      kind: 'short',
+      text: ''
+    })
+    expect(parseWriteInlineAction('<<<SHORT >>> <<<LONG >>> <<<EDIT >>>', { fallbackKind: 'long' })).toEqual({
+      kind: 'long',
+      text: ''
+    })
+  })
+
+  it('returns an empty completion when the model parrots the protocol template', () => {
+    const template = [
+      '<<<SHORT',
+      'short text to insert at the cursor',
+      '>>>',
+      '<<<LONG',
+      'longer continuation to insert at the cursor',
+      '>>>',
+      '<<<EDIT',
+      'replacement text for the editable local scope',
+      '>>>'
+    ].join('\n')
+    expect(parseWriteInlineAction(template)).toEqual({ kind: 'short', text: '' })
+  })
+
+  it('parses same-line marked blocks', () => {
+    expect(parseWriteInlineAction('<<<SHORT next words >>>')).toEqual({
+      kind: 'short',
+      text: 'next words'
+    })
+  })
+
+  it('prefers the first non-empty block when an earlier block is empty', () => {
+    expect(parseWriteInlineAction('<<<SHORT\n>>>\n<<<LONG\nA fuller continuation.\n>>>')).toEqual({
+      kind: 'long',
+      text: 'A fuller continuation.'
+    })
+  })
+
+  it('extracts a block that dropped its closing marker without swallowing the next marker', () => {
+    expect(parseWriteInlineAction('<<<SHORT\nnext words\n<<<EDIT\nignored\n>>>')).toEqual({
+      kind: 'short',
+      text: 'next words'
+    })
+  })
+
+  it('keeps plain text that legitimately contains >>> when no protocol marker is present', () => {
+    expect(parseWriteInlineAction('>>> a Python prompt')).toEqual({
+      kind: 'short',
+      text: '>>> a Python prompt'
     })
   })
 })

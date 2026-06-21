@@ -25,6 +25,19 @@ export type EventSourcedChildRunProjection = {
   seq: number
   updatedAt: string
   text?: string
+  /** Observability metrics carried on the child lifecycle events. */
+  model?: string
+  profile?: string
+  toolPolicy?: 'readOnly' | 'inherit'
+  prefixReused?: boolean
+  inheritedHistoryItems?: number
+  toolInvocations?: number
+  durationMs?: number
+  queuedMs?: number
+  totalTokens?: number
+  cacheHitRate?: number | null
+  costUsd?: number
+  costCny?: number
 }
 
 export type EventSourcedRuntimeProjection = {
@@ -61,6 +74,8 @@ export type EventSourcedRuntimeProjection = {
     itemId?: string
     message: string
     code?: string
+    details?: unknown
+    severity?: 'info' | 'warning' | 'error'
   }>
 }
 
@@ -169,7 +184,9 @@ export function applyRuntimeEvent(
         ...(event.turnId ? { turnId: event.turnId } : {}),
         ...(event.itemId ? { itemId: event.itemId } : {}),
         message: event.message,
-        ...(event.code ? { code: event.code } : {})
+        ...(event.code ? { code: event.code } : {}),
+        ...(event.details !== undefined ? { details: event.details } : {}),
+        ...(event.severity ? { severity: event.severity } : {})
       })
       if (event.itemId && event.turnId) {
         upsertItem(next, {
@@ -182,7 +199,9 @@ export function applyRuntimeEvent(
           finishedAt: event.timestamp,
           kind: 'error',
           message: event.message,
-          ...(event.code ? { code: event.code } : {})
+          ...(event.code ? { code: event.code } : {}),
+          ...(event.details !== undefined ? { details: event.details } : {}),
+          ...(event.severity ? { severity: event.severity } : {})
         }, 'replace')
       }
       break
@@ -238,7 +257,19 @@ function upsertChildRun(
     status: child.childStatus,
     seq: child.childSeq,
     updatedAt: event.timestamp,
-    ...(event.text ? { text: event.text } : {})
+    ...(event.text ? { text: event.text } : {}),
+    ...(child.childModel ? { model: child.childModel } : {}),
+    ...(child.childProfile ? { profile: child.childProfile } : {}),
+    ...(child.childToolPolicy ? { toolPolicy: child.childToolPolicy } : {}),
+    ...(child.prefixReused !== undefined ? { prefixReused: child.prefixReused } : {}),
+    ...(child.inheritedHistoryItems !== undefined ? { inheritedHistoryItems: child.inheritedHistoryItems } : {}),
+    ...(child.toolInvocations !== undefined ? { toolInvocations: child.toolInvocations } : {}),
+    ...(child.durationMs !== undefined ? { durationMs: child.durationMs } : {}),
+    ...(child.queuedMs !== undefined ? { queuedMs: child.queuedMs } : {}),
+    ...(child.totalTokens !== undefined ? { totalTokens: child.totalTokens } : {}),
+    ...(child.cacheHitRate !== undefined ? { cacheHitRate: child.cacheHitRate } : {}),
+    ...(child.costUsd !== undefined ? { costUsd: child.costUsd } : {}),
+    ...(child.costCny !== undefined ? { costCny: child.costCny } : {})
   }
   if (existingIndex >= 0) projection.childRuns[existingIndex] = next
   else projection.childRuns.push(next)

@@ -18,20 +18,23 @@ import {
 import { rendererRuntimeClient } from '../agent/runtime-client'
 import { getProvider } from '../agent/registry'
 import type {
+  CoreMemoryDiagnosticsJson,
   CoreMemoryRecordJson,
   CoreRuntimeInfoJson,
   CoreRuntimeToolDiagnosticsJson
 } from '../agent/kun-contract'
 import type { WriteInlineCompletionDebugEntry } from '@shared/write-inline-completion'
-import { applyTheme, applyUiFontScale } from '../lib/apply-theme'
+import { applyCursorSpotlight, applyTheme, applyUiFontScale, applyWriteTypography } from '../lib/apply-theme'
 import { formatWorkspacePickerError } from '../lib/format-workspace-picker-error'
-import {
-  joinFsPath,
-  loadPreferredSkillRootId,
-  savePreferredSkillRootId,
-  type SkillRootId
-} from '../lib/skill-root-preference'
+import type { SkillRootListItem } from '@shared/kun-gui-api'
 import { normalizeWorkspaceRoot } from '../lib/workspace-path'
+import {
+  compactHomePathForSettingsDisplay,
+  compactHomePathListForSettingsDisplay,
+  expandHomePathForSettingsUse,
+  expandHomePathListForSettingsUse,
+  expandSettingsHomePathsForUse
+} from '../lib/settings-home-paths'
 import { useChatStore, type SettingsRouteSection } from '../store/chat-store'
 import { SettingsSidebar } from './SettingsSidebar'
 import { WriteDebugLogModal } from './settings-debug-log'
@@ -45,22 +48,27 @@ import {
   splitSettingsList
 } from './settings-utils'
 import { loadKunDiagnostics } from '../lib/load-kun-diagnostics'
+import { SETTINGS_CHANGED_EVENT, emitRendererSettingsChanged } from '../lib/keyboard-shortcut-settings'
 import {
   AgentsSettingsSection,
+  ArchivedThreadsSettingsSection,
   ClawSettingsSection,
+  EasterEggSettingsSection,
   GeneralSettingsSection,
+  KeyboardShortcutsSettingsSection,
+  LlmDebugSettingsSection,
+  WorktreeSettingsSection,
+  MediaGenerationSettingsSection,
+  MemorySettingsSection,
+  ProvidersSettingsSection,
+  SpeechToTextSettingsSection,
+  UpdatesSettingsSection,
   WriteSettingsSection
 } from './settings-sections'
 
-type SettingsCategory = 'general' | 'write' | 'agents' | 'claw'
+type SettingsCategory = 'general' | 'providers' | 'write' | 'mediaGeneration' | 'speechToText' | 'agents' | 'archives' | 'permissions' | 'worktree' | 'memory' | 'shortcuts' | 'easterEgg' | 'claw' | 'updates' | 'debug'
 type SaveStatus = 'idle' | 'saving' | 'saved' | 'error'
 type SettingsPatch = AppSettingsPatch
-type SkillRootOption = {
-  id: SkillRootId
-  label: string
-  path: string
-  available: boolean
-}
 type InlineNotice = {
   tone: 'success' | 'error' | 'info'
   message: string
@@ -80,6 +88,13 @@ export function SettingsView(): ReactElement {
   const applyI18n = useChatStore((s) => s.applyI18nFromSettings)
   const reloadUiSettings = useChatStore((s) => s.reloadUiSettings)
   const probeRuntime = useChatStore((s) => s.probeRuntime)
+  const threads = useChatStore((s) => s.threads)
+  const runtimeConnection = useChatStore((s) => s.runtimeConnection)
+  const refreshThreads = useChatStore((s) => s.refreshThreads)
+  const selectThread = useChatStore((s) => s.selectThread)
+  const archiveThread = useChatStore((s) => s.archiveThread)
+  const deleteThread = useChatStore((s) => s.deleteThread)
+  const addClawChannel = useChatStore((s) => s.addClawChannel)
   const [category, setCategory] = useState<SettingsCategory>('general')
   const [form, setForm] = useState<AppSettingsV1 | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
@@ -92,7 +107,8 @@ export function SettingsView(): ReactElement {
   const [showRuntimeToken, setShowRuntimeToken] = useState(false)
   const [logPath, setLogPath] = useState('')
   const [logDirOpenError, setLogDirOpenError] = useState<string | null>(null)
-  const [skillRootId, setSkillRootId] = useState<SkillRootId>(() => loadPreferredSkillRootId())
+  const [skillRoots, setSkillRoots] = useState<SkillRootListItem[]>([])
+  const [skillRootsLoading, setSkillRootsLoading] = useState(false)
   const [skillNotice, setSkillNotice] = useState<InlineNotice | null>(null)
   const [mcpConfigPath, setMcpConfigPath] = useState('~/.kun/mcp.json')
   const [mcpConfigText, setMcpConfigText] = useState('')
@@ -104,6 +120,7 @@ export function SettingsView(): ReactElement {
   const [runtimeInfo, setRuntimeInfo] = useState<CoreRuntimeInfoJson | null>(null)
   const [toolDiagnostics, setToolDiagnostics] = useState<CoreRuntimeToolDiagnosticsJson | null>(null)
   const [memoryRecords, setMemoryRecords] = useState<CoreMemoryRecordJson[]>([])
+  const [memoryDiagnostics, setMemoryDiagnostics] = useState<CoreMemoryDiagnosticsJson | null>(null)
   const [runtimeDiagnosticsBusy, setRuntimeDiagnosticsBusy] = useState(false)
   const [runtimeDiagnosticsNotice, setRuntimeDiagnosticsNotice] = useState<InlineNotice | null>(null)
   const [writeDebugModalOpen, setWriteDebugModalOpen] = useState(false)
@@ -121,10 +138,22 @@ export function SettingsView(): ReactElement {
   const permissionsSectionRef = useRef<HTMLDivElement | null>(null)
   const formTheme = form?.theme
   const formUiFontScale = form?.uiFontScale
+  const writeTypography = form?.write?.typography
   const formWorkspaceRoot = form?.workspaceRoot
   const formKun = form ? getKunRuntimeSettings(form) : null
   const formPort = formKun?.port
   const formGuiUpdateChannel = form?.guiUpdate?.channel
+  const formCursorSpotlight = form?.cursorSpotlight
+  const settingsPlatform = typeof window !== 'undefined' ? window.kunGui?.platform ?? '' : ''
+  const settingsHomeDir = typeof window !== 'undefined' ? window.kunGui?.homeDir ?? '' : ''
+  const compactHomePath = useCallback((value: string): string =>
+    compactHomePathForSettingsDisplay(value, settingsHomeDir, settingsPlatform), [settingsHomeDir, settingsPlatform])
+  const expandHomePath = useCallback((value: string): string =>
+    expandHomePathForSettingsUse(value, settingsHomeDir, settingsPlatform), [settingsHomeDir, settingsPlatform])
+  const compactHomePathList = useCallback((values: readonly string[]): string =>
+    compactHomePathListForSettingsDisplay(values, settingsHomeDir, settingsPlatform), [settingsHomeDir, settingsPlatform])
+  const expandHomePathList = useCallback((values: readonly string[]): string[] =>
+    expandHomePathListForSettingsUse(values, settingsHomeDir, settingsPlatform), [settingsHomeDir, settingsPlatform])
   const {
     checkingGuiUpdate,
     checkGuiUpdate,
@@ -146,7 +175,7 @@ export function SettingsView(): ReactElement {
 
   useEffect(() => {
     let cancelled = false
-    if (typeof window.dsGui === 'undefined') {
+    if (typeof window.kunGui === 'undefined') {
       setLoadError('PRELOAD_BRIDGE')
       return
     }
@@ -170,16 +199,43 @@ export function SettingsView(): ReactElement {
   }, [formTheme, formUiFontScale])
 
   useEffect(() => {
-    if (typeof window.dsGui?.getLogPath !== 'function') return
-    void window.dsGui.getLogPath().then((p) => setLogPath(p)).catch(() => undefined)
+    if (typeof formCursorSpotlight === 'boolean') {
+      applyCursorSpotlight(formCursorSpotlight)
+    }
+  }, [formCursorSpotlight])
+
+  // Live-preview the Write editor typography as the form changes, mirroring the
+  // theme/scale preview above. Keyed on the scalar fields so it only re-applies
+  // on real changes.
+  useEffect(() => {
+    if (writeTypography) applyWriteTypography(writeTypography)
+  }, [
+    writeTypography?.fontPreset,
+    writeTypography?.customFontFamily,
+    writeTypography?.fontSizePx,
+    writeTypography?.lineHeight
+  ])
+
+  useEffect(() => {
+    const onSettingsChanged = (event: Event): void => {
+      const next = (event as CustomEvent<AppSettingsV1>).detail
+      if (next) setForm(coerceRendererSettings(next))
+    }
+    window.addEventListener(SETTINGS_CHANGED_EVENT, onSettingsChanged)
+    return () => window.removeEventListener(SETTINGS_CHANGED_EVENT, onSettingsChanged)
+  }, [])
+
+  useEffect(() => {
+    if (typeof window.kunGui?.getLogPath !== 'function') return
+    void window.kunGui.getLogPath().then((p) => setLogPath(p)).catch(() => undefined)
   }, [category])
 
   const loadWriteDebugEntries = useCallback(async (): Promise<void> => {
     setWriteDebugLoading(true)
     setWriteDebugError(null)
     try {
-      const completionEntries = typeof window.dsGui?.listWriteInlineCompletionDebugEntries === 'function'
-        ? await window.dsGui.listWriteInlineCompletionDebugEntries()
+      const completionEntries = typeof window.kunGui?.listWriteInlineCompletionDebugEntries === 'function'
+        ? await window.kunGui.listWriteInlineCompletionDebugEntries()
         : []
       setWriteCompletionDebugEntries(completionEntries)
       setWriteCompletionDebugSelectedId((current) =>
@@ -203,7 +259,7 @@ export function SettingsView(): ReactElement {
     if (!form || initializedCategory.current) return
     initializedCategory.current = true
     if (!getActiveAgentApiKey(form).trim()) {
-      setCategory('general')
+      setCategory('providers')
     }
   }, [form])
 
@@ -212,12 +268,48 @@ export function SettingsView(): ReactElement {
       setCategory('general')
       return
     }
+    if (settingsSection === 'providers') {
+      setCategory('providers')
+      return
+    }
     if (settingsSection === 'write') {
       setCategory('write')
       return
     }
+    if (settingsSection === 'imageGeneration') {
+      setCategory('mediaGeneration')
+      return
+    }
+    if (settingsSection === 'mediaGeneration') {
+      setCategory('mediaGeneration')
+      return
+    }
+    if (settingsSection === 'speechToText') {
+      setCategory('speechToText')
+      return
+    }
+    if (settingsSection === 'permissions') {
+      setCategory('permissions')
+      return
+    }
+    if (settingsSection === 'archives') {
+      setCategory('archives')
+      return
+    }
     if (settingsSection === 'claw') {
       setCategory('claw')
+      return
+    }
+    if (settingsSection === 'shortcuts') {
+      setCategory('shortcuts')
+      return
+    }
+    if (settingsSection === 'easterEgg') {
+      setCategory('easterEgg')
+      return
+    }
+    if (settingsSection === 'updates') {
+      setCategory('updates')
       return
     }
     setCategory('agents')
@@ -227,16 +319,28 @@ export function SettingsView(): ReactElement {
     if (!form) return
     if (
       settingsSection === 'general' ||
+      settingsSection === 'providers' ||
       settingsSection === 'write' ||
+      settingsSection === 'imageGeneration' ||
+      settingsSection === 'mediaGeneration' ||
+      settingsSection === 'speechToText' ||
+      settingsSection === 'archives' ||
       settingsSection === 'claw' ||
-      category !== 'agents'
+      settingsSection === 'shortcuts' ||
+      settingsSection === 'easterEgg' ||
+      settingsSection === 'updates' ||
+      (category !== 'agents' && category !== 'permissions')
     ) {
       return
     }
-    const refs: Record<Exclude<SettingsRouteSection, 'general' | 'write' | 'claw'>, HTMLDivElement | null> = {
+    const refs: Record<
+      Exclude<SettingsRouteSection, 'general' | 'providers' | 'write' | 'imageGeneration' | 'mediaGeneration' | 'speechToText' | 'archives' | 'claw' | 'shortcuts' | 'easterEgg' | 'updates'>,
+      HTMLDivElement | null
+    > = {
       agents: agentsSectionRef.current,
       skill: skillSectionRef.current,
-      mcp: mcpSectionRef.current
+      mcp: mcpSectionRef.current,
+      permissions: permissionsSectionRef.current
     }
     const target = refs[settingsSection]
     if (!target) return
@@ -244,6 +348,15 @@ export function SettingsView(): ReactElement {
       target.scrollIntoView({ behavior: 'smooth', block: 'start' })
     })
   }, [category, form, settingsSection])
+
+  useEffect(() => {
+    if (!form || category !== 'permissions') return
+    const target = permissionsSectionRef.current
+    if (!target) return
+    window.requestAnimationFrame(() => {
+      target.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    })
+  }, [category, form])
 
   useEffect(() => {
     return () => {
@@ -258,59 +371,31 @@ export function SettingsView(): ReactElement {
     return null
   }, [form, formPort, t])
 
-  const skillRootOptions = useMemo<SkillRootOption[]>(() => {
-    const workspaceRoot = normalizeWorkspaceRoot(formWorkspaceRoot)
-    const hasWorkspace = !!workspaceRoot
-    return [
-      {
-        id: 'workspace-agents',
-        label: tCommon('pluginSkillRootWorkspaceAgents'),
-        path: workspaceRoot ? joinFsPath(workspaceRoot, '.agents/skills') : '',
-        available: hasWorkspace
-      },
-      {
-        id: 'workspace-skills',
-        label: tCommon('pluginSkillRootWorkspaceSkills'),
-        path: workspaceRoot ? joinFsPath(workspaceRoot, 'skills') : '',
-        available: hasWorkspace
-      },
-      {
-        id: 'global-agents',
-        label: tCommon('pluginSkillRootGlobalAgents'),
-        path: '~/.agents/skills',
-        available: true
-      },
-      {
-        id: 'global-deepseek',
-        label: tCommon('pluginSkillRootGlobalDeepseek'),
-        path: '~/.kun/skills',
-        available: true
-      }
-    ]
-  }, [formWorkspaceRoot, tCommon])
-
-  const selectedSkillRoot =
-    skillRootOptions.find((option) => option.id === skillRootId && option.available) ??
-    skillRootOptions.find((option) => option.available)
+  const refreshSkillRoots = useCallback(async (): Promise<void> => {
+    if (typeof window.kunGui?.listSkillRoots !== 'function') return
+    setSkillRootsLoading(true)
+    try {
+      const workspaceRoot = normalizeWorkspaceRoot(expandHomePath(formWorkspaceRoot ?? ''))
+      const result = await window.kunGui.listSkillRoots(workspaceRoot || undefined)
+      if (result.ok) setSkillRoots(result.roots)
+    } catch {
+      /* listing skill roots is best-effort; keep the last known list */
+    } finally {
+      setSkillRootsLoading(false)
+    }
+  }, [expandHomePath, formWorkspaceRoot])
 
   useEffect(() => {
-    const selectedOption = skillRootOptions.find((option) => option.id === skillRootId && option.available)
-    if (selectedOption) {
-      savePreferredSkillRootId(skillRootId)
-      return
-    }
-    const fallback = skillRootOptions.find((option) => option.available)
-    if (fallback && fallback.id !== skillRootId) {
-      setSkillRootId(fallback.id)
-    }
-  }, [skillRootId, skillRootOptions])
+    if (category !== 'agents') return
+    void refreshSkillRoots()
+  }, [category, refreshSkillRoots])
 
   const loadMcpConfig = async (): Promise<void> => {
-    if (typeof window.dsGui?.getDeepseekConfigFile !== 'function') return
+    if (typeof window.kunGui?.getKunConfigFile !== 'function') return
     setMcpLoading(true)
     setMcpNotice(null)
     try {
-      const config = await window.dsGui.getDeepseekConfigFile()
+      const config = await window.kunGui.getKunConfigFile()
       setMcpConfigPath(config.path)
       setMcpConfigText(config.content)
       setMcpConfigExists(config.exists)
@@ -326,34 +411,50 @@ export function SettingsView(): ReactElement {
   }
 
   useEffect(() => {
-    if (category !== 'agents' || mcpLoaded || mcpLoading) return
+    if ((category !== 'agents' && category !== 'permissions') || mcpLoaded || mcpLoading) return
     void loadMcpConfig()
   }, [category, mcpLoaded, mcpLoading])
 
-  const openSkillRoot = async (): Promise<void> => {
-    if (!selectedSkillRoot?.path || !selectedSkillRoot.available) {
+  const openSkillRoot = async (path: string): Promise<void> => {
+    if (!path) {
       setSkillNotice({ tone: 'error', message: t('skillsRootUnavailable') })
       return
     }
-    if (typeof window.dsGui?.openSkillRoot !== 'function') return
+    if (typeof window.kunGui?.openSkillRoot !== 'function') return
     setSkillNotice(null)
-    const result = await window.dsGui.openSkillRoot(selectedSkillRoot.path)
+    const result = await window.kunGui.openSkillRoot(path)
     if (!result.ok) {
       setSkillNotice({ tone: 'error', message: result.message ?? t('applyFailed') })
     }
   }
 
+  const toggleSkillRoot = (root: SkillRootListItem, enabled: boolean): void => {
+    const current = form?.claw.skills.disabledDirs ?? []
+    const keys = new Set([root.disableKey, root.id])
+    const nextDisabled = enabled
+      ? current.filter((entry) => !keys.has(entry))
+      : [...new Set([...current, root.disableKey])]
+    update({ claw: { skills: { disabledDirs: nextDisabled } } })
+    // Optimistically reflect the toggle so the row responds before the
+    // debounced save round-trips; skill counts are unaffected by toggling.
+    setSkillRoots((roots) =>
+      roots.map((item) =>
+        item.id === root.id && item.path === root.path ? { ...item, enabled } : item
+      )
+    )
+  }
+
   const saveMcpConfig = async (): Promise<void> => {
-    if (typeof window.dsGui?.setDeepseekConfigFile !== 'function') return
+    if (typeof window.kunGui?.setKunConfigFile !== 'function') return
     setMcpBusy(true)
     setMcpNotice(null)
     try {
-      const result = await window.dsGui.setDeepseekConfigFile(mcpConfigText)
+      const result = await window.kunGui.setKunConfigFile(mcpConfigText)
       setMcpConfigPath(result.path)
       setMcpConfigExists(true)
       setMcpNotice({
         tone: 'success',
-        message: t('mcpSaved', { path: result.path })
+        message: t('mcpSaved', { path: compactHomePath(result.path) })
       })
     } catch (e) {
       setMcpNotice({
@@ -366,8 +467,8 @@ export function SettingsView(): ReactElement {
   }
 
   const openMcpConfigDir = async (): Promise<void> => {
-    if (typeof window.dsGui?.openDeepseekConfigDir !== 'function') return
-    const result = await window.dsGui.openDeepseekConfigDir()
+    if (typeof window.kunGui?.openKunConfigDir !== 'function') return
+    const result = await window.kunGui.openKunConfigDir()
     if (!result.ok) {
       setMcpNotice({ tone: 'error', message: result.message ?? t('applyFailed') })
     }
@@ -379,7 +480,7 @@ export function SettingsView(): ReactElement {
     setRuntimeDiagnosticsNotice(null)
     try {
       const loaded = await loadKunDiagnostics(provider, {
-        workspace: normalizeWorkspaceRoot(formWorkspaceRoot)
+        workspace: normalizeWorkspaceRoot(expandHomePath(formWorkspaceRoot ?? ''))
       })
       if (loaded.runtimeInfo !== undefined) setRuntimeInfo(loaded.runtimeInfo)
       if (loaded.toolDiagnostics !== undefined) setToolDiagnostics(loaded.toolDiagnostics)
@@ -398,18 +499,83 @@ export function SettingsView(): ReactElement {
     } finally {
       setRuntimeDiagnosticsBusy(false)
     }
-  }, [formWorkspaceRoot])
+  }, [expandHomePath, formWorkspaceRoot])
 
   useEffect(() => {
-    if (category !== 'agents') return
+    if (category !== 'agents' && category !== 'permissions' && category !== 'memory') return
     void refreshKunDiagnostics()
   }, [category, refreshKunDiagnostics])
+
+  const refreshMemoryDiagnostics = async (): Promise<void> => {
+    const provider = getProvider()
+    if (typeof provider.getMemoryDiagnostics !== 'function') return
+    try {
+      const diagnostics = await provider.getMemoryDiagnostics()
+      setMemoryDiagnostics(diagnostics)
+    } catch {
+      // best-effort; surfaced via runtimeDiagnosticsNotice elsewhere
+    }
+  }
+
+  useEffect(() => {
+    if (category !== 'memory') return
+    void refreshMemoryDiagnostics()
+  }, [category, memoryRecords])
+
+  const createMemoryRecord = async (input: {
+    content: string
+    scope?: 'user' | 'workspace' | 'project'
+    tags?: string[]
+    confidence?: number
+  }): Promise<boolean> => {
+    const provider = getProvider()
+    if (typeof provider.createMemory !== 'function') return false
+    try {
+      const workspace = normalizeWorkspaceRoot(formWorkspaceRoot)
+      const memory = await provider.createMemory({
+        ...input,
+        ...(input.scope === 'user' ? {} : { workspace }),
+        ...(input.scope === 'project' ? { project: workspace } : {})
+      })
+      setMemoryRecords((records) => [memory, ...records])
+      return true
+    } catch (error) {
+      setRuntimeDiagnosticsNotice({
+        tone: 'error',
+        message: error instanceof Error ? error.message : String(error)
+      })
+      return false
+    }
+  }
+
+  const updateMemoryRecord = async (
+    memoryId: string,
+    patch: { content?: string; tags?: string[]; confidence?: number; disabled?: boolean }
+  ): Promise<boolean> => {
+    const provider = getProvider()
+    if (typeof provider.updateMemory !== 'function') return false
+    try {
+      const memory = await provider.updateMemory(memoryId, patch, {
+        workspace: normalizeWorkspaceRoot(formWorkspaceRoot)
+      })
+      setMemoryRecords((records) => records.map((record) => (record.id === memoryId ? memory : record)))
+      return true
+    } catch (error) {
+      setRuntimeDiagnosticsNotice({
+        tone: 'error',
+        message: error instanceof Error ? error.message : String(error)
+      })
+      return false
+    }
+  }
 
   const disableMemoryRecord = async (memoryId: string): Promise<void> => {
     const provider = getProvider()
     if (typeof provider.updateMemory !== 'function') return
     try {
-      const memory = await provider.updateMemory(memoryId, { disabled: true })
+      const memory = await provider.updateMemory(memoryId, { disabled: true }, {
+        workspace: normalizeWorkspaceRoot(formWorkspaceRoot)
+      })
       setMemoryRecords((records) => records.map((record) => record.id === memoryId ? memory : record))
     } catch (error) {
       setRuntimeDiagnosticsNotice({
@@ -423,7 +589,9 @@ export function SettingsView(): ReactElement {
     const provider = getProvider()
     if (typeof provider.deleteMemory !== 'function') return
     try {
-      await provider.deleteMemory(memoryId)
+      await provider.deleteMemory(memoryId, {
+        workspace: normalizeWorkspaceRoot(formWorkspaceRoot)
+      })
       setMemoryRecords((records) => records.filter((record) => record.id !== memoryId))
     } catch (error) {
       setRuntimeDiagnosticsNotice({
@@ -449,10 +617,15 @@ export function SettingsView(): ReactElement {
     setSaveError(null)
 
     try {
-      const next = coerceRendererSettings(await rendererRuntimeClient.setSettings(snapshot))
+      const next = coerceRendererSettings(
+        await rendererRuntimeClient.setSettings(
+          expandSettingsHomePathsForUse(snapshot, settingsHomeDir, settingsPlatform)
+        )
+      )
       if (version !== draftVersion.current) return
 
       setForm(next)
+      emitRendererSettingsChanged(next)
       await applyI18n(next.locale)
       void reloadUiSettings()
       void probeRuntime('background')
@@ -466,8 +639,10 @@ export function SettingsView(): ReactElement {
       }, 1500)
     } catch (e) {
       if (version !== draftVersion.current) return
-      setSaveError(e instanceof Error ? e.message : String(e))
+      const message = e instanceof Error ? e.message : String(e)
+      setSaveError(message)
       setSaveStatus('error')
+      void window.kunGui?.logError?.('settings', 'Failed to apply settings', { message }).catch(() => undefined)
     }
   }
 
@@ -600,10 +775,10 @@ export function SettingsView(): ReactElement {
   const pickWorkspace = async (): Promise<void> => {
     try {
       setWorkspacePickerError(null)
-      if (typeof window.dsGui?.pickWorkspaceDirectory !== 'function') {
+      if (typeof window.kunGui?.pickWorkspaceDirectory !== 'function') {
         throw new Error('workspace:pick-directory unavailable')
       }
-      const picked = await window.dsGui.pickWorkspaceDirectory(form.workspaceRoot || undefined)
+      const picked = await window.kunGui.pickWorkspaceDirectory(expandHomePath(form.workspaceRoot) || undefined)
       if (!picked.canceled && picked.path) {
         update({ workspaceRoot: picked.path })
       }
@@ -614,17 +789,17 @@ export function SettingsView(): ReactElement {
 
   const resetWorkspaceToDefault = (): void => {
     setWorkspacePickerError(null)
-    update({ workspaceRoot: DEFAULT_WORKSPACE_ROOT })
+    update({ workspaceRoot: expandHomePath(DEFAULT_WORKSPACE_ROOT) })
   }
 
   const pickWriteWorkspace = async (): Promise<void> => {
     try {
       setWriteWorkspacePickerError(null)
-      if (typeof window.dsGui?.pickWorkspaceDirectory !== 'function') {
+      if (typeof window.kunGui?.pickWorkspaceDirectory !== 'function') {
         throw new Error('workspace:pick-directory unavailable')
       }
-      const picked = await window.dsGui.pickWorkspaceDirectory(
-        form.write.defaultWorkspaceRoot || DEFAULT_WRITE_WORKSPACE_ROOT
+      const picked = await window.kunGui.pickWorkspaceDirectory(
+        expandHomePath(form.write.defaultWorkspaceRoot || DEFAULT_WRITE_WORKSPACE_ROOT)
       )
       if (!picked.canceled && picked.path) {
         const workspaces = [
@@ -647,11 +822,12 @@ export function SettingsView(): ReactElement {
 
   const resetWriteWorkspaceToDefault = (): void => {
     setWriteWorkspacePickerError(null)
+    const workspaceRoot = expandHomePath(DEFAULT_WRITE_WORKSPACE_ROOT)
     update({
       write: {
-        defaultWorkspaceRoot: DEFAULT_WRITE_WORKSPACE_ROOT,
-        activeWorkspaceRoot: DEFAULT_WRITE_WORKSPACE_ROOT,
-        workspaces: [DEFAULT_WRITE_WORKSPACE_ROOT, ...form.write.workspaces]
+        defaultWorkspaceRoot: workspaceRoot,
+        activeWorkspaceRoot: workspaceRoot,
+        workspaces: [workspaceRoot, ...form.write.workspaces]
       }
     })
   }
@@ -659,11 +835,11 @@ export function SettingsView(): ReactElement {
   const pickClawWorkspace = async (): Promise<void> => {
     try {
       setClawWorkspacePickerError(null)
-      if (typeof window.dsGui?.pickWorkspaceDirectory !== 'function') {
+      if (typeof window.kunGui?.pickWorkspaceDirectory !== 'function') {
         throw new Error('workspace:pick-directory unavailable')
       }
-      const picked = await window.dsGui.pickWorkspaceDirectory(
-        form.claw.im.workspaceRoot || form.workspaceRoot || undefined
+      const picked = await window.kunGui.pickWorkspaceDirectory(
+        expandHomePath(form.claw.im.workspaceRoot || form.workspaceRoot) || undefined
       )
       if (!picked.canceled && picked.path) {
         update({ claw: { im: { workspaceRoot: picked.path } } })
@@ -682,8 +858,8 @@ export function SettingsView(): ReactElement {
     setWriteDebugLoading(true)
     setWriteDebugError(null)
     try {
-      if (typeof window.dsGui?.clearWriteInlineCompletionDebugEntries === 'function') {
-        await window.dsGui.clearWriteInlineCompletionDebugEntries()
+      if (typeof window.kunGui?.clearWriteInlineCompletionDebugEntries === 'function') {
+        await window.kunGui.clearWriteInlineCompletionDebugEntries()
       }
       setWriteCompletionDebugEntries([])
       setWriteCompletionDebugSelectedId(null)
@@ -732,6 +908,10 @@ export function SettingsView(): ReactElement {
     logPath,
     logDirOpenError,
     setLogDirOpenError,
+    compactHomePath,
+    expandHomePath,
+    compactHomePathList,
+    expandHomePathList,
     pickWriteWorkspace,
     resetWriteWorkspaceToDefault,
     writeWorkspacePickerError,
@@ -748,10 +928,9 @@ export function SettingsView(): ReactElement {
     skillSectionRef,
     mcpSectionRef,
     permissionsSectionRef,
-    selectedSkillRoot,
-    skillRootOptions,
-    skillRootId,
-    setSkillRootId,
+    skillRoots,
+    skillRootsLoading,
+    toggleSkillRoot,
     skillNotice,
     openSkillRoot,
     openPlugins,
@@ -768,16 +947,28 @@ export function SettingsView(): ReactElement {
     runtimeInfo,
     toolDiagnostics,
     memoryRecords,
+    memoryDiagnostics,
     runtimeDiagnosticsBusy,
     runtimeDiagnosticsNotice,
     refreshKunDiagnostics,
+    createMemoryRecord,
+    updateMemoryRecord,
     disableMemoryRecord,
     deleteMemoryRecord,
     pickClawWorkspace,
     resetClawWorkspaceToDefault,
     clawWorkspacePickerError,
+    addClawChannel,
     splitSettingsList,
-    listSettingsText
+    listSettingsText,
+    threads,
+    runtimeReady: runtimeConnection === 'ready',
+    locale: form.locale,
+    refreshThreads,
+    openCode,
+    selectThread,
+    archiveThread,
+    deleteThread
   }
 
   return (
@@ -824,12 +1015,52 @@ export function SettingsView(): ReactElement {
             </span>
           </div>
 
+          {saveStatus === 'error' && saveError ? (
+            <div
+              role="alert"
+              className="mb-5 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-[13px] leading-5 text-red-800 shadow-sm dark:border-red-500/25 dark:bg-red-500/10 dark:text-red-200"
+            >
+              {saveError}
+            </div>
+          ) : null}
+
           {category === 'general' ? <GeneralSettingsSection ctx={settingsSectionContext} /> : null}
+          {category === 'providers' ? <ProvidersSettingsSection ctx={settingsSectionContext} /> : null}
           {category === 'write' ? <WriteSettingsSection ctx={settingsSectionContext} /> : null}
-          {category === 'agents' ? <AgentsSettingsSection ctx={settingsSectionContext} /> : null}
+          {category === 'mediaGeneration' ? <MediaGenerationSettingsSection ctx={settingsSectionContext} /> : null}
+          {category === 'speechToText' ? <SpeechToTextSettingsSection ctx={settingsSectionContext} /> : null}
+          {category === 'agents' || category === 'permissions' ? <AgentsSettingsSection ctx={settingsSectionContext} /> : null}
+          {category === 'archives' ? <ArchivedThreadsSettingsSection ctx={settingsSectionContext} /> : null}
+          {category === 'worktree' ? <WorktreeSettingsSection ctx={settingsSectionContext} /> : null}
+          {category === 'memory' ? <MemorySettingsSection ctx={settingsSectionContext} /> : null}
+          {category === 'shortcuts' ? <KeyboardShortcutsSettingsSection ctx={settingsSectionContext} /> : null}
+          {category === 'easterEgg' ? <EasterEggSettingsSection ctx={settingsSectionContext} /> : null}
           {category === 'claw' ? <ClawSettingsSection ctx={settingsSectionContext} /> : null}
+          {category === 'updates' ? <UpdatesSettingsSection ctx={settingsSectionContext} /> : null}
+          {category === 'debug' ? <LlmDebugSettingsSection ctx={settingsSectionContext} /> : null}
         </div>
       </div>
+      {saveStatus === 'error' && saveError ? (
+        <div
+          role="alert"
+          className="ds-no-drag fixed bottom-6 right-8 z-30 flex max-w-[min(560px,calc(100vw-3rem))] items-center gap-3 rounded-2xl border border-red-300/70 bg-red-50/95 px-4 py-3 text-red-900 shadow-2xl shadow-red-950/10 backdrop-blur dark:border-red-500/30 dark:bg-red-950/90 dark:text-red-100"
+        >
+          <div className="min-w-0">
+            <div className="text-[13px] font-semibold">{t('applyFailed')}</div>
+            <div className="mt-0.5 truncate text-[12px] text-red-800/85 dark:text-red-100/80">
+              {saveError}
+            </div>
+          </div>
+          <button
+            type="button"
+            className="shrink-0 rounded-xl bg-red-600 px-3 py-2 text-[12px] font-semibold text-white shadow-sm transition hover:bg-red-500 disabled:cursor-not-allowed disabled:opacity-60"
+            disabled={Boolean(portError)}
+            onClick={() => void flushPendingSave()}
+          >
+            {t('retrySave')}
+          </button>
+        </div>
+      ) : null}
       {writeDebugModalOpen ? (
         <WriteDebugLogModal
           completionEntries={writeCompletionDebugEntries}

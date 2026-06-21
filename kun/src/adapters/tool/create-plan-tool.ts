@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { mkdir, readdir, rename, writeFile } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, normalize, relative } from 'node:path'
 import { LocalToolHost, type LocalTool } from './local-tool-host.js'
+import { withFileMutationQueue } from './file-mutation-queue.js'
 import type { ToolHostContext } from '../../ports/tool-host.js'
 import {
   GUI_PLAN_RELATIVE_DIR,
@@ -14,6 +15,7 @@ import {
   type CreatePlanToolOutput,
   type GuiPlanOperation
 } from '../../shared/gui-plan.js'
+import { canWritePath } from './sandbox-policy.js'
 
 /**
  * Shared tool name. Kept in sync with the renderer contract so the
@@ -161,17 +163,19 @@ async function defaultWritePlan(
   target: { workspaceRoot: string; relativePath: string; absolutePath: string; markdown: string },
   signal: AbortSignal
 ): Promise<{ path: string; savedAt: string }> {
-  if (signal.aborted) {
-    throw new Error('plan write aborted before start')
-  }
-  await mkdir(dirname(target.absolutePath), { recursive: true })
-  const tempPath = buildTempPath(target.absolutePath)
-  await writeFile(tempPath, target.markdown, 'utf8')
-  if (signal.aborted) {
-    throw new Error('plan write aborted before atomic rename')
-  }
-  await rename(tempPath, target.absolutePath)
-  return { path: target.absolutePath, savedAt: new Date().toISOString() }
+  return withFileMutationQueue(target.absolutePath, async () => {
+    if (signal.aborted) {
+      throw new Error('plan write aborted before start')
+    }
+    await mkdir(dirname(target.absolutePath), { recursive: true })
+    const tempPath = buildTempPath(target.absolutePath)
+    await writeFile(tempPath, target.markdown, 'utf8')
+    if (signal.aborted) {
+      throw new Error('plan write aborted before atomic rename')
+    }
+    await rename(tempPath, target.absolutePath)
+    return { path: target.absolutePath, savedAt: new Date().toISOString() }
+  })
 }
 
 /**
@@ -287,6 +291,16 @@ export async function executeCreatePlanTool(
     ? normalize(join(resolvedWorkspace, resolved.relativePath))
     : normalize(join(planDirectory(resolvedWorkspace), basename(resolved.relativePath)))
   assertWithinWorkspace(absolutePath, resolvedWorkspace)
+  const writePermission = canWritePath(absolutePath, context)
+  if (!writePermission.ok) {
+    return {
+      output: {
+        code: writePermission.block.code,
+        error: writePermission.block.message
+      },
+      isError: true
+    }
+  }
   if (context.abortSignal.aborted) {
     return { output: { error: 'plan write aborted' }, isError: true }
   }

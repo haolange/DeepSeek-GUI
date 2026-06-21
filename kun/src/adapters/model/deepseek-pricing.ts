@@ -1,3 +1,5 @@
+import { isDeepSeekHost } from './model-error-probe.js'
+
 export type DeepseekCurrencyCosts = {
   costUsd: number
   costCny: number
@@ -80,7 +82,18 @@ export function estimateDeepseekCost(input: {
   cacheHitTokens: number
   cacheMissTokens: number
   outputTokens: number
+  /**
+   * Optional upstream base URL. When provided, the function returns
+   * null for non-DeepSeek hosts (OpenRouter, llama.cpp, etc.) because
+   * we don't have authoritative prices for third-party providers.
+   * Callers that omit it keep the legacy behavior: trust the model
+   * name. See issue #26.
+   */
+  providerHost?: string
 }): DeepseekCurrencyCosts | null {
+  if (input.providerHost !== undefined && !isDeepSeekHost(input.providerHost)) {
+    return null
+  }
   const tier = pricingTierForModel(input.model)
   if (!tier) return null
   const prices = DEEPSEEK_V4_PRICES[tier]
@@ -90,29 +103,6 @@ export function estimateDeepseekCost(input: {
   }
 }
 
-export function estimateDeepseekInputTokenCost(input: {
-  model: string
-  inputTokens: number
-}): DeepseekCurrencyCosts | null {
-  return estimateDeepseekCost({
-    model: input.model,
-    cacheHitTokens: 0,
-    cacheMissTokens: input.inputTokens,
-    outputTokens: 0
-  })
-}
-
-export function estimateDeepseekCacheSavings(input: {
-  model: string
-  cacheHitTokens: number
-}): DeepseekCurrencyCosts | null {
-  const tier = pricingTierForModel(input.model)
-  if (!tier) return null
-  const prices = DEEPSEEK_V4_PRICES[tier]
-  return {
-    costUsd: (input.cacheHitTokens / TOKENS_PER_MILLION) *
-      Math.max(0, prices.usd.inputCacheMiss - prices.usd.inputCacheHit),
-    costCny: (input.cacheHitTokens / TOKENS_PER_MILLION) *
-      Math.max(0, prices.cny.inputCacheMiss - prices.cny.inputCacheHit)
-  }
-}
+// Savings are reported in tokens only. Money estimates for savings were
+// removed: list prices drift and third-party providers make any currency
+// figure unreliable, so the UI now shows saved tokens instead.

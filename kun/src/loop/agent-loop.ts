@@ -1,4 +1,5 @@
-import type { ModelClient, ModelRequest, ModelStreamChunk, ModelToolSpec } from '../ports/model-client.js'
+import { isAbsolute, relative, resolve } from 'node:path'
+import type { ModelClient, ModelRequest, ModelToolSpec } from '../ports/model-client.js'
 import type {
   ToolHost,
   ToolCallLike,
@@ -8,7 +9,7 @@ import type {
   ToolProviderKind
 } from '../ports/tool-host.js'
 import type { ModelCapabilityMetadata } from '../contracts/capabilities.js'
-import { DEFAULT_APPROVAL_POLICY } from '../contracts/policy.js'
+import { DEFAULT_APPROVAL_POLICY, DEFAULT_SANDBOX_MODE } from '../contracts/policy.js'
 import type { ThreadStore } from '../ports/thread-store.js'
 import type { SessionStore } from '../ports/session-store.js'
 import type { ApprovalGate } from '../ports/approval-gate.js'
@@ -17,9 +18,16 @@ import type { UsageService } from '../services/usage-service.js'
 import type { TurnService } from '../services/turn-service.js'
 import type { RuntimeEventRecorder } from '../services/runtime-event-recorder.js'
 import type { PipelineStage } from '../contracts/events.js'
+import type { RuntimeErrorSeverity } from '../contracts/errors.js'
 import type { IdGenerator } from '../ports/id-generator.js'
 import type { ImmutablePrefix } from '../cache/immutable-prefix.js'
 import { ContextCompactor } from './context-compactor.js'
+import {
+  effectiveHistoryAfterLatestCompaction,
+  insertCompactionIntoVisibleHistory,
+  placeCompactionsAtTurnEnd
+} from './compaction-history.js'
+import { summarizeCompactionWithModel } from './compaction-summary.js'
 import { InflightTracker } from './inflight-tracker.js'
 import { SteeringQueue } from './steering-queue.js'
 import {
@@ -51,13 +59,19 @@ import type { AttachmentContent, AttachmentStore } from '../attachments/attachme
 import type { ModelInputAttachment, ModelTextAttachmentFallback } from '../ports/model-client.js'
 import type { MemoryStore } from '../memory/memory-store.js'
 import {
+  hasHooksForPhase,
+  runObserverHooks,
+  runUserPromptSubmitHooks,
+  type ResolvedHook
+} from '../hooks/hook-engine.js'
+import {
   applyTokenEconomyToRequest,
   normalizeTokenEconomyConfig,
   type TokenEconomyConfig
 } from './token-economy.js'
 import { applyRequestHistoryHygiene } from './request-history-hygiene.js'
-import { estimateModelRequestInputTokens } from './model-request-estimator.js'
-import { estimateDeepseekInputTokenCost } from '../adapters/model/deepseek-pricing.js'
+import { capToolResultImages } from './tool-result-image.js'
+import { estimateModelRequestInputTokens, estimateRequestOverheadTokens } from './model-request-estimator.js'
 import {
   recentAutoRouterContext,
   resolveAutoModelRoute,
@@ -70,12 +84,68 @@ import { CREATE_PLAN_TOOL_NAME } from '../adapters/tool/create-plan-tool.js'
 import { GET_GOAL_TOOL_NAME, UPDATE_GOAL_TOOL_NAME } from '../adapters/tool/goal-tools.js'
 import { TODO_LIST_TOOL_NAME, TODO_WRITE_TOOL_NAME } from '../adapters/tool/todo-tools.js'
 import { shellRuntimeInstruction } from '../adapters/tool/builtin-tool-utils.js'
+import {
+  GoalResumeCoordinator,
+  DEFAULT_MAX_GOAL_RESUME_NO_PROGRESS_ATTEMPTS,
+  type GoalResumeCoordinatorDeps
+} from './goal-resume-coordinator.js'
 
 const PARALLEL_READ_ONLY_TOOL_NAMES = new Set(['read', 'grep', 'find', 'ls'])
+const DELEGATE_TASK_TOOL_NAME = 'delegate_task'
 const MAX_PARALLEL_TOOL_CALLS = 3
-const DEFAULT_COMPACTION_SUMMARY_TIMEOUT_MS = 15_000
-const DEFAULT_COMPACTION_SUMMARY_MAX_TOKENS = 1_200
-const DEFAULT_COMPACTION_SUMMARY_INPUT_MAX_BYTES = 96 * 1024
+// Number of most-recent tool-result screenshots/images kept inline in a
+// request. Older ones collapse to a text note (Anthropic-style "keep last
+// N images"), bounding context growth for long computer-use sessions.
+const MAX_FORWARDED_TOOL_IMAGES = 3
+const MAX_TURN_MODEL_STEPS = 64
+
+/**
+ * Tools that, on their own, do not count as "progress" toward a goal when
+ * deciding whether to keep auto-resuming after a failed goal turn. A turn
+ * that only inspects/updates goal state (and then fails) made no real
+ * advancement, so it should burn the no-progress budget; a turn that edits
+ * files, runs commands, advances todos, etc. resets it.
+ */
+const GOAL_NON_PROGRESS_TOOL_NAMES = new Set<string>([
+  GET_GOAL_TOOL_NAME,
+  UPDATE_GOAL_TOOL_NAME
+])
+
+/**
+ * Prompt seeded into an auto-resumed goal continuation turn. The active-goal
+ * continuation instruction is injected separately (the goal is still
+ * `active`); this user message just nudges the model to pick the work back up
+ * where the interrupted turn left off.
+ */
+const GOAL_RESUME_PROMPT = [
+  'Continue working toward the active goal.',
+  'The previous attempt was interrupted before the goal was complete (it failed or the runtime restarted).',
+  'Review the current state, pick up where the work left off, and keep going until the goal is genuinely achieved or blocked.'
+].join(' ')
+
+/**
+ * Stable identity for the resume coordinator. Changing the objective (or
+ * starting a brand-new goal) yields a new key, so a pending backoff resume
+ * for an old goal is discarded rather than relaunched against the new one.
+ */
+function goalResumeKey(threadId: string, goal: ThreadGoal): string {
+  return `${threadId}::${goal.createdAt}::${goal.objective}`
+}
+const MAX_TOOL_CATALOG_SNAPSHOTS = 256
+
+type TurnFailure = {
+  error: string
+  code?: string
+  details?: unknown
+  severity?: RuntimeErrorSeverity
+}
+
+type ModelClientDiagnostics = {
+  provider?: string
+  providerBaseUrl?: string
+  endpointFormat?: string
+  configuredModel?: string
+}
 
 const PIPELINE_STAGE_LABELS: Record<PipelineStage, string> = {
   setup: 'Setup',
@@ -116,13 +186,55 @@ type ToolCatalogDrift =
  */
 export const PLAN_MODE_INSTRUCTION = [
   'You are in Plan mode.',
-  'Investigate the task first using read-only tools and commands: prefer `read`, `grep`, `find`, `ls`, and safe read-only shell commands appropriate for the host platform via `bash` to gather the facts you need.',
-  'Do NOT modify project files, apply edits, or run mutating commands in this mode.',
+  'Investigate the task first using read-only tools: prefer `read`, `grep`, `find`, and `ls` to gather the facts you need.',
+  'Do NOT modify project files, apply edits, run shell commands, or run mutating commands in this mode.',
   'When you understand the task well enough, call the `create_plan` tool to save a complete implementation plan as Markdown.',
   'Use `operation: "draft"` for the first plan, and `operation: "refine"` when revising an existing plan; you may call `create_plan` multiple times as the plan evolves.',
   'Write concrete, actionable steps (summary, implementation steps, tests, risks) rather than vague intentions.',
+  'Favor the smallest plan that fully solves the task: question whether each proposed component, abstraction, dependency, config knob, or new file needs to exist at all (YAGNI), and prefer the standard library, a native platform feature, or an already-present dependency over new custom code. Do NOT trim correctness, input validation, error handling, security, or accessibility to make a plan smaller.',
   'After saving, give the user a short summary of the plan and what to review.'
 ].join('\n')
+
+/** Read-only tools allowed during the investigation phase of a Plan-mode
+ * turn (step 0, before `create_plan` has been called). Matches the
+ * PLAN_MODE_INSTRUCTION guidance. `bash` is intentionally excluded —
+ * it can execute arbitrary commands and its policy is `on-request` which
+ * auto-approves under `approvalPolicy: auto`. */
+const PLAN_READ_ONLY_TOOL_NAMES = new Set([
+  'read',
+  'ls',
+  'find',
+  'grep',
+  'web_search',
+  'web_fetch'
+])
+
+/**
+ * Resolve the tool list for a Plan-mode turn step. Extracted as a pure
+ * function so the behaviour can be unit-tested without spinning up the
+ * full agent loop.
+ *
+ * - Not plan-active or plan already satisfied → pass through unchanged.
+ * - Step 0 (investigation): read-only tools + create_plan.
+ * - Step > 0 (must produce plan): only create_plan.
+ */
+export function resolvePlanModeToolSpecs(
+  toolSpecs: ModelToolSpec[],
+  options: {
+    planTurnActive: boolean
+    createPlanSatisfied: boolean
+    stepIndex: number
+    readOnlyToolNames?: ReadonlySet<string>
+    planToolName?: string
+  }
+): ModelToolSpec[] {
+  if (!options.planTurnActive || options.createPlanSatisfied) return toolSpecs
+  const readOnly = options.readOnlyToolNames ?? PLAN_READ_ONLY_TOOL_NAMES
+  const planTool = options.planToolName ?? CREATE_PLAN_TOOL_NAME
+  return options.stepIndex === 0
+    ? toolSpecs.filter((tool) => tool.name === planTool || readOnly.has(tool.name))
+    : toolSpecs.filter((tool) => tool.name === planTool)
+}
 
 function goalContinuationInstruction(goal: ThreadGoal | undefined): string | null {
   if (!goal || goal.status !== 'active') return null
@@ -160,6 +272,73 @@ function goalContinuationInstruction(goal: ThreadGoal | undefined): string | nul
     '',
     `Do not call ${UPDATE_GOAL_TOOL_NAME} unless the goal is complete or the strict blocked audit above is satisfied.`
   ].join('\n')
+}
+
+const GOAL_NO_TOOL_REPEAT_SIMILARITY = 0.85
+const GOAL_NO_TOOL_REPEAT_MIN_LENGTH = 12
+const GOAL_NO_TOOL_REPEAT_MAX_RECOVERY_STEPS = 3
+const EMPTY_POST_TOOL_MAX_RECOVERY_STEPS = 1
+
+function goalNoToolRecoveryInstruction(recoveryStep: number): string {
+  return [
+    'Goal continuation recovery:',
+    `- The active goal continuation has produced near-identical no-tool replies ${recoveryStep} time(s).`,
+    '- Do not repeat the same status update, promise, or summary again.',
+    `- If the objective is actually achieved, call ${UPDATE_GOAL_TOOL_NAME} with status "complete" after verifying the current state.`,
+    `- If the strict blocked audit is satisfied, call ${UPDATE_GOAL_TOOL_NAME} with status "blocked".`,
+    '- Otherwise, continue with new substantive work or call an available tool to make concrete progress.'
+  ].join('\n')
+}
+
+function emptyPostToolRecoveryInstruction(): string {
+  return [
+    'Tool continuation recovery:',
+    '- The previous model response ended without a final answer after tool execution.',
+    '- Continue the task now: inspect the tool result, call additional tools if needed, or provide a clear final answer.',
+    '- Do not stop with an empty response.'
+  ].join('\n')
+}
+
+/**
+ * Goal continuation re-prompts the model whenever it stops without tool
+ * calls, which can spin forever on "I will do X next" filler that never
+ * acts. Exact-equality checks miss this: the filler usually varies in
+ * punctuation, casing, or word order between rounds, so the guard
+ * normalizes both texts and falls back to character-bigram similarity.
+ */
+function isRepeatedNoToolAssistantText(previous: string | undefined, current: string): boolean {
+  if (previous === undefined) return false
+  const a = normalizeNoToolAssistantText(previous)
+  const b = normalizeNoToolAssistantText(current)
+  if (a === b) return true
+  if (a.length < GOAL_NO_TOOL_REPEAT_MIN_LENGTH || b.length < GOAL_NO_TOOL_REPEAT_MIN_LENGTH) {
+    return false
+  }
+  return charBigramDiceSimilarity(a, b) >= GOAL_NO_TOOL_REPEAT_SIMILARITY
+}
+
+function normalizeNoToolAssistantText(text: string): string {
+  return text.toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, '')
+}
+
+function charBigramDiceSimilarity(a: string, b: string): number {
+  const bigramsA = charBigramCounts(a)
+  const bigramsB = charBigramCounts(b)
+  let shared = 0
+  for (const [bigram, countA] of bigramsA) {
+    const countB = bigramsB.get(bigram)
+    if (countB) shared += Math.min(countA, countB)
+  }
+  return (2 * shared) / (a.length - 1 + b.length - 1)
+}
+
+function charBigramCounts(text: string): Map<string, number> {
+  const counts = new Map<string, number>()
+  for (let index = 0; index < text.length - 1; index += 1) {
+    const bigram = text.slice(index, index + 2)
+    counts.set(bigram, (counts.get(bigram) ?? 0) + 1)
+  }
+  return counts
 }
 
 function todoContinuationInstruction(todos: ThreadTodoList | undefined): string | null {
@@ -207,6 +386,19 @@ function latestUserMessageText(items: readonly TurnItem[], turnId: string): stri
   return ''
 }
 
+/**
+ * Injected when the turn runs without an interactive user (IM bridges,
+ * headless runs). The user-input tools are also withheld from the tool
+ * catalog; this line keeps the model from promising a GUI dialog that
+ * nobody can answer.
+ */
+function userInputUnavailableInstruction(): string {
+  return [
+    'Interactive user input is unavailable for this turn: the user is on a remote channel (IM) and cannot answer GUI prompts.',
+    'Do not ask for structured input or wait for confirmation. If information is missing, state your assumption and continue, or finish your reply with the question so the user can answer in their next message.'
+  ].join(' ')
+}
+
 function allowedToolNamesWithGuiStateTools(
   allowedToolNames: readonly string[] | undefined,
   activeGoal: boolean
@@ -220,6 +412,23 @@ function allowedToolNamesWithGuiStateTools(
   next.add(TODO_LIST_TOOL_NAME)
   next.add(TODO_WRITE_TOOL_NAME)
   return [...next]
+}
+
+/**
+ * Intersect an optional allow-list with a hard-forced allow-list. Used to
+ * clamp a subagent loop to read-only tools: the forced list wins, but any
+ * narrower skill-imposed list is preserved. Returns the forced list when no
+ * base restriction exists, and leaves the base untouched when nothing is
+ * forced (the main agent path).
+ */
+function intersectAllowedToolNames(
+  base: readonly string[] | undefined,
+  forced: readonly string[] | undefined
+): readonly string[] | undefined {
+  if (!forced) return base
+  if (!base) return [...forced]
+  const forcedSet = new Set(forced)
+  return base.filter((name) => forcedSet.has(name))
 }
 
 export type AgentLoopOptions = {
@@ -249,6 +458,26 @@ export type AgentLoopOptions = {
   toolArgumentRepair?: {
     maxStringBytes?: number
   }
+  /**
+   * Tuning + test seams for goal auto-resume (KunAgent/Kun#370). Defaults
+   * back off exponentially and bound consecutive no-progress retries; tests
+   * inject a synchronous timer and small caps for determinism.
+   */
+  goalResume?: Pick<
+    GoalResumeCoordinatorDeps,
+    'setTimer' | 'maxNoProgressAttempts' | 'baseDelayMs' | 'maxDelayMs' | 'log'
+  >
+  /**
+   * Hard allow-list intersected into every tool context for this loop. Used
+   * by read-only subagents to clamp the inherited tool host to investigation
+   * tools — enforced at both the schema (listTools) and execute layers.
+   */
+  forcedAllowedToolNames?: readonly string[]
+  /**
+   * Lifecycle hooks (UserPromptSubmit, TurnStart, TurnEnd, PreCompact).
+   * Tool phases are handled by the tool host; the loop ignores them.
+   */
+  hooks?: readonly ResolvedHook[]
   /**
    * Optional fallback GUI plan context for embedders that run the loop
    * without persisted turn metadata. Normal serve mode reads GUI plan
@@ -286,11 +515,49 @@ export class AgentLoop {
   private readonly opts: AgentLoopOptions
   private readonly autoModelRoutes = new Map<string, AutoModelRouteSelection>()
   private readonly promptTokenPressure = new Map<string, { model: string; promptTokens: number }>()
+  /** Threads for which a one-time pressure hydration from persisted usage was already attempted. */
+  private readonly hydratedPressureThreads = new Set<string>()
   private readonly toolStormBreakers = new Map<string, ToolStormBreaker>()
   private readonly toolCatalogSnapshots = new Map<string, ToolCatalogSnapshot>()
+  private readonly lastNoToolTextByTurn = new Map<string, string>()
+  private readonly goalNoToolRecoveryStepsByTurn = new Map<string, number>()
+  private readonly emptyPostToolRecoveryStepsByTurn = new Map<string, number>()
+  private readonly turnFailures = new Map<string, TurnFailure>()
+  /** Turns that executed at least one real (non-goal-status) tool call. */
+  private readonly turnMadeProgress = new Set<string>()
+  private readonly goalResume: GoalResumeCoordinator
 
   constructor(opts: AgentLoopOptions) {
     this.opts = opts
+    this.goalResume = new GoalResumeCoordinator({
+      launch: (threadId) => this.launchGoalResumeTurn(threadId),
+      getActiveGoalKey: async (threadId) => {
+        const goal = (await this.opts.threadStore.get(threadId))?.goal
+        return goal && goal.status === 'active' ? goalResumeKey(threadId, goal) : null
+      },
+      isThreadBusy: async (threadId) =>
+        (await this.opts.threadStore.get(threadId))?.status === 'running',
+      ...this.opts.goalResume
+    })
+  }
+
+  /** Cancel any pending goal auto-resume timers (called on runtime shutdown). */
+  shutdownGoalResume(): void {
+    this.goalResume.shutdown()
+  }
+
+  /**
+   * Resume goals stranded by a runtime restart (path A). `threadIds` are the
+   * threads whose in-flight turn was just reconciled to `failed`; only those
+   * with a still-`active` goal are relaunched, so dormant goals on unrelated
+   * threads are never auto-started on boot.
+   */
+  async resumeInterruptedGoals(threadIds: readonly string[]): Promise<number> {
+    let resumed = 0
+    for (const threadId of threadIds) {
+      if (await this.goalResume.resumeInterrupted(threadId)) resumed += 1
+    }
+    return resumed
   }
 
   /**
@@ -309,6 +576,8 @@ export class AgentLoop {
       return 'aborted'
     }
     let goalTimer: GoalElapsedTimer | null = null
+    let finalStatus: 'completed' | 'failed' | 'aborted' | undefined
+    let finalError: string | undefined
     try {
       goalTimer = await this.startGoalElapsedTimer(threadId)
       await this.recordPipelineStage(threadId, turnId, 'setup')
@@ -316,24 +585,193 @@ export class AgentLoop {
         this.toolStormBreakers.set(turnId, new ToolStormBreaker(this.opts.toolStorm))
       }
       await this.recordPipelineStage(threadId, turnId, 'pre_start')
+      const denial = await this.runTurnStartLifecycleHooks(threadId, turnId)
+      if (denial) {
+        await this.opts.events.record({
+          kind: 'error',
+          threadId,
+          turnId,
+          message: denial,
+          code: 'hook_denied',
+          severity: 'error'
+        })
+        await this.opts.turns.applyItem(
+          threadId,
+          makeErrorItem({
+            id: this.opts.ids.next('item_error'),
+            turnId,
+            threadId,
+            message: denial,
+            code: 'hook_denied',
+            severity: 'error'
+          })
+        )
+        await this.opts.turns.finishTurn({ threadId, turnId, status: 'failed', error: denial })
+        finalStatus = 'failed'
+        finalError = denial
+        return 'failed'
+      }
       await this.drainSteering(threadId, turnId, signal)
       await this.recordPipelineStage(threadId, turnId, 'post_start')
       const status = await this.loop(threadId, turnId, signal)
-      await this.opts.turns.finishTurn({ threadId, turnId, status })
+      const failure = status === 'failed' ? this.turnFailures.get(turnId) : undefined
+      await this.opts.turns.finishTurn({
+        threadId,
+        turnId,
+        status,
+        ...(failure ?? {})
+      })
+      finalStatus = status
+      finalError = failure?.error
       return status
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
+      const raw = error instanceof Error ? error.message : String(error)
+      // Best-effort enrichment so the renderer can show "what failed where"
+      // instead of the bare "Kun turn failed" string. See issue #26.
+      const modelInfo = this.opts.model && 'config' in this.opts.model
+        ? (this.opts.model as { config: { model?: string; baseUrl?: string } }).config
+        : undefined
+      const modelName = modelInfo?.model ?? 'unknown'
+      const provider = modelInfo?.baseUrl ?? 'unknown'
+      const stack = error instanceof Error
+        ? (error.stack?.split('\n').slice(0, 3).join(' | ') ?? '')
+        : ''
+      const message = [
+        '[Kun turn failed]',
+        `turn=${turnId}`,
+        `thread=${threadId}`,
+        `model=${modelName}`,
+        `provider=${provider}`,
+        `error=${raw}`,
+        stack ? `stack=${stack}` : ''
+      ].filter(Boolean).join(' ')
       await this.failTurn(threadId, turnId, message)
+      finalStatus = 'failed'
+      finalError = message
       return 'failed'
     } finally {
       await this.finishGoalElapsedTimer(threadId, goalTimer)
+      // Decide cross-turn goal resume before clearing the per-turn progress
+      // marker it reads.
+      await this.evaluateGoalResume(threadId, turnId, finalStatus ?? 'failed')
       this.autoModelRoutes.delete(autoModelRouteKey(threadId, turnId))
       this.toolStormBreakers.delete(turnId)
+      this.lastNoToolTextByTurn.delete(turnId)
+      this.goalNoToolRecoveryStepsByTurn.delete(turnId)
+      this.turnMadeProgress.delete(turnId)
+      this.emptyPostToolRecoveryStepsByTurn.delete(turnId)
+      this.turnFailures.delete(turnId)
+      await this.runTurnEndHooks(threadId, turnId, finalStatus ?? 'failed', finalError)
+    }
+  }
+
+  /**
+   * TurnStart (observe-only) then UserPromptSubmit hooks. Returns the
+   * denial message when a UserPromptSubmit hook blocks the turn.
+   * Accepted `additionalContext` is persisted as an extra user message
+   * so replays and the prompt cache see a stable history.
+   */
+  private async runTurnStartLifecycleHooks(threadId: string, turnId: string): Promise<string | undefined> {
+    const hooks = this.opts.hooks
+    const hasStart = hasHooksForPhase(hooks, 'TurnStart')
+    const hasSubmit = hasHooksForPhase(hooks, 'UserPromptSubmit')
+    if (!hasStart && !hasSubmit) return undefined
+    const turn = await this.opts.turns.getTurn(threadId, turnId)
+    const thread = await this.opts.threadStore.get(threadId)
+    const payload = {
+      threadId,
+      turnId,
+      prompt: turn?.prompt ?? '',
+      ...(thread?.workspace ? { workspace: thread.workspace } : {})
+    }
+    if (hasStart) {
+      const started = await runObserverHooks(hooks, { phase: 'TurnStart', ...payload })
+      await this.recordHookWarnings(threadId, turnId, started.warnings)
+    }
+    if (!hasSubmit) return undefined
+    const submit = await runUserPromptSubmitHooks(hooks, payload)
+    await this.recordHookWarnings(threadId, turnId, submit.warnings)
+    if (submit.denied) return submit.denied
+    if (submit.additionalContext.length > 0) {
+      const now = this.opts.nowIso()
+      const item: TurnItem = {
+        id: this.opts.ids.next('item_hook'),
+        turnId,
+        threadId,
+        role: 'user',
+        status: 'completed',
+        createdAt: now,
+        finishedAt: now,
+        kind: 'user_message',
+        text: `<hook-context>\n${submit.additionalContext.join('\n\n')}\n</hook-context>`
+      }
+      await this.opts.turns.applyItem(threadId, item)
+    }
+    return undefined
+  }
+
+  /** Observe-only TurnEnd hooks; run after the turn is finalized and must never throw. */
+  private async runTurnEndHooks(
+    threadId: string,
+    turnId: string,
+    status: 'completed' | 'failed' | 'aborted',
+    error?: string
+  ): Promise<void> {
+    if (!hasHooksForPhase(this.opts.hooks, 'TurnEnd')) return
+    try {
+      const outcome = await runObserverHooks(this.opts.hooks, {
+        phase: 'TurnEnd',
+        threadId,
+        turnId,
+        status,
+        ...(error ? { error } : {})
+      })
+      await this.recordHookWarnings(threadId, turnId, outcome.warnings)
+    } catch {
+      // Observe-only: a TurnEnd hook must never break turn cleanup.
+    }
+  }
+
+  private async recordHookWarnings(
+    threadId: string,
+    turnId: string,
+    warnings: readonly string[]
+  ): Promise<void> {
+    for (const message of warnings) {
+      await this.opts.events.record({
+        kind: 'error',
+        threadId,
+        turnId,
+        message,
+        code: 'hook_warning',
+        severity: 'warning'
+      })
     }
   }
 
   private async failTurn(threadId: string, turnId: string, message: string): Promise<void> {
     await this.opts.turns.finishTurn({ threadId, turnId, status: 'failed', error: message })
+  }
+
+  private rememberTurnFailure(turnId: string, failure: TurnFailure): void {
+    if (!failure.error.trim()) return
+    this.turnFailures.set(turnId, failure)
+  }
+
+  private modelClientDiagnostics(): ModelClientDiagnostics {
+    const client = this.opts.model as ModelClient & {
+      config?: {
+        baseUrl?: string
+        endpointFormat?: string
+        model?: string
+      }
+    }
+    return {
+      provider: client.provider,
+      ...(client.config?.baseUrl ? { providerBaseUrl: sanitizeProviderBaseUrl(client.config.baseUrl) } : {}),
+      ...(client.config?.endpointFormat ? { endpointFormat: client.config.endpointFormat } : {}),
+      ...(client.config?.model ? { configuredModel: client.config.model } : {})
+    }
   }
 
   private nowMs(): number {
@@ -381,6 +819,104 @@ export class AgentLoop {
     })
   }
 
+  /**
+   * Decide whether to auto-resume the goal after a turn settles (path B).
+   *
+   * Only failed, non-plan turns on a still-`active` goal are resumed: a model
+   * step-budget stop or a model/network/tool error left the goal "in
+   * progress" with nothing running (KunAgent/Kun#370). Deliberate stops
+   * (`completed`: the goal-repetition guard or a cost-budget block) and user
+   * interrupts / shutdown (`aborted`) are never relaunched. When the
+   * consecutive no-progress budget is exhausted the goal is moved to
+   * `blocked` so the banner reflects reality.
+   */
+  private async evaluateGoalResume(
+    threadId: string,
+    turnId: string,
+    finalStatus: 'completed' | 'failed' | 'aborted'
+  ): Promise<void> {
+    const thread = await this.opts.threadStore.get(threadId)
+    const goal = thread?.goal
+    if (!thread || !goal || goal.status !== 'active') {
+      this.goalResume.clear(threadId)
+      return
+    }
+    const turn = thread.turns.find((t) => t.id === turnId)
+    const wasPlanTurn = turn?.mode === 'plan' || Boolean(turn?.guiPlan)
+    if (finalStatus !== 'failed' || wasPlanTurn) {
+      this.goalResume.clear(threadId)
+      return
+    }
+    const outcome = this.goalResume.noteGoalTurnFailed({
+      threadId,
+      goalKey: goalResumeKey(threadId, goal),
+      madeProgress: this.turnMadeProgress.has(turnId)
+    })
+    if (outcome === 'exhausted') {
+      await this.transitionGoalStatus(
+        threadId,
+        turnId,
+        'blocked',
+        `Goal auto-resume stopped: ${DEFAULT_MAX_GOAL_RESUME_NO_PROGRESS_ATTEMPTS} consecutive attempts made no progress. Set the goal active again to retry.`
+      )
+    }
+  }
+
+  /** Start and drive a fresh continuation turn for the thread's active goal. */
+  private async launchGoalResumeTurn(threadId: string): Promise<void> {
+    const thread = await this.opts.threadStore.get(threadId)
+    const goal = thread?.goal
+    if (!thread || !goal || goal.status !== 'active') return
+    // Inherit headless/IM gating from the most recent turn so a resumed turn
+    // doesn't deadlock awaiting user input that will never arrive.
+    const lastTurn = thread.turns[thread.turns.length - 1]
+    const started = await this.opts.turns.startTurn({
+      threadId,
+      request: {
+        prompt: GOAL_RESUME_PROMPT,
+        mode: 'agent',
+        ...(lastTurn?.disableUserInput ? { disableUserInput: true } : {})
+      }
+    })
+    await this.opts.events.record({
+      kind: 'error',
+      threadId,
+      turnId: started.turnId,
+      message: 'Auto-resuming the active goal after an interrupted turn.',
+      code: 'goal_auto_resume',
+      severity: 'warning'
+    })
+    // Fire-and-forget: the new turn drives its own lifecycle and re-enters
+    // evaluateGoalResume when it settles.
+    void this.runTurn(threadId, started.turnId)
+  }
+
+  /** Move a goal out of `active` (e.g. to `blocked`) and surface why. */
+  private async transitionGoalStatus(
+    threadId: string,
+    turnId: string,
+    status: ThreadGoal['status'],
+    message?: string
+  ): Promise<void> {
+    const current = await this.opts.threadStore.get(threadId)
+    const goal = current?.goal
+    if (!current || !goal || goal.status === status) return
+    const now = this.opts.nowIso()
+    const next: ThreadGoal = { ...goal, status, updatedAt: now }
+    await this.opts.threadStore.upsert(touchThread({ ...current, goal: next }, now))
+    await this.opts.events.record({ kind: 'goal_updated', threadId, goal: next })
+    if (message) {
+      await this.opts.events.record({
+        kind: 'error',
+        threadId,
+        turnId,
+        message,
+        code: 'goal_auto_resume_exhausted',
+        severity: 'warning'
+      })
+    }
+  }
+
   private async drainSteering(threadId: string, turnId: string, signal: AbortSignal): Promise<void> {
     const pending = this.opts.steering.drain()
     if (pending.length === 0) return
@@ -408,6 +944,30 @@ export class AgentLoop {
   ): Promise<'completed' | 'failed' | 'aborted'> {
     for (let step = 0; ; step += 1) {
       if (signal.aborted) return 'aborted'
+      if (step >= MAX_TURN_MODEL_STEPS) {
+        const message =
+          `Turn stopped after ${MAX_TURN_MODEL_STEPS} model steps without reaching a final response.`
+        await this.opts.events.record({
+          kind: 'error',
+          threadId,
+          turnId,
+          message,
+          code: 'turn_step_limit_exceeded',
+          severity: 'error'
+        })
+        await this.opts.turns.applyItem(
+          threadId,
+          makeErrorItem({
+            id: this.opts.ids.next('item_error'),
+            turnId,
+            threadId,
+            message,
+            code: 'turn_step_limit_exceeded',
+            severity: 'error'
+          })
+        )
+        return 'failed'
+      }
       await this.drainSteering(threadId, turnId, signal)
       const stepResult = await this.modelStep(threadId, turnId, signal, step)
       if (stepResult === 'stop') return 'completed'
@@ -436,9 +996,16 @@ export class AgentLoop {
     const budgetGate = await this.checkBudgetGate(thread, threadId, turnId)
     if (budgetGate === 'blocked') return 'stop'
     const loadedItems = await this.opts.sessionStore.loadItems(threadId)
-    const healed = healLoadedHistoryItems(loadedItems)
-    if (healed.changed) {
-      await this.opts.sessionStore.rewriteItems(threadId, healed.items)
+    // Heal (and possibly rewrite) on-disk history once per turn: within a
+    // turn the loop only appends well-formed items, and healing's deep
+    // change detection costs two full-history stringifies per call.
+    let historyItems: TurnItem[] = loadedItems
+    if (stepIndex === 0) {
+      const healed = healLoadedHistoryItems(loadedItems)
+      if (healed.changed) {
+        await this.opts.sessionStore.rewriteItems(threadId, healed.items)
+      }
+      historyItems = healed.items
     }
     await this.recordPipelineStage(
       threadId,
@@ -447,7 +1014,7 @@ export class AgentLoop {
       prefixVolatilityStageDetails(detectVolatilePrefixContent(this.opts.prefix))
     )
     if (stepIndex > 0) {
-      const toolResultCount = healed.items.filter(
+      const toolResultCount = historyItems.filter(
         (item) => item.turnId === turnId && item.kind === 'tool_result'
       ).length
       await this.opts.events.record({
@@ -459,9 +1026,10 @@ export class AgentLoop {
       })
     }
     const items = repairModelHistoryItems(
-      effectiveHistoryAfterLatestCompaction(healed.items)
+      effectiveHistoryAfterLatestCompaction(historyItems)
     )
     const approvalPolicy = normalizeApprovalPolicy(thread?.approvalPolicy)
+    const sandboxMode = normalizeSandboxMode(thread?.sandboxMode)
     // Per-turn mode overrides the thread mode so the GUI can toggle
     // Plan/agent (and run Build as agent) without recreating the thread.
     const effectiveMode = turn?.mode ?? thread?.mode
@@ -503,11 +1071,23 @@ export class AgentLoop {
     const activeGoalInstruction = planTurnActive
       ? null
       : goalContinuationInstruction(thread?.goal)
-    const activeTodoInstruction = todoContinuationInstruction(thread?.todos)
-    const allowedToolNames = allowedToolNamesWithGuiStateTools(
-      skillResolution.allowedToolNames,
-      activeGoalInstruction !== null
+    const goalRecoveryInstruction = activeGoalInstruction
+      ? goalNoToolRecoveryInstruction(this.goalNoToolRecoveryStepsByTurn.get(turnId) ?? 0)
+      : null
+    const activeTodoInstruction = planTurnActive
+      ? null
+      : todoContinuationInstruction(thread?.todos)
+    const allowedToolNames = intersectAllowedToolNames(
+      allowedToolNamesWithGuiStateTools(
+        skillResolution.allowedToolNames,
+        activeGoalInstruction !== null
+      ),
+      this.opts.forcedAllowedToolNames
     )
+    // IM/headless turns run without the user-input gate; the tools key
+    // their advertisement off `awaitUserInput`, so omitting it hides
+    // `user_input`/`request_user_input` and rejects stray calls.
+    const userInputDisabled = turn?.disableUserInput === true
     const toolContext: ToolHostContext = {
       threadId,
       turnId,
@@ -520,9 +1100,12 @@ export class AgentLoop {
       delegationPolicy: { enabled: false },
       ...(allowedToolNames ? { allowedToolNames } : {}),
       approvalPolicy,
+      sandboxMode,
       abortSignal: signal,
       awaitApproval: async () => 'allow',
-      awaitUserInput: (input) => this.awaitUserInput(threadId, turnId, input, signal)
+      ...(userInputDisabled
+        ? {}
+        : { awaitUserInput: (input) => this.awaitUserInput(threadId, turnId, input, signal) })
     }
     const tools = await this.opts.toolHost.listTools(toolContext)
     const toolSpecs: ModelToolSpec[] = tools
@@ -537,6 +1120,7 @@ export class AgentLoop {
       model: modelCapabilities.id,
       activeSkillIds: skillResolution.activeSkillIds,
       allowedToolNames,
+      userInputDisabled,
       fingerprint: toolCatalog.fingerprint,
       toolNames: toolCatalog.toolNames,
       toolHashes: toolCatalog.toolHashes
@@ -568,7 +1152,7 @@ export class AgentLoop {
     if (toolCatalogDrift.kind === 'breaking') return 'stop'
     const toolKinds = new Map(toolSpecs.map((tool) => [tool.name, tool.toolKind]))
     const createPlanSatisfied = planTurnActive
-      ? hasSuccessfulCreatePlanResult(healed.items, turnId)
+      ? hasSuccessfulCreatePlanResult(historyItems, turnId)
       : false
     const requiredToolName =
       planTurnActive &&
@@ -576,21 +1160,40 @@ export class AgentLoop {
       toolSpecs.some((tool) => tool.name === CREATE_PLAN_TOOL_NAME)
         ? CREATE_PLAN_TOOL_NAME
         : undefined
-    // Final step of a plan turn that still owes a plan. Offer ONLY create_plan
-    // (this DeepSeek-compatible provider ignores a forced tool_choice, so we
-    // remove the investigation tools instead) so the model can only save the
-    // plan or answer with plan text that the create_plan fallback materializes.
-    const history = await this.compactIfNeeded(items, model, signal, { threadId, turnId })
+    const effectiveToolSpecs = resolvePlanModeToolSpecs(toolSpecs, {
+      planTurnActive,
+      createPlanSatisfied,
+      stepIndex
+    })
+    const history = await this.compactIfNeeded(items, model, signal, {
+      threadId,
+      turnId,
+      visibleItems: historyItems,
+      toolSpecs: effectiveToolSpecs
+    })
     if (signal.aborted) return 'aborted'
     await this.recordPipelineStage(threadId, turnId, 'input_compressed', {
       historyItems: history.length
     })
     const contextInstructions = [
       ...(activeGoalInstruction ? [activeGoalInstruction] : []),
+      ...(goalRecoveryInstruction && (this.goalNoToolRecoveryStepsByTurn.get(turnId) ?? 0) > 0
+        ? [goalRecoveryInstruction]
+        : []),
       ...(activeTodoInstruction ? [activeTodoInstruction] : []),
+      ...((this.emptyPostToolRecoveryStepsByTurn.get(turnId) ?? 0) > 0
+        ? [emptyPostToolRecoveryInstruction()]
+        : []),
+      ...imageGenerationReferenceInstructions({
+        imageAttachments: attachments.imageAttachments,
+        textFallbacks: attachments.textFallbacks,
+        workspace: thread?.workspace ?? '',
+        tools: effectiveToolSpecs
+      }),
       ...memoryInstructions(memories),
       ...skillResolution.instructions,
-      ...(toolSpecs.some((tool) => tool.name === 'bash') ? [shellRuntimeInstruction()] : []),
+      ...(userInputDisabled ? [userInputUnavailableInstruction()] : []),
+      ...(effectiveToolSpecs.some((tool) => tool.name === 'bash') ? [shellRuntimeInstruction()] : []),
       ...(toolCatalogDriftMessage ? [toolCatalogDriftMessage] : [])
     ]
     await this.recordPipelineStage(threadId, turnId, 'input_remembered', {
@@ -602,14 +1205,15 @@ export class AgentLoop {
       threadId,
       turnId,
       model,
+      ...(thread?.providerId?.trim() ? { providerId: thread.providerId.trim() } : {}),
       systemPrompt: this.opts.prefix.systemPrompt,
       ...(planTurnActive ? { modeInstruction: PLAN_MODE_INSTRUCTION } : {}),
       ...(contextInstructions.length ? { contextInstructions } : {}),
       prefix: this.opts.prefix.fewShots,
-      history,
+      history: capToolResultImages(history, MAX_FORWARDED_TOOL_IMAGES),
       ...(attachments.imageAttachments.length ? { attachments: attachments.imageAttachments } : {}),
       ...(attachments.textFallbacks.length ? { attachmentTextFallbacks: attachments.textFallbacks } : {}),
-      tools: toolSpecs,
+      tools: effectiveToolSpecs,
       ...(requiredToolName ? { requiredToolName } : {}),
       ...(modelRoute.reasoningEffort ? { reasoningEffort: modelRoute.reasoningEffort } : {}),
       abortSignal: signal
@@ -620,7 +1224,9 @@ export class AgentLoop {
     const economyRequest = applyTokenEconomyToRequest(baseRequest, tokenEconomy)
     const request: ModelRequest = {
       ...economyRequest,
-      history: applyRequestHistoryHygiene(economyRequest.history, tokenEconomy.historyHygiene)
+      history: applyRequestHistoryHygiene(economyRequest.history, tokenEconomy.historyHygiene, {
+        currentTurnId: turnId
+      })
     }
     if (tokenEconomy.enabled) {
       await this.recordTokenEconomySavings({
@@ -637,8 +1243,42 @@ export class AgentLoop {
     let reasoningItemId = ''
     const completedToolCalls: ToolCallLike[] = []
     let stopReason: 'stop' | 'tool_calls' | 'length' | 'error' = 'stop'
+    const modelClientDiagnostics = this.modelClientDiagnostics()
+    let persistedReasoning = false
+    let persistedText = false
+    const persistAccumulatedResponse = async (): Promise<void> => {
+      if (!persistedReasoning && reasoningAccumulator.value) {
+        persistedReasoning = true
+        const itemId = reasoningItemId || this.opts.ids.next('item_reasoning')
+        await this.opts.turns.applyItem(
+          threadId,
+          makeAssistantReasoningItem({
+            id: itemId,
+            turnId,
+            threadId,
+            text: reasoningAccumulator.value,
+            status: 'completed'
+          })
+        )
+      }
+      if (!persistedText && textAccumulator.value) {
+        persistedText = true
+        const itemId = textItemId || this.opts.ids.next('item_text')
+        await this.opts.turns.applyItem(
+          threadId,
+          makeAssistantTextItem({
+            id: itemId,
+            turnId,
+            threadId,
+            text: textAccumulator.value,
+            status: 'completed'
+          })
+        )
+      }
+    }
     await this.recordPipelineStage(threadId, turnId, 'pre_send', {
       model: request.model,
+      ...modelClientDiagnostics,
       historyItems: request.history.length,
       toolCount: request.tools.length,
       ...(request.requiredToolName ? { requiredToolName: request.requiredToolName } : {}),
@@ -650,10 +1290,14 @@ export class AgentLoop {
       })
     })
     await this.recordPipelineStage(threadId, turnId, 'post_send', {
-      model: request.model
+      model: request.model,
+      ...modelClientDiagnostics
     })
     for await (const chunk of this.opts.model.stream(request)) {
-      if (signal.aborted) return 'aborted'
+      if (signal.aborted) {
+        await persistAccumulatedResponse()
+        return 'aborted'
+      }
       switch (chunk.kind) {
         case 'assistant_text_delta':
           textItemId ||= this.opts.ids.next('item_text')
@@ -748,50 +1392,35 @@ export class AgentLoop {
           break
         }
         case 'completed':
-          stopReason = chunk.stopReason
+          if (stopReason !== 'error') stopReason = chunk.stopReason
           break
         case 'error':
+          this.rememberTurnFailure(turnId, {
+            error: chunk.message,
+            ...(chunk.code ? { code: chunk.code } : {}),
+            severity: 'error'
+          })
           await this.opts.events.record({
             kind: 'error',
             threadId,
             turnId,
             message: chunk.message,
-            code: chunk.code
+            code: chunk.code,
+            severity: 'error'
           })
           stopReason = 'error'
           break
       }
     }
+    if (signal.aborted) {
+      await persistAccumulatedResponse()
+      return 'aborted'
+    }
     await this.recordPipelineStage(threadId, turnId, 'response_received', {
       stopReason,
       toolCallCount: completedToolCalls.length
     })
-    if (reasoningAccumulator.value) {
-      const itemId = reasoningItemId || this.opts.ids.next('item_reasoning')
-      await this.opts.turns.applyItem(
-        threadId,
-        makeAssistantReasoningItem({
-          id: itemId,
-          turnId,
-          threadId,
-          text: reasoningAccumulator.value,
-          status: 'completed'
-        })
-      )
-    }
-    if (textAccumulator.value) {
-      const itemId = textItemId || this.opts.ids.next('item_text')
-      await this.opts.turns.applyItem(
-        threadId,
-        makeAssistantTextItem({
-          id: itemId,
-          turnId,
-          threadId,
-          text: textAccumulator.value,
-          status: 'completed'
-        })
-      )
-    }
+    await persistAccumulatedResponse()
     if (stopReason === 'error') return 'failed'
     if (completedToolCalls.length === 0) {
       if (request.requiredToolName) {
@@ -803,7 +1432,7 @@ export class AgentLoop {
           const provider = toolProviderMetadata.get(CREATE_PLAN_TOOL_NAME)
           const toolKind = toolKinds.get(CREATE_PLAN_TOOL_NAME)
           const sourceRequest = activePlanContext?.sourceRequest ||
-            latestUserMessageText(healed.items, turnId) ||
+            latestUserMessageText(historyItems, turnId) ||
             turn?.prompt ||
             ''
           const argumentsForFallback: Record<string, unknown> = activePlanContext
@@ -862,9 +1491,11 @@ export class AgentLoop {
             allowedToolNames,
             toolProviderKinds: new Map(tools.map((tool) => [tool.name, tool.providerKind])),
             approvalPolicy,
+            sandboxMode,
             signal
           })
           if (dispatched === 'aborted') return 'aborted'
+          if (dispatched === 'all_suppressed') return 'stop'
           return 'continue'
         }
         const message = `Model did not call the required \`${request.requiredToolName}\` tool for this GUI plan turn.`
@@ -887,9 +1518,97 @@ export class AgentLoop {
         )
         return 'failed'
       }
-      if (stopReason === 'stop' && activeGoalInstruction) return 'continue'
+      const hasCurrentTurnFileChange = historyItems.some(
+        (item) =>
+          item.turnId === turnId &&
+          item.kind === 'tool_call' &&
+          item.toolKind === 'file_change' &&
+          item.toolName !== CREATE_PLAN_TOOL_NAME
+      )
+      if (
+        stopReason === 'stop' &&
+        !textAccumulator.value.trim() &&
+        hasCurrentTurnFileChange
+      ) {
+        const recoverySteps = (this.emptyPostToolRecoveryStepsByTurn.get(turnId) ?? 0) + 1
+        if (recoverySteps <= EMPTY_POST_TOOL_MAX_RECOVERY_STEPS) {
+          this.emptyPostToolRecoveryStepsByTurn.set(turnId, recoverySteps)
+          return 'continue'
+        }
+
+        const message =
+          'Model stopped without a final answer after tool execution, including after a recovery retry.'
+        this.rememberTurnFailure(turnId, {
+          error: message,
+          code: 'empty_post_tool_continuation',
+          severity: 'error'
+        })
+        await this.opts.events.record({
+          kind: 'error',
+          threadId,
+          turnId,
+          message,
+          code: 'empty_post_tool_continuation',
+          severity: 'error'
+        })
+        await this.opts.turns.applyItem(
+          threadId,
+          makeErrorItem({
+            id: this.opts.ids.next('item_error'),
+            turnId,
+            threadId,
+            message,
+            code: 'empty_post_tool_continuation',
+            severity: 'error'
+          })
+        )
+        return 'failed'
+      }
+      if (stopReason === 'stop' && activeGoalInstruction) {
+        const previousText = this.lastNoToolTextByTurn.get(turnId)
+        if (isRepeatedNoToolAssistantText(previousText, textAccumulator.value)) {
+          const recoverySteps = (this.goalNoToolRecoveryStepsByTurn.get(turnId) ?? 0) + 1
+          if (recoverySteps <= GOAL_NO_TOOL_REPEAT_MAX_RECOVERY_STEPS) {
+            this.goalNoToolRecoveryStepsByTurn.set(turnId, recoverySteps)
+            this.lastNoToolTextByTurn.set(turnId, textAccumulator.value)
+            return 'continue'
+          }
+          const message =
+            'Goal continuation stopped: the model kept repeating near-identical replies without calling tools or updating the goal.'
+          await this.opts.turns.applyItem(
+            threadId,
+            makeErrorItem({
+              id: this.opts.ids.next('item_error'),
+              turnId,
+              threadId,
+              message,
+              code: 'goal_repetition_stop',
+              severity: 'warning'
+            })
+          )
+          await this.opts.events.record({
+            kind: 'error',
+            threadId,
+            turnId,
+            message,
+            code: 'goal_repetition_stop',
+            severity: 'warning'
+          })
+          this.lastNoToolTextByTurn.delete(turnId)
+          this.goalNoToolRecoveryStepsByTurn.delete(turnId)
+          return 'stop'
+        }
+        this.goalNoToolRecoveryStepsByTurn.delete(turnId)
+        this.lastNoToolTextByTurn.set(turnId, textAccumulator.value)
+        return 'continue'
+      }
       return 'stop'
     }
+    // Tool calls mean the turn is making progress again; reset the no-tool
+    // repetition window so unrelated later status texts are not compared.
+    this.lastNoToolTextByTurn.delete(turnId)
+    this.goalNoToolRecoveryStepsByTurn.delete(turnId)
+    this.emptyPostToolRecoveryStepsByTurn.delete(turnId)
     const dispatched = await this.dispatchToolCalls({
       calls: completedToolCalls,
       threadId,
@@ -900,11 +1619,14 @@ export class AgentLoop {
       modelCapabilities,
       activeSkillIds: skillResolution.activeSkillIds,
       allowedToolNames,
+      userInputDisabled,
       toolProviderKinds: new Map(tools.map((tool) => [tool.name, tool.providerKind])),
       approvalPolicy,
+      sandboxMode,
       signal
     })
     if (dispatched === 'aborted') return 'aborted'
+    if (dispatched === 'all_suppressed') return 'stop'
     return 'continue'
   }
 
@@ -918,12 +1640,20 @@ export class AgentLoop {
     modelCapabilities: ModelCapabilityMetadata
     activeSkillIds: readonly string[]
     allowedToolNames?: readonly string[]
+    userInputDisabled?: boolean
     toolProviderKinds: ReadonlyMap<string, ToolProviderKind | undefined>
     approvalPolicy: ToolHostContext['approvalPolicy']
+    sandboxMode: NonNullable<ToolHostContext['sandboxMode']>
     signal: AbortSignal
-  }): Promise<'continue' | 'aborted'> {
+  }): Promise<'continue' | 'aborted' | 'all_suppressed'> {
     const context = this.createToolContext(input)
     let index = 0
+    let executedAny = false
+    const markProgress = (toolName: string): void => {
+      if (!GOAL_NON_PROGRESS_TOOL_NAMES.has(toolName)) {
+        this.turnMadeProgress.add(input.turnId)
+      }
+    }
 
     while (index < input.calls.length) {
       if (input.signal.aborted) return 'aborted'
@@ -944,25 +1674,33 @@ export class AgentLoop {
       }
 
       if (!this.isParallelSafeToolCall(call, input.approvalPolicy, input.toolProviderKinds)) {
-        const result = await this.executeToolCall({
+        const result = await this.executeToolCallSafely({
           threadId: input.threadId,
           turnId: input.turnId,
           call,
           context
         })
+        executedAny = true
+        markProgress(call.toolName)
         await this.persistToolCallResult(input.threadId, input.turnId, call, result)
         index += 1
         continue
       }
 
+      // Keep batches homogeneous: delegation children fan out together (the
+      // runtime semaphore bounds real concurrency), while built-in read-only
+      // tools stay capped at MAX_PARALLEL_TOOL_CALLS.
+      const headIsDelegation = this.isParallelDelegationCall(call, input.toolProviderKinds)
+      const batchCap = headIsDelegation ? input.calls.length : MAX_PARALLEL_TOOL_CALLS
       const batch: ToolCallLike[] = [call]
       index += 1
       let suppressedAfterBatch: { call: ToolCallLike; reason?: string } | undefined
 
-      while (batch.length < MAX_PARALLEL_TOOL_CALLS && index < input.calls.length) {
+      while (batch.length < batchCap && index < input.calls.length) {
         const next = input.calls[index]
         if (!next) break
         if (!this.isParallelSafeToolCall(next, input.approvalPolicy, input.toolProviderKinds)) break
+        if (this.isParallelDelegationCall(next, input.toolProviderKinds) !== headIsDelegation) break
 
         const nextStorm = this.toolStormBreakers.get(input.turnId)?.inspect(next)
         if (nextStorm?.suppress) {
@@ -977,7 +1715,7 @@ export class AgentLoop {
 
       const settled = await Promise.allSettled(
         batch.map((entry) =>
-          this.executeToolCall({
+          this.executeToolCallSafely({
             threadId: input.threadId,
             turnId: input.turnId,
             call: entry,
@@ -985,11 +1723,13 @@ export class AgentLoop {
           })
         )
       )
+      executedAny = true
       for (let batchIndex = 0; batchIndex < batch.length; batchIndex += 1) {
         const result = settled[batchIndex]
         const batchCall = batch[batchIndex]
         if (!result || !batchCall) continue
         if (result.status === 'rejected') throw result.reason
+        markProgress(batchCall.toolName)
         await this.persistToolCallResult(input.threadId, input.turnId, batchCall, result.value)
       }
 
@@ -1003,7 +1743,7 @@ export class AgentLoop {
       }
     }
 
-    return 'continue'
+    return executedAny ? 'continue' : 'all_suppressed'
   }
 
   private isParallelSafeToolCall(
@@ -1011,10 +1751,25 @@ export class AgentLoop {
     approvalPolicy: ToolHostContext['approvalPolicy'],
     toolProviderKinds: ReadonlyMap<string, ToolProviderKind | undefined>
   ): boolean {
+    // Untrusted/never prompt on every tool, so parallel fan-out is unsafe.
+    if (approvalPolicy === 'untrusted' || approvalPolicy === 'never') return false
+    // Delegated children are isolated runs; multiple in one assistant message
+    // are independent and safe to fan out. The delegation runtime caps real
+    // concurrency at maxParallel and queues the overflow.
+    if (this.isParallelDelegationCall(call, toolProviderKinds)) return true
     if (!PARALLEL_READ_ONLY_TOOL_NAMES.has(call.toolName)) return false
     if (call.toolKind && call.toolKind !== 'tool_call') return false
-    if (approvalPolicy === 'untrusted' || approvalPolicy === 'never') return false
     return toolProviderKinds.get(call.toolName) === 'built-in'
+  }
+
+  private isParallelDelegationCall(
+    call: ToolCallLike,
+    toolProviderKinds: ReadonlyMap<string, ToolProviderKind | undefined>
+  ): boolean {
+    return (
+      call.toolName === DELEGATE_TASK_TOOL_NAME &&
+      toolProviderKinds.get(call.toolName) === 'delegation'
+    )
   }
 
   private createToolContext(input: {
@@ -1026,7 +1781,9 @@ export class AgentLoop {
     modelCapabilities: ModelCapabilityMetadata
     activeSkillIds: readonly string[]
     allowedToolNames?: readonly string[]
+    userInputDisabled?: boolean
     approvalPolicy: ToolHostContext['approvalPolicy']
+    sandboxMode: NonNullable<ToolHostContext['sandboxMode']>
     signal: AbortSignal
   }): ToolHostContext {
     return {
@@ -1041,6 +1798,7 @@ export class AgentLoop {
       delegationPolicy: { enabled: false },
       ...(input.allowedToolNames ? { allowedToolNames: input.allowedToolNames } : {}),
       approvalPolicy: input.approvalPolicy,
+      sandboxMode: input.sandboxMode,
       abortSignal: input.signal,
       awaitApproval: async (approval) => {
         await this.opts.events.record({
@@ -1050,12 +1808,18 @@ export class AgentLoop {
           approvalId: approval.id,
           toolName: approval.toolName,
           status: 'pending',
+          approvalPolicy: input.approvalPolicy,
+          sandboxMode: input.sandboxMode,
           summary: approval.summary
         })
         return this.opts.approvalGate.request(approval)
       },
-      awaitUserInput: (inputRequest) =>
-        this.awaitUserInput(input.threadId, input.turnId, inputRequest, input.signal)
+      ...(input.userInputDisabled
+        ? {}
+        : {
+            awaitUserInput: (inputRequest) =>
+              this.awaitUserInput(input.threadId, input.turnId, inputRequest, input.signal)
+          })
     }
   }
 
@@ -1073,15 +1837,104 @@ export class AgentLoop {
         turnId: input.turnId,
         callId: input.call.callId
       },
-      () => this.opts.toolHost.execute(input.call, input.context, async (item) => {
-        const existing = await this.opts.turns.updateItem(input.threadId, item.id, {
-          output: item.kind === 'tool_result' ? item.output : undefined,
-          isError: item.kind === 'tool_result' ? item.isError : undefined,
-          status: 'running'
-        } as Partial<TurnItem>)
-        if (existing) return
-        await this.opts.turns.applyItem(input.threadId, item)
+      async () => {
+        try {
+          return await this.opts.toolHost.execute(input.call, input.context, async (item) => {
+            const existing = await this.opts.turns.updateItem(input.threadId, item.id, {
+              output: item.kind === 'tool_result' ? item.output : undefined,
+              isError: item.kind === 'tool_result' ? item.isError : undefined,
+              status: 'running'
+            } as Partial<TurnItem>)
+            if (existing) return
+            await this.opts.turns.applyItem(input.threadId, item)
+          })
+        } catch (error) {
+          if (input.context.abortSignal.aborted || !this.isRecoverableToolDispatchError(error)) {
+            throw error
+          }
+          const message = error instanceof Error ? error.message : String(error)
+          await this.opts.events.record({
+            kind: 'error',
+            threadId: input.threadId,
+            turnId: input.turnId,
+            message: `Tool call ${input.call.toolName} was rejected: ${message}`,
+            code: 'tool_dispatch_rejected',
+            severity: 'warning'
+          })
+          return {
+            item: makeToolResultItem({
+              id: `item_${input.call.callId}`,
+              turnId: input.turnId,
+              threadId: input.threadId,
+              callId: input.call.callId,
+              toolName: input.call.toolName,
+              toolKind: input.call.toolKind ?? 'tool_call',
+              output: {
+                code: 'tool_dispatch_rejected',
+                error: message,
+                guidance: 'Use only tools advertised in the current turn context.'
+              },
+              isError: true
+            }),
+            approved: false
+          }
+        }
+      }
+    )
+  }
+
+  /**
+   * A crashing tool handler must surface as an error tool_result the
+   * model can react to, not kill the whole turn. Only turn aborts are
+   * allowed to propagate.
+   */
+  private async executeToolCallSafely(input: {
+    threadId: string
+    turnId: string
+    call: ToolCallLike
+    context: ToolHostContext
+  }): Promise<ToolHostResult> {
+    try {
+      return await this.executeToolCall(input)
+    } catch (error) {
+      if (input.context.abortSignal.aborted) throw error
+      const message = error instanceof Error ? error.message : String(error)
+      await this.opts.events.record({
+        kind: 'error',
+        threadId: input.threadId,
+        turnId: input.turnId,
+        message: `Tool call ${input.call.toolName} failed: ${message}`,
+        code: 'tool_execution_failed',
+        severity: 'warning'
       })
+      return {
+        item: makeToolResultItem({
+          id: `item_${input.call.callId}`,
+          turnId: input.turnId,
+          threadId: input.threadId,
+          callId: input.call.callId,
+          toolName: input.call.toolName,
+          toolKind: input.call.toolKind ?? 'tool_call',
+          output: {
+            code: 'tool_execution_failed',
+            error: message,
+            guidance:
+              'The tool crashed while executing. Adjust the arguments or take a different approach instead of retrying the identical call.'
+          },
+          isError: true
+        }),
+        approved: false
+      }
+    }
+  }
+
+  private isRecoverableToolDispatchError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error)
+    return (
+      message.startsWith('unknown tool:') ||
+      message.includes(' is not provided by ') ||
+      message.includes(' is not advertised') ||
+      message.includes(' is disabled by policy')
     )
   }
 
@@ -1129,7 +1982,8 @@ export class AgentLoop {
         threadId,
         turnId,
         message: `Failed to sync plan checklist to thread todos: ${message}`,
-        code: 'todo_plan_sync_failed'
+        code: 'todo_plan_sync_failed',
+        severity: 'warning'
       })
     }
   }
@@ -1272,14 +2126,43 @@ export class AgentLoop {
     items: TurnItem[],
     model: string,
     signal: AbortSignal,
-    context: { threadId: string; turnId: string }
+    context: {
+      threadId: string
+      turnId: string
+      visibleItems: TurnItem[]
+      toolSpecs?: readonly ModelToolSpec[]
+    }
   ): Promise<TurnItem[]> {
+    // Restore the accurate provider token count after a process restart,
+    // when the in-memory pressure map is empty. Without this the next
+    // line falls back to the item-only estimator, which under-counts and
+    // can silently skip compaction until the context overruns the window.
+    await this.hydratePromptPressureIfCold(context.threadId, model)
     const pressure = this.consumePromptPressure(context.threadId, model)
     const thresholdModel = pressure?.model || model
-    const plan = this.opts.compactor.planCompaction(items, { model: thresholdModel, promptTokens: pressure?.promptTokens })
+    const overheadTokens = estimateRequestOverheadTokens({
+      systemPrompt: this.opts.prefix.systemPrompt,
+      prefix: this.opts.prefix.fewShots,
+      tools: context.toolSpecs
+    })
+    const plan = this.opts.compactor.planCompaction(items, {
+      model: thresholdModel,
+      promptTokens: pressure?.promptTokens,
+      overheadTokens
+    })
     if (!plan) return items
     const threadId = context.threadId
     const turnId = context.turnId
+    if (hasHooksForPhase(this.opts.hooks, 'PreCompact')) {
+      const observed = await runObserverHooks(this.opts.hooks, {
+        phase: 'PreCompact',
+        threadId,
+        turnId,
+        reason: String(plan.reason),
+        mode: String(plan.mode)
+      })
+      await this.recordHookWarnings(threadId, turnId, observed.warnings)
+    }
     let result = this.opts.compactor.compact({
       threadId,
       turnId,
@@ -1290,13 +2173,36 @@ export class AgentLoop {
       keepRecent: plan.keepRecent
     })
     if (result.replacedTokens > 0 && this.opts.contextCompaction?.summaryMode === 'model') {
-      const modelSummary = await this.summarizeCompactionWithModel({
+      const modelSummary = await summarizeCompactionWithModel({
         threadId,
         turnId,
         model,
+        modelClient: this.opts.model,
+        prefix: this.opts.prefix,
+        contextCompaction: this.opts.contextCompaction,
         items,
         heuristicSummary: result.summaryItem.kind === 'compaction' ? result.summaryItem.summary : '',
-        signal
+        signal,
+        recordUsage: async (usageSnapshot) => {
+          const usage = this.opts.usage.record(threadId, usageSnapshot)
+          await this.opts.events.record({
+            kind: 'usage',
+            threadId,
+            turnId,
+            model,
+            usage
+          })
+        },
+        recordFallback: async (message) => {
+          await this.opts.events.record({
+            kind: 'error',
+            threadId,
+            turnId,
+            message,
+            code: 'compaction_summary_fallback',
+            severity: 'warning'
+          })
+        }
       })
       if (signal.aborted) return items
       if (modelSummary) {
@@ -1312,13 +2218,15 @@ export class AgentLoop {
         })
       }
     }
-    // Persist the new compaction summary so the on-disk history
-    // reflects the folded state. SSE subscribers see the event
-    // through the event bus; the store append is async and safe to
-    // skip when no items need summarisation.
     if (result.replacedTokens > 0) {
+      const visibleItems = insertCompactionIntoVisibleHistory({
+        visibleItems: context.visibleItems,
+        compactedItems: result.next,
+        summaryItem: result.summaryItem
+      })
       this.opts.toolHost.clearReadTracker?.(threadId)
-      await this.opts.sessionStore.appendItem(threadId, result.summaryItem)
+      await this.opts.sessionStore.rewriteItems(threadId, visibleItems)
+      await this.rewriteThreadItemsFromSession(threadId, visibleItems)
       await this.opts.events.record({
         kind: 'compaction_completed',
         threadId,
@@ -1341,109 +2249,25 @@ export class AgentLoop {
     return result.next
   }
 
-  private async summarizeCompactionWithModel(input: {
-    threadId: string
-    turnId: string
-    model: string
-    items: TurnItem[]
-    heuristicSummary: string
-    signal: AbortSignal
-  }): Promise<string | undefined> {
-    if (input.signal.aborted) return undefined
-    const timeoutMs = Math.max(
-      1,
-      Math.floor(this.opts.contextCompaction?.summaryTimeoutMs ?? DEFAULT_COMPACTION_SUMMARY_TIMEOUT_MS)
-    )
-    const controller = new AbortController()
-    const onAbort = (): void => controller.abort()
-    const timeout = setTimeout(() => controller.abort(), timeoutMs)
-    input.signal.addEventListener('abort', onAbort, { once: true })
-    let fallbackRecorded = false
-    const recordFallback = async (message: string): Promise<void> => {
-      if (fallbackRecorded || input.signal.aborted) return
-      fallbackRecorded = true
-      await this.opts.events.record({
-        kind: 'error',
-        threadId: input.threadId,
-        turnId: input.turnId,
-        message,
-        code: 'compaction_summary_fallback'
-      })
+  private async rewriteThreadItemsFromSession(threadId: string, items: TurnItem[]): Promise<void> {
+    if (items.length === 0) return
+    const current = await this.opts.threadStore.get(threadId)
+    if (!current) return
+    const itemsByTurn = new Map<string, TurnItem[]>()
+    for (const item of items) {
+      const turnItems = itemsByTurn.get(item.turnId) ?? []
+      turnItems.push(item)
+      itemsByTurn.set(item.turnId, turnItems)
     }
-    try {
-      const requestItem = makeUserItem({
-        id: `item_${input.turnId}_compaction_summary_request`,
-        turnId: input.turnId,
-        threadId: input.threadId,
-        text: buildModelCompactionPrompt({
-          items: input.items,
-          heuristicSummary: input.heuristicSummary,
-          maxBytes: this.opts.contextCompaction?.summaryInputMaxBytes ?? DEFAULT_COMPACTION_SUMMARY_INPUT_MAX_BYTES
-        })
-      })
-      let text = ''
-      for await (const chunk of this.opts.model.stream({
-        threadId: input.threadId,
-        turnId: input.turnId,
-        model: input.model,
-        systemPrompt: this.opts.prefix.systemPrompt,
-        contextInstructions: [
-          'Summarize context for a history fold. Preserve durable task state and omit transient chatter.'
-        ],
-        prefix: this.opts.prefix.fewShots,
-        history: [requestItem],
-        tools: [],
-        stream: true,
-        maxTokens: Math.max(
-          1,
-          Math.floor(this.opts.contextCompaction?.summaryMaxTokens ?? DEFAULT_COMPACTION_SUMMARY_MAX_TOKENS)
-        ),
-        temperature: 0,
-        reasoningEffort: 'off',
-        abortSignal: controller.signal
-      })) {
-        if (input.signal.aborted) return undefined
-        if (controller.signal.aborted) {
-          await recordFallback(
-            `Model compaction summary timed out after ${timeoutMs}ms; using heuristic summary.`
-          )
-          return undefined
-        }
-        if (chunk.kind === 'assistant_text_delta') text += chunk.text
-        if (chunk.kind === 'usage') {
-          const usage = this.opts.usage.record(input.threadId, chunk.usage)
-          await this.opts.events.record({
-            kind: 'usage',
-            threadId: input.threadId,
-            turnId: input.turnId,
-            model: input.model,
-            usage
-          })
-        }
-        if (chunk.kind === 'error') {
-          await recordFallback(
-            `Model compaction summary failed${chunk.code ? ` (${chunk.code})` : ''}: ${chunk.message}. Using heuristic summary.`
-          )
-          return undefined
-        }
-      }
-      const summary = text.trim()
-      if (!summary) {
-        await recordFallback('Model compaction summary returned empty text; using heuristic summary.')
-        return undefined
-      }
-      return summary ? summary : undefined
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      const reason = controller.signal.aborted && !input.signal.aborted
-        ? `Model compaction summary timed out after ${timeoutMs}ms`
-        : `Model compaction summary threw: ${message}`
-      await recordFallback(`${reason}; using heuristic summary.`)
-      return undefined
-    } finally {
-      clearTimeout(timeout)
-      input.signal.removeEventListener('abort', onAbort)
-    }
+    let changed = false
+    const turns = current.turns.map((turn) => {
+      const sessionItems = itemsByTurn.get(turn.id)
+      if (!sessionItems) return turn
+      changed = true
+      return { ...turn, items: placeCompactionsAtTurnEnd(sessionItems) }
+    })
+    if (!changed) return
+    await this.opts.threadStore.upsert(touchThread({ ...current, turns }, this.opts.nowIso()))
   }
 
   private async recordTokenEconomySavings(input: {
@@ -1455,14 +2279,8 @@ export class AgentLoop {
   }): Promise<void> {
     const savedTokens = Math.max(0, Math.floor(input.rawInputTokens - input.sentInputTokens))
     if (savedTokens <= 0) return
-    const estimatedCost = estimateDeepseekInputTokenCost({
-      model: input.model,
-      inputTokens: savedTokens
-    })
     const usage = this.opts.usage.recordTokenEconomySavings(input.threadId, {
-      tokenEconomySavingsTokens: savedTokens,
-      ...(estimatedCost ? { tokenEconomySavingsUsd: estimatedCost.costUsd } : {}),
-      ...(estimatedCost ? { tokenEconomySavingsCny: estimatedCost.costCny } : {})
+      tokenEconomySavingsTokens: savedTokens
     })
     await this.opts.events.record({
       kind: 'usage',
@@ -1496,6 +2314,42 @@ export class AgentLoop {
     this.promptTokenPressure.set(threadId, { model, promptTokens })
   }
 
+  /**
+   * Seed `promptTokenPressure` from persisted usage the first time a thread
+   * is touched in this process. The pressure map is in-memory only, so after
+   * a restart the compaction trigger would otherwise rely on the item-only
+   * estimator (which omits the system prompt and tool schemas) and could
+   * skip compaction for an already-oversized thread. `loadUsageRecords`
+   * returns per-request deltas ordered oldest-first, so the last positive
+   * entry is the most recent request's prompt size — the best available
+   * proxy for the current context pressure. Best-effort: any failure leaves
+   * the estimator (plus overhead floor) as the fallback.
+   */
+  private async hydratePromptPressureIfCold(threadId: string, fallbackModel: string): Promise<void> {
+    if (!threadId) return
+    if (this.promptTokenPressure.has(threadId)) return
+    if (this.hydratedPressureThreads.has(threadId)) return
+    this.hydratedPressureThreads.add(threadId)
+    const loadUsageRecords = this.opts.sessionStore.loadUsageRecords
+    if (typeof loadUsageRecords !== 'function') return
+    try {
+      const records = await loadUsageRecords.call(this.opts.sessionStore, { threadId })
+      let restored: { model: string; promptTokens: number } | undefined
+      for (const record of records) {
+        if (record.threadId !== threadId) continue
+        const promptTokens = Math.floor(record.usage?.promptTokens ?? 0)
+        if (promptTokens > 0) {
+          restored = { model: record.model || fallbackModel, promptTokens }
+        }
+      }
+      if (restored && !this.promptTokenPressure.has(threadId)) {
+        this.promptTokenPressure.set(threadId, restored)
+      }
+    } catch {
+      // Best-effort restore; the estimator + overhead floor still applies.
+    }
+  }
+
   private async recordToolCatalogDrift(input: {
     threadId: string
     turnId: string
@@ -1510,7 +2364,8 @@ export class AgentLoop {
       threadId: input.threadId,
       turnId: input.turnId,
       message: input.message,
-      code: 'tool_catalog_changed'
+      code: 'tool_catalog_changed',
+      severity: 'info'
     }))
     await this.opts.events.record({
       kind: 'tool_catalog_changed',
@@ -1531,6 +2386,7 @@ export class AgentLoop {
     model: string
     activeSkillIds: readonly string[]
     allowedToolNames?: readonly string[]
+    userInputDisabled?: boolean
     fingerprint: string
     toolNames: string[]
     toolHashes: Record<string, string>
@@ -1541,7 +2397,8 @@ export class AgentLoop {
       mode: input.mode,
       model: input.model,
       activeSkillIds: [...input.activeSkillIds].sort(),
-      allowedToolNames: input.allowedToolNames ? [...input.allowedToolNames].sort() : []
+      allowedToolNames: input.allowedToolNames ? [...input.allowedToolNames].sort() : [],
+      userInputDisabled: input.userInputDisabled === true
     })
     const current: ToolCatalogSnapshot = {
       fingerprint: input.fingerprint,
@@ -1549,7 +2406,12 @@ export class AgentLoop {
       toolHashes: input.toolHashes
     }
     const previous = this.toolCatalogSnapshots.get(key)
+    this.toolCatalogSnapshots.delete(key)
     this.toolCatalogSnapshots.set(key, current)
+    if (this.toolCatalogSnapshots.size > MAX_TOOL_CATALOG_SNAPSHOTS) {
+      const oldest = this.toolCatalogSnapshots.keys().next().value
+      if (oldest !== undefined) this.toolCatalogSnapshots.delete(oldest)
+    }
     if (!previous || previous.fingerprint === input.fingerprint) return { kind: 'none' }
     return isAdditiveToolCatalogChange(previous, current)
       ? { kind: 'additive', previous }
@@ -1595,14 +2457,16 @@ export class AgentLoop {
         threadId,
         turnId,
         message,
-        code: 'budget_warning'
+        code: 'budget_warning',
+        severity: 'warning'
       }))
       await this.opts.events.record({
         kind: 'error',
         threadId,
         turnId,
         message,
-        code: 'budget_warning'
+        code: 'budget_warning',
+        severity: 'warning'
       })
     }
     return 'allow'
@@ -1689,7 +2553,8 @@ export class AgentLoop {
           mimeType: attachment.mimeType,
           dataBase64: attachment.data.toString('base64'),
           ...(attachment.width ? { width: attachment.width } : {}),
-          ...(attachment.height ? { height: attachment.height } : {})
+          ...(attachment.height ? { height: attachment.height } : {}),
+          ...(attachment.localFilePath ? { localFilePath: attachment.localFilePath } : {})
         })
         continue
       }
@@ -1742,6 +2607,7 @@ function buildTextAttachmentFallback(
       byteSize: fallback.byteSize,
       ...(fallback.width ? { width: fallback.width } : {}),
       ...(fallback.height ? { height: fallback.height } : {}),
+      ...(attachment.localFilePath ? { localFilePath: attachment.localFilePath } : {}),
       ...(fallback.wasCompressed !== undefined ? { wasCompressed: fallback.wasCompressed } : {})
     }
   }
@@ -1760,6 +2626,7 @@ function buildTextAttachmentFallback(
     byteSize: attachment.byteSize,
     ...(attachment.width ? { width: attachment.width } : {}),
     ...(attachment.height ? { height: attachment.height } : {}),
+    ...(attachment.localFilePath ? { localFilePath: attachment.localFilePath } : {}),
     wasCompressed: false
   }
 }
@@ -1796,10 +2663,50 @@ function attachmentRequestPipelineDetails(input: {
   }
 }
 
+function imageGenerationReferenceInstructions(input: {
+  imageAttachments: readonly ModelInputAttachment[]
+  textFallbacks: readonly ModelTextAttachmentFallback[]
+  workspace: string
+  tools: readonly Pick<ModelToolSpec, 'name'>[]
+}): string[] {
+  if (!input.tools.some((tool) => tool.name === 'generate_image')) return []
+
+  const references = [...input.imageAttachments, ...input.textFallbacks]
+    .filter((attachment) => attachment.mimeType.startsWith('image/'))
+    .map((attachment) => ({
+      name: attachment.name,
+      path: workspaceRelativeAttachmentPath(attachment.localFilePath, input.workspace)
+    }))
+    .filter((attachment): attachment is { name: string; path: string } => Boolean(attachment.path))
+
+  if (references.length === 0) return []
+  return [[
+    'Image-to-image reference images are available for this turn:',
+    ...references.map((reference) => `- ${reference.name}: ${reference.path}`),
+    'For image edits, restyles, redraws, or transformations, call `generate_image` with the matching workspace-relative path(s) in `reference_image_paths`.'
+  ].join('\n')]
+}
+
+function workspaceRelativeAttachmentPath(
+  localFilePath: string | undefined,
+  workspace: string
+): string | null {
+  const workspaceRoot = workspace.trim()
+  const rawPath = localFilePath?.trim()
+  if (!workspaceRoot || !rawPath) return null
+
+  const workspaceAbsolute = resolve(workspaceRoot)
+  const fileAbsolute = isAbsolute(rawPath) ? resolve(rawPath) : resolve(workspaceAbsolute, rawPath)
+  const relativePath = relative(workspaceAbsolute, fileAbsolute)
+  if (!relativePath || relativePath.startsWith('..') || isAbsolute(relativePath)) return null
+  return relativePath.replace(/\\/g, '/')
+}
+
 function normalizeApprovalPolicy(
   value: string | undefined
 ): ToolHostContext['approvalPolicy'] {
   switch (value) {
+    case 'on-request':
     case 'never':
     case 'auto':
     case 'suggest':
@@ -1807,6 +2714,20 @@ function normalizeApprovalPolicy(
       return value
     default:
       return DEFAULT_APPROVAL_POLICY
+  }
+}
+
+function normalizeSandboxMode(
+  value: string | undefined
+): NonNullable<ToolHostContext['sandboxMode']> {
+  switch (value) {
+    case 'read-only':
+    case 'workspace-write':
+    case 'danger-full-access':
+    case 'external-sandbox':
+      return value
+    default:
+      return DEFAULT_SANDBOX_MODE
   }
 }
 
@@ -1841,95 +2762,6 @@ function buildToolCatalogDriftMessage(toolCatalog: {
   ].filter(Boolean).join(' ')
 }
 
-function buildModelCompactionPrompt(input: {
-  items: readonly TurnItem[]
-  heuristicSummary: string
-  maxBytes: number
-}): string {
-  const transcript = fitTextToBytes(
-    input.items
-      .map(compactionPromptLine)
-      .filter((line) => line.length > 0)
-      .join('\n'),
-    Math.max(1_024, input.maxBytes)
-  )
-  return [
-    'Summarize the following Kun conversation history for a context fold.',
-    'Preserve user goals, requirements, decisions, files touched, tool outcomes, errors, constraints, active/pinned skills, and unresolved next steps.',
-    'Do not invent facts. Do not include generic advice. Prefer concise bullets grouped by topic.',
-    '',
-    'Existing heuristic summary to cross-check:',
-    input.heuristicSummary.trim() || '(none)',
-    '',
-    'History excerpt to fold:',
-    transcript || '(empty)'
-  ].join('\n')
-}
-
-function compactionPromptLine(item: TurnItem): string {
-  switch (item.kind) {
-    case 'user_message':
-      return `[user] ${clipForPrompt(item.text, 2_000)}`
-    case 'assistant_text':
-      return `[assistant] ${clipForPrompt(item.text, 2_000)}`
-    case 'assistant_reasoning':
-      return ''
-    case 'tool_call':
-      return `[tool_call:${item.toolName}] ${clipForPrompt(item.summary || stringifyForPrompt(item.arguments), 1_200)}`
-    case 'tool_result':
-      return `[tool_result:${item.toolName}${item.isError ? ':error' : ''}] ${clipForPrompt(stringifyForPrompt(item.output), 2_000)}`
-    case 'approval':
-      return `[approval:${item.status}:${item.toolName}] ${clipForPrompt(item.summary, 800)}`
-    case 'user_input':
-      return `[user_input:${item.status}] ${clipForPrompt(item.prompt, 800)}`
-    case 'compaction':
-      return item.replacedTokens > 0 ? `[compaction] ${clipForPrompt(item.summary, 2_000)}` : ''
-    case 'review':
-      return `[review:${item.title}] ${clipForPrompt(item.reviewText || stringifyForPrompt(item.output), 2_000)}`
-    case 'error':
-      return `[error${item.code ? `:${item.code}` : ''}] ${clipForPrompt(item.message, 1_200)}`
-  }
-}
-
-function stringifyForPrompt(value: unknown): string {
-  if (typeof value === 'string') return value
-  if (value == null) return ''
-  try {
-    return JSON.stringify(value)
-  } catch {
-    return String(value)
-  }
-}
-
-function clipForPrompt(text: string, maxChars: number): string {
-  const compact = text.replace(/\s+/g, ' ').trim()
-  if (compact.length <= maxChars) return compact
-  return `${compact.slice(0, Math.max(0, maxChars - 3)).trim()}...`
-}
-
-function fitTextToBytes(text: string, maxBytes: number): string {
-  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text
-  let used = 0
-  let out = ''
-  for (const char of text) {
-    const bytes = Buffer.byteLength(char, 'utf8')
-    if (used + bytes > maxBytes) break
-    out += char
-    used += bytes
-  }
-  return `${out.trimEnd()}\n...[truncated for model compaction summary]`
-}
-
-function effectiveHistoryAfterLatestCompaction(items: TurnItem[]): TurnItem[] {
-  for (let index = items.length - 1; index >= 0; index -= 1) {
-    const item = items[index]
-    if (item.kind === 'compaction' && item.replacedTokens > 0) {
-      return items.slice(index)
-    }
-  }
-  return items
-}
-
 function resolveModelMode(...candidates: Array<string | undefined>): { kind: 'fixed'; model: string } | { kind: 'auto' } {
   for (const candidate of candidates) {
     const trimmed = candidate?.trim() ?? ''
@@ -1944,6 +2776,19 @@ function resolveModelMode(...candidates: Array<string | undefined>): { kind: 'fi
 function normalizeRequestedReasoningEffort(effort: string | undefined): string | undefined {
   const normalized = effort?.trim().toLowerCase()
   return normalized && normalized !== 'auto' ? normalized : undefined
+}
+
+function sanitizeProviderBaseUrl(baseUrl: string): string {
+  try {
+    const url = new URL(baseUrl)
+    url.username = ''
+    url.password = ''
+    url.search = ''
+    url.hash = ''
+    return url.toString().replace(/\/$/, '')
+  } catch {
+    return baseUrl.replace(/[?#].*$/, '').replace(/\/+$/, '')
+  }
 }
 
 function autoModelRouteKey(threadId: string, turnId: string): string {

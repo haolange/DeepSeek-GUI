@@ -1,13 +1,20 @@
 import { randomUUID } from 'node:crypto'
 import {
   DEFAULT_WRITE_INLINE_COMPLETION_MAX_TOKENS,
+  isCustomModelEndpointFormat,
+  modelEndpointPath,
+  resolveModelProviderProxyUrl,
+  resolveWriteInlineCompletionEndpointFormat,
   resolveWriteInlineCompletionApiKey,
   resolveWriteInlineCompletionBaseUrl,
   resolveWriteInlineCompletionModel,
+  resolveModelEndpointFormat,
+  type ModelEndpointFormat,
   type AppSettingsV1
 } from '../../shared/app-settings'
 import {
   upstreamDeepSeekFimCompletionsUrl,
+  upstreamOpenAiCustomEndpointUrl,
   upstreamOpenAiChatCompletionsUrl
 } from '../../shared/openai-compat-url'
 import type {
@@ -20,14 +27,31 @@ import type {
 import type { WriteInlineEditRecentEdit } from '../../shared/write-inline-edit'
 import {
   retrieveWriteInlineCompletionContext,
-  type WriteRetrievalContext
+  type WriteRetrievalContext,
+  type WriteRetrievalSnippet
 } from './write-retrieval-service'
+import { fetchWithOptionalProxy } from '../proxy-fetch'
 
 const INLINE_COMPLETION_TIMEOUT_MS = 12_000
 const MAX_INLINE_COMPLETION_DEBUG_ENTRIES = 120
 const MAX_DEBUG_TEXT_CHARS = 80_000
 const INPUT_BOUNDARY_MARKERS = ['PREFIX', 'SUFFIX', 'EDIT_SCOPE'] as const
 const OUTPUT_ACTION_MARKERS = ['SHORT', 'LONG', 'EDIT'] as const
+// Every protocol marker name, longest first so the alternation prefers EDIT_SCOPE
+// over EDIT. Used to terminate a marked body that lost its closing >>> and to
+// scrub malformed marker soup that must never reach the ghost text.
+const PROTOCOL_MARKER_NAMES = [...INPUT_BOUNDARY_MARKERS, ...OUTPUT_ACTION_MARKERS]
+  .slice()
+  .sort((a, b) => b.length - a.length)
+  .join('|')
+const PROTOCOL_MARKER_OPENER = new RegExp(`<<<[ \\t]*(?:${PROTOCOL_MARKER_NAMES})\\b`, 'i')
+// The placeholder lines from buildResponseProtocolPromptBlock(). A weak model
+// sometimes parrots them verbatim; such an echo is never a real suggestion.
+const PROTOCOL_PLACEHOLDER_BODIES = new Set([
+  'short text to insert at the cursor',
+  'longer continuation to insert at the cursor',
+  'replacement text for the editable local scope'
+])
 
 type ChatCompletionResponse = {
   choices?: Array<{
@@ -38,10 +62,21 @@ type ChatCompletionResponse = {
   }>
 }
 
+type ResponsesApiResponse = {
+  output_text?: string
+  output?: Array<Record<string, unknown>>
+}
+
+type AnthropicMessageResponse = {
+  content?: Array<Record<string, unknown>>
+}
+
 type ChatCompletionMessage = {
   role: 'system' | 'user'
   content: string
 }
+
+type WriteInlineProviderResponseFormat = ModelEndpointFormat | 'fim_completions'
 
 function shouldDisableThinkingForInlineCompletion(model: string): boolean {
   const normalized = model.trim().toLowerCase()
@@ -154,7 +189,7 @@ function markerBlock(marker: string, text = ''): string {
 }
 
 function sanitizePromptLine(text = ''): string {
-  return String(text || '').replace(/\r\n?/g, '\n').replace(/-->/g, '--\\>')
+  return String(text || '').replace(/\r\n?/g, '\n').split('-->').join('--\\>')
 }
 
 function compactText(text = ''): string {
@@ -264,10 +299,19 @@ function buildRetrievalPromptBlock(
     `Query keywords: ${retrieval.keywords.join(', ')}`
   ]
 
+  const formatSnippetLocation = (snippet: WriteRetrievalSnippet): string => {
+    if (snippet.location.kind === 'pdf') {
+      return snippet.location.pageStart === snippet.location.pageEnd
+        ? `${snippet.path}#page=${snippet.location.pageStart}`
+        : `${snippet.path}#page=${snippet.location.pageStart}-${snippet.location.pageEnd}`
+    }
+    return snippet.location.lineStart === snippet.location.lineEnd
+      ? `${snippet.path}:${snippet.location.lineStart}`
+      : `${snippet.path}:${snippet.location.lineStart}-${snippet.location.lineEnd}`
+  }
+
   retrieval.snippets.forEach((snippet, index) => {
-    const location = snippet.lineStart === snippet.lineEnd
-      ? `${snippet.path}:${snippet.lineStart}`
-      : `${snippet.path}:${snippet.lineStart}-${snippet.lineEnd}`
+    const location = formatSnippetLocation(snippet)
     lines.push('')
     lines.push(`[${index + 1}] ${location}`)
     if (snippet.title) lines.push(`Title: ${sanitizePromptLine(snippet.title)}`)
@@ -284,7 +328,7 @@ export function buildWriteInlineCompletionPrompt(
 ): string {
   const mode = resolveMode(request)
   const lines = [
-    '<!-- DeepSeek GUI inline completion.',
+    '<!-- Kun inline completion.',
     'Complete the text at the cursor.',
     'The boundary blocks below identify local context, but the response must be plain insertable text only.',
     'Return only the text to insert at the cursor.',
@@ -359,7 +403,7 @@ export function buildWriteInlineCompletionChatMessages(
     {
       role: 'system',
       content: [
-        'You are DeepSeek GUI inline writing. You perform local writing completion and in-place text edits.',
+        'You are Kun inline writing. You perform local writing completion and in-place text edits.',
         'For edit tasks, reason from <<<PREFIX ... >>>, <<<EDIT_SCOPE ... >>>, and <<<SUFFIX ... >>>, then return only the replacement inside <<<EDIT ... >>>.',
         'Do not include explanations, markdown fences outside the marked action, before/after labels, or unchanged surrounding text outside the chosen action.'
       ].join('\n')
@@ -377,17 +421,191 @@ function debugPromptFromMessages(messages: ChatCompletionMessage[]): string {
     .join('\n\n')
 }
 
-function providerTextFromResponse(responseText: string): string {
-  let parsed: ChatCompletionResponse
+function compatibleModelEndpointUrl(baseUrl: string, endpointFormat: ModelEndpointFormat): string {
+  if (isCustomModelEndpointFormat(endpointFormat)) return upstreamOpenAiCustomEndpointUrl(baseUrl)
+  if (endpointFormat === 'chat_completions') return upstreamOpenAiChatCompletionsUrl(baseUrl)
+  const path = modelEndpointPath(endpointFormat)
+  const normalized = trimTrailingSlashes(baseUrl.trim())
+  if (!normalized) return `/v1/${path}`
+  if (normalized.toLowerCase().endsWith(`/${path}`)) return normalized
+  const withoutEndpoint = stripKnownModelEndpointPath(normalized)
+  const lastSegment = withoutEndpoint.split('/').pop()?.toLowerCase() ?? ''
+  if (lastSegment === 'beta') {
+    return `${withoutEndpoint.slice(0, -'/beta'.length)}/v1/${path}`
+  }
+  if (isVersionSegment(lastSegment)) {
+    return `${withoutEndpoint}/${path}`
+  }
+  return `${withoutEndpoint}/v1/${path}`
+}
+
+function stripKnownModelEndpointPath(baseUrl: string): string {
+  const lower = baseUrl.toLowerCase()
+  for (const path of ['chat/completions', 'responses', 'messages']) {
+    if (lower.endsWith(`/${path}`)) {
+      return trimTrailingSlashes(baseUrl.slice(0, -path.length))
+    }
+  }
+  return baseUrl
+}
+
+function isDeepSeekInlineCompletionBaseUrl(baseUrl: string): boolean {
+  const hostname = baseUrlHostname(baseUrl)
+  return hostname === 'deepseek.com' || hostname.endsWith('.deepseek.com')
+}
+
+function baseUrlHostname(baseUrl: string): string {
+  const trimmed = baseUrl.trim()
+  if (!trimmed) return ''
+  for (const candidate of [trimmed, `https://${trimmed}`]) {
+    try {
+      return new URL(candidate).hostname.toLowerCase()
+    } catch {
+      // Try the next normalized form.
+    }
+  }
+  return ''
+}
+
+function trimTrailingSlashes(value: string): string {
+  let end = value.length
+  while (end > 0 && value.charCodeAt(end - 1) === 47) end -= 1
+  return end === value.length ? value : value.slice(0, end)
+}
+
+function isVersionSegment(value: string): boolean {
+  if (value.length < 2 || value[0] !== 'v') return false
+  for (let index = 1; index < value.length; index += 1) {
+    const code = value.charCodeAt(index)
+    if (code < 48 || code > 57) return false
+  }
+  return true
+}
+
+function buildProviderHeaders(apiKey: string, responseFormat: WriteInlineProviderResponseFormat): Record<string, string> {
+  const headers: Record<string, string> = {
+    Accept: 'application/json',
+    Authorization: `Bearer ${apiKey}`,
+    'Content-Type': 'application/json'
+  }
+  if (responseFormat === 'messages') {
+    headers['x-api-key'] = apiKey
+    headers['anthropic-version'] = '2023-06-01'
+  }
+  return headers
+}
+
+function buildAnthropicMessages(messages: ChatCompletionMessage[]): {
+  system: string
+  messages: Array<{ role: 'user' | 'assistant'; content: string }>
+} {
+  const system: string[] = []
+  const out: Array<{ role: 'user' | 'assistant'; content: string }> = []
+  for (const message of messages) {
+    if (message.role === 'system') {
+      system.push(message.content)
+      continue
+    }
+    out.push({ role: 'user', content: message.content })
+  }
+  return { system: system.join('\n\n'), messages: out }
+}
+
+function buildProviderRequestBody(input: {
+  responseFormat: WriteInlineProviderResponseFormat
+  model: string
+  messages: ChatCompletionMessage[] | null
+  prompt: string
+  suffix: string
+  maxTokens: number
+}): Record<string, unknown> {
+  if (input.responseFormat === 'fim_completions') {
+    return {
+      model: input.model,
+      prompt: input.prompt,
+      suffix: input.suffix,
+      max_tokens: input.maxTokens
+    }
+  }
+  const messages = input.messages ?? [
+    { role: 'user' as const, content: input.prompt }
+  ]
+  if (input.responseFormat === 'messages') {
+    const converted = buildAnthropicMessages(messages)
+    return {
+      model: input.model,
+      messages: converted.messages,
+      max_tokens: input.maxTokens,
+      ...(converted.system ? { system: converted.system } : {})
+    }
+  }
+  if (input.responseFormat === 'responses') {
+    return {
+      model: input.model,
+      input: messages.map((message) => ({
+        role: message.role,
+        content: message.content
+      })),
+      max_output_tokens: input.maxTokens
+    }
+  }
+  return {
+    model: input.model,
+    messages,
+    max_tokens: input.maxTokens,
+    ...(shouldDisableThinkingForInlineCompletion(input.model)
+      ? { thinking: { type: 'disabled' } }
+      : {})
+  }
+}
+
+function providerTextFromResponse(
+  responseText: string,
+  format: WriteInlineProviderResponseFormat = 'chat_completions'
+): string {
+  let parsed: ChatCompletionResponse | ResponsesApiResponse | AnthropicMessageResponse
   try {
-    parsed = JSON.parse(responseText) as ChatCompletionResponse
+    parsed = JSON.parse(responseText) as ChatCompletionResponse | ResponsesApiResponse | AnthropicMessageResponse
   } catch {
     throw new Error('Inline completion provider returned non-JSON data.')
   }
-  const firstChoice = parsed.choices?.[0]
+  if (format === 'responses') {
+    return textFromResponsesPayload(parsed as ResponsesApiResponse)
+  }
+  if (format === 'messages') {
+    return textFromAnthropicPayload(parsed as AnthropicMessageResponse)
+  }
+  const chatPayload = parsed as ChatCompletionResponse
+  const firstChoice = chatPayload.choices?.[0]
   if (typeof firstChoice?.text === 'string') return firstChoice.text
   const first = firstChoice?.message?.content
   return flattenMessageContent(first)
+}
+
+function textFromResponsesPayload(payload: ResponsesApiResponse): string {
+  if (typeof payload.output_text === 'string') return payload.output_text
+  const parts: string[] = []
+  for (const item of payload.output ?? []) {
+    const content = item.content
+    if (!Array.isArray(content)) continue
+    for (const block of content) {
+      if (!block || typeof block !== 'object') continue
+      const record = block as Record<string, unknown>
+      const text = record.text
+      if (typeof text === 'string') parts.push(text)
+    }
+  }
+  return parts.join('')
+}
+
+function textFromAnthropicPayload(payload: AnthropicMessageResponse): string {
+  const parts: string[] = []
+  for (const block of payload.content ?? []) {
+    if (block.type === 'text' && typeof block.text === 'string') {
+      parts.push(block.text)
+    }
+  }
+  return parts.join('')
 }
 
 export type WriteInlineActionEditTarget = {
@@ -441,15 +659,50 @@ function containsInputBoundaryEcho(text: string): boolean {
     text.includes('Return only the text to insert at the cursor.')
 }
 
+/**
+ * Strip protocol marker tokens that leaked into a malformed response so they can
+ * never surface as ghost text. Guarded on an actual marker opener being present,
+ * so ordinary prose that merely contains ">>>" (a REPL transcript, a merge
+ * conflict marker) is returned untouched.
+ */
+function stripActionMarkerArtifacts(text: string): string {
+  if (!PROTOCOL_MARKER_OPENER.test(text)) return text
+  return text
+    .replace(new RegExp(`<<<[ \\t]*(?:${PROTOCOL_MARKER_NAMES})\\b[ \\t]*`, 'gi'), '')
+    .replace(/>>>/g, '')
+    // Drop any line that is a bare echo of the protocol placeholder text, so a
+    // full-template parrot collapses to empty rather than leaking the sample lines.
+    .split('\n')
+    .filter((line) => !PROTOCOL_PLACEHOLDER_BODIES.has(line.trim().toLowerCase()))
+    .join('\n')
+    .replace(/[ \t]+$/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
 function parseMarkedActionBlock(
   text: string,
   options: { editTarget?: WriteInlineActionEditTarget }
 ): WriteInlineCompletionAction | null {
+  // A body ends at the first closing >>> or the next protocol opener, whichever
+  // comes first, so a block that dropped its >>> never swallows later markers.
+  const bodyTerminator = new RegExp(`>>>|<<<[ \\t]*(?:${PROTOCOL_MARKER_NAMES})\\b`, 'i')
   for (const marker of OUTPUT_ACTION_MARKERS) {
-    const exact = new RegExp(`^<<<[ \\t]*${marker}[ \\t]*\\n([\\s\\S]*?)\\n?>>>$`, 'i').exec(text)
-    const embedded = exact ?? new RegExp(`<<<[ \\t]*${marker}[ \\t]*\\n([\\s\\S]*?)\\n?>>>`, 'i').exec(text)
-    if (!embedded) continue
-    const body = trimMarkerPadding(embedded[1])
+    // Tolerant opener: trailing spaces/tabs and an optional single newline after
+    // the keyword, so same-line bodies (<<<SHORT text >>>) parse too.
+    const opener = new RegExp(`<<<[ \\t]*${marker}\\b[ \\t]*\\n?`, 'i').exec(text)
+    if (!opener) continue
+    const rest = text.slice(opener.index + opener[0].length)
+    const end = rest.search(bodyTerminator)
+    // Drop horizontal whitespace abutting the close marker, then a single
+    // trailing newline; leading whitespace is kept so a continuation like
+    // " next words" stays intact.
+    const body = trimMarkerPadding((end >= 0 ? rest.slice(0, end) : rest).replace(/[ \t]+$/, ''))
+    // Skip empty blocks (a contentless SHORT must not shadow a filled LONG, and
+    // a pure marker skeleton must fall through to the scrubbing fallback below)
+    // and skip a verbatim echo of the protocol's own placeholder text.
+    const condensed = body.trim().toLowerCase()
+    if (!condensed || PROTOCOL_PLACEHOLDER_BODIES.has(condensed)) continue
     if (marker === 'SHORT') return completionAction(body, 'short')
     if (marker === 'LONG') return completionAction(body, 'long')
     return editAction(body, options.editTarget)
@@ -515,9 +768,13 @@ export function parseWriteInlineAction(
   const labeledEdit = trimmed.match(/^(?:edit|replacement|replace|new text|edited text|替换文本|修改后|修改|替换)[:：]\s*([\s\S]*)$/i)
   if (labeledEdit) return editAction(labeledEdit[1], options.editTarget)
 
+  // Last resort: treat the response as plain insertable text, but scrub any
+  // leaked protocol markers first so a malformed skeleton (">>> <<<LONG >>>
+  // <<<EDIT") degrades to an empty completion instead of polluting the ghost text.
+  const scrubbed = stripActionMarkerArtifacts(normalized)
   return fallbackKind === 'edit'
-    ? editAction(normalized, options.editTarget)
-    : completionAction(normalized, fallbackKind === 'long' ? 'long' : 'short')
+    ? editAction(scrubbed, options.editTarget)
+    : completionAction(scrubbed, fallbackKind === 'long' ? 'long' : 'short')
 }
 
 export function extractWriteInlineAction(
@@ -525,9 +782,10 @@ export function extractWriteInlineAction(
   options: {
     fallbackKind?: WriteInlineCompletionAction['kind']
     editTarget?: WriteInlineActionEditTarget
+    responseFormat?: WriteInlineProviderResponseFormat
   } = {}
 ): WriteInlineCompletionAction {
-  return parseWriteInlineAction(providerTextFromResponse(responseText), options)
+  return parseWriteInlineAction(providerTextFromResponse(responseText, options.responseFormat), options)
 }
 
 export async function requestWriteInlineCompletion(
@@ -551,9 +809,24 @@ export async function requestWriteInlineCompletion(
   const actionMayEdit = Boolean(request.editCandidate && request.recentEdits?.length)
   const useChatCompletions = mode === 'edit' || actionMayEdit
   const baseUrl = resolveWriteInlineCompletionBaseUrl(settings)
-  const url = useChatCompletions
-    ? upstreamOpenAiChatCompletionsUrl(baseUrl)
-    : upstreamDeepSeekFimCompletionsUrl(baseUrl)
+  const configuredEndpointFormat = resolveWriteInlineCompletionEndpointFormat(settings)
+  const endpointFormat = resolveModelEndpointFormat(configuredEndpointFormat, baseUrl)
+  if (!endpointFormat) {
+    return {
+      ok: false,
+      message: 'Custom full endpoint URL must end with /chat/completions, /completions, /responses, or /messages.'
+    }
+  }
+  const useFimCompletions =
+    !useChatCompletions &&
+    configuredEndpointFormat === 'chat_completions' &&
+    isDeepSeekInlineCompletionBaseUrl(baseUrl)
+  const responseFormat: WriteInlineProviderResponseFormat = useFimCompletions
+    ? 'fim_completions'
+    : endpointFormat
+  const url = useFimCompletions
+    ? upstreamDeepSeekFimCompletionsUrl(baseUrl)
+    : compatibleModelEndpointUrl(baseUrl, configuredEndpointFormat)
   const maxTokens = mode === 'long' || mode === 'edit' || actionMayEdit
     ? settings.write.inlineCompletion.longMaxTokens || settings.write.inlineCompletion.maxTokens || DEFAULT_WRITE_INLINE_COMPLETION_MAX_TOKENS
     : settings.write.inlineCompletion.maxTokens || DEFAULT_WRITE_INLINE_COMPLETION_MAX_TOKENS
@@ -562,9 +835,9 @@ export async function requestWriteInlineCompletion(
     : await retrieveWriteInlineCompletionContext(request, {
         maxSnippets: mode === 'long' || mode === 'edit' || actionMayEdit ? 5 : 3
       }).catch(() => null)
-  const messages = useChatCompletions
-    ? buildWriteInlineCompletionChatMessages(request, retrieval)
-    : null
+  const messages = useFimCompletions
+    ? null
+    : buildWriteInlineCompletionChatMessages(request, retrieval)
   const prompt = messages
     ? debugPromptFromMessages(messages)
     : buildWriteInlineCompletionPrompt(request, retrieval)
@@ -583,31 +856,20 @@ export async function requestWriteInlineCompletion(
   }
 
   try {
-    const body = useChatCompletions
-      ? {
-          model,
-          messages,
-          max_tokens: maxTokens,
-          ...(shouldDisableThinkingForInlineCompletion(model)
-            ? { thinking: { type: 'disabled' } }
-            : {})
-        }
-      : {
-          model,
-          prompt,
-          suffix: request.suffix,
-          max_tokens: maxTokens
-        }
-    const response = await fetch(url, {
+    const body = buildProviderRequestBody({
+      responseFormat,
+      model,
+      messages,
+      prompt,
+      suffix: request.suffix,
+      maxTokens
+    })
+    const response = await fetchWithOptionalProxy(url, {
       method: 'POST',
-      headers: {
-        Accept: 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json'
-      },
+      headers: buildProviderHeaders(apiKey, responseFormat),
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(INLINE_COMPLETION_TIMEOUT_MS)
-    })
+    }, resolveModelProviderProxyUrl(settings))
     const text = await response.text()
     if (!response.ok) {
       appendInlineCompletionDebugEntry({
@@ -627,6 +889,7 @@ export async function requestWriteInlineCompletion(
 
     const action = extractWriteInlineAction(text, {
       fallbackKind: mode,
+      responseFormat,
       editTarget: request.editCandidate
         ? {
             from: request.editCandidate.from,

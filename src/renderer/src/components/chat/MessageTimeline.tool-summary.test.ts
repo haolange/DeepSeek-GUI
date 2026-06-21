@@ -1,9 +1,10 @@
-import { describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it } from 'vitest'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import type { ChatBlock, ToolBlock } from '../../agent/types'
-import { summarizeToolBlock } from './MessageTimeline'
-import { MessageBubble } from './message-timeline-bubbles'
+import type { ChatBlock, NormalizedThread, ToolBlock } from '../../agent/types'
+import { useChatStore } from '../../store/chat-store'
+import { MessageTimeline, goalTimelinePaddingClass, liveTurnProgressClass, summarizeToolBlock } from './MessageTimeline'
+import { GeneratedFilesPanel, MessageBubble } from './message-timeline-bubbles'
 import { ProcessSectionRow } from './message-timeline-process'
 
 const labels: Record<string, string> = {
@@ -18,6 +19,15 @@ const labels: Record<string, string> = {
 }
 
 const t = (key: string) => labels[key] ?? (key === 'toolActionCommand' ? 'Ran command' : key)
+
+const activeThread: NormalizedThread = {
+  id: 'thr_1',
+  title: 'Thread',
+  updatedAt: '2026-06-07T00:00:00.000Z',
+  model: 'deepseek-chat',
+  mode: 'code',
+  workspace: '/tmp/project'
+}
 
 function toolBlock(overrides: Partial<ToolBlock>): ToolBlock {
   return {
@@ -113,6 +123,23 @@ describe('MessageTimeline tool summaries', () => {
 })
 
 describe('MessageTimeline Kun runtime metadata smoke', () => {
+  beforeEach(() => {
+    useChatStore.setState({
+      route: 'chat',
+      workspaceRoot: '/tmp/project',
+      activeThreadId: 'thr_1',
+      threads: [activeThread],
+      busy: false,
+      currentTurnUserId: null,
+      turnStartedAtByUserId: {},
+      turnDurationByUserId: {},
+      turnReasoningFirstAtByUserId: {},
+      turnReasoningLastAtByUserId: {},
+      clawChannels: [],
+      activeClawChannelId: ''
+    })
+  })
+
   it('renders user image attachments as thumbnails instead of attachment chips', () => {
     const block: ChatBlock = {
       kind: 'user',
@@ -135,6 +162,60 @@ describe('MessageTimeline Kun runtime metadata smoke', () => {
     expect(html).toContain('src="data:image/png;base64,abc"')
     expect(html).toContain('为什么图片完全没有识别啊')
     expect(html).not.toContain('Attachments 1')
+    expect(html).not.toContain('ds-media-printer-reveal')
+  })
+
+  it('renders user file references under the sent prompt', () => {
+    const block: ChatBlock = {
+      kind: 'user',
+      id: 'user_files',
+      text: '看一下这些文件',
+      meta: {
+        fileReferences: [
+          {
+            path: '/workspace/deepseek-gui/src/App.tsx',
+            relativePath: 'src/App.tsx',
+            name: 'App.tsx',
+            kind: 'file'
+          },
+          {
+            path: '/workspace/deepseek-gui/src',
+            relativePath: 'src',
+            name: 'src',
+            kind: 'directory'
+          }
+        ]
+      }
+    }
+
+    const html = renderToStaticMarkup(createElement(MessageBubble, { block }))
+
+    expect(html).toContain('看一下这些文件')
+    expect(html).toContain('Referenced files 2')
+    expect(html).toContain('src/App.tsx')
+    expect(html).toContain('src/')
+  })
+
+  it('renders generated image previews with the printer reveal effect', () => {
+    const block: ToolBlock = toolBlock({
+      id: 'tool_img',
+      summary: 'generate_image',
+      meta: {
+        generatedFiles: [
+          {
+            name: 'painting.png',
+            mimeType: 'image/png',
+            previewUrl: 'data:image/png;base64,paint'
+          }
+        ]
+      }
+    })
+
+    const html = renderToStaticMarkup(createElement(GeneratedFilesPanel, { blocks: [block] }))
+
+    expect(html).toContain('<img')
+    expect(html).toContain('src="data:image/png;base64,paint"')
+    expect(html).toContain('ds-media-printer-reveal')
   })
 
   it('renders managed Claw prompts as the user-visible message', () => {
@@ -235,7 +316,7 @@ describe('MessageTimeline Kun runtime metadata smoke', () => {
     expect(html).toContain('Sources 1')
   })
 
-  it('expands running tool calls so partial details stay visible', () => {
+  it('keeps running tool calls collapsed by default while showing active status', () => {
     const block: ChatBlock = toolBlock({
       summary: 'read: file',
       status: 'running',
@@ -257,8 +338,30 @@ describe('MessageTimeline Kun runtime metadata smoke', () => {
     expect(html).toContain('/tmp/readme.md')
     expect(html).not.toContain('ds-work-logo')
     expect(html).toContain('ds-shiny-text')
-    expect(html).toContain('partial tool output while running')
+    expect(html).not.toContain('partial tool output while running')
     expect(html).toContain('ds-process-file-reference')
+  })
+
+  it('shows failed tool details by default while keeping the row collapsible', () => {
+    const block: ChatBlock = toolBlock({
+      summary: 'Recognize image recognize_image',
+      status: 'error',
+      detail: 'model request failed with status 401',
+      meta: { toolName: 'recognize_image' }
+    })
+
+    const html = renderToStaticMarkup(
+      createElement(ProcessSectionRow, {
+        section: { id: 'execution-tool_error', kind: 'execution', blocks: [block] },
+        processing: false,
+        singleReasoningSection: false,
+        viewportRef: { current: null }
+      })
+    )
+
+    expect(html).toContain('Recognize image recognize_image')
+    expect(html).toContain('model request failed with status 401')
+    expect(html).toContain('role="button"')
   })
 
   it('expands active reasoning so the current process is visible', () => {
@@ -313,5 +416,317 @@ describe('MessageTimeline Kun runtime metadata smoke', () => {
     expect(html).not.toContain('needle')
     expect(html).not.toContain('read detail should stay tucked away')
     expect(html).not.toContain('grep detail should stay tucked away')
+  })
+
+  it('auto-expands pending request_user_input while keeping other tool details tucked away', () => {
+    const readBlock: ChatBlock = toolBlock({
+      id: 'tool_read',
+      summary: 'read: file',
+      detail: 'read detail should stay tucked away',
+      meta: { toolName: 'read' },
+      filePath: '/tmp/readme.md'
+    })
+    const inputBlock: ChatBlock = {
+      kind: 'user_input',
+      id: 'ui_1',
+      requestId: 'input_1',
+      status: 'pending',
+      questions: [
+        {
+          header: 'Dinner',
+          id: 'dinner',
+          question: 'What should we eat tonight?',
+          options: [
+            {
+              label: 'Noodles',
+              description: 'Fast and warm'
+            }
+          ]
+        }
+      ]
+    }
+
+    const html = renderToStaticMarkup(
+      createElement(ProcessSectionRow, {
+        section: { id: 'execution-batch', kind: 'execution', blocks: [readBlock, inputBlock] },
+        processing: true,
+        singleReasoningSection: false,
+        viewportRef: { current: null }
+      })
+    )
+
+    expect(html).toContain('ds-work-stack')
+    expect(html).toContain('What should we eat tonight?')
+    expect(html).toContain('Noodles')
+    expect(html).not.toContain('read detail should stay tucked away')
+  })
+
+  it('auto-expands pending approvals while keeping other tool details tucked away', () => {
+    const readBlock: ChatBlock = toolBlock({
+      id: 'tool_read',
+      summary: 'read: file',
+      detail: 'read detail should stay tucked away',
+      meta: { toolName: 'read' },
+      filePath: '/tmp/readme.md'
+    })
+    const approvalBlock: ChatBlock = {
+      kind: 'approval',
+      id: 'approval_appr_1',
+      approvalId: 'appr_1',
+      status: 'pending',
+      toolName: 'edit',
+      summary: 'Run edit(path="/tmp/app.ts")'
+    }
+
+    const html = renderToStaticMarkup(
+      createElement(ProcessSectionRow, {
+        section: { id: 'execution-batch', kind: 'execution', blocks: [readBlock, approvalBlock] },
+        processing: true,
+        singleReasoningSection: false,
+        viewportRef: { current: null }
+      })
+    )
+
+    expect(html).toContain('ds-work-stack')
+    expect(html).toContain('Run edit(path=&quot;/tmp/app.ts&quot;)')
+    expect(html).toMatch(/Approval required|需要审批|approvalTitle/)
+    expect(html).toMatch(/Allow|允许|approvalAllow/)
+    expect(html).not.toContain('read detail should stay tucked away')
+  })
+
+  it('renders request_user_input without options as a freeform answer field', () => {
+    const inputBlock: ChatBlock = {
+      kind: 'user_input',
+      id: 'ui_freeform',
+      requestId: 'input_freeform',
+      status: 'pending',
+      questions: [
+        {
+          header: 'Input',
+          id: 'direction',
+          question: '你更想去南方还是北方？',
+          options: []
+        }
+      ]
+    }
+
+    const html = renderToStaticMarkup(
+      createElement(ProcessSectionRow, {
+        section: { id: 'execution-input', kind: 'execution', blocks: [inputBlock] },
+        processing: true,
+        singleReasoningSection: false,
+        viewportRef: { current: null }
+      })
+    )
+
+    expect(html).toContain('你更想去南方还是北方？')
+    expect(html).toContain('<textarea')
+    expect(html).not.toContain('userInputOther')
+    expect(html).not.toContain('其他')
+  })
+
+  it('expands the live work timeline by default while keeping tool details collapsed', () => {
+    const blocks: ChatBlock[] = [
+      {
+        kind: 'user',
+        id: 'user_1',
+        text: 'inspect this file'
+      },
+      toolBlock({
+        summary: 'read: file',
+        status: 'running',
+        detail: 'running timeline detail should stay collapsed',
+        meta: { toolName: 'read' },
+        filePath: '/tmp/project/src/app.ts'
+      })
+    ]
+    useChatStore.setState({
+      busy: true,
+      currentTurnUserId: 'user_1',
+      turnStartedAtByUserId: { user_1: Date.now() }
+    })
+
+    const html = renderToStaticMarkup(
+      createElement(MessageTimeline, {
+        blocks,
+        liveReasoning: '',
+        live: '',
+        activeThreadId: 'thr_1',
+        runtimeConnection: 'ready',
+        onRetryConnection: () => undefined,
+        onOpenSettings: () => undefined
+      })
+    )
+
+    expect(html).toContain('aria-expanded="true"')
+    expect(html).toContain('Read')
+    expect(html).toContain('/tmp/project/src/app.ts')
+    expect(html).not.toContain('running timeline detail should stay collapsed')
+  })
+
+  it('renders running compaction as a lightweight status divider', () => {
+    const blocks: ChatBlock[] = [
+      {
+        kind: 'compaction',
+        id: 'compact_1',
+        summary: 'Context compacted',
+        status: 'running',
+        auto: false
+      }
+    ]
+    useChatStore.setState({
+      busy: true,
+      currentTurnUserId: null,
+      turnStartedAtByUserId: {}
+    })
+
+    const html = renderToStaticMarkup(
+      createElement(MessageTimeline, {
+        blocks,
+        liveReasoning: '',
+        live: '',
+        activeThreadId: 'thr_1',
+        runtimeConnection: 'ready',
+        onRetryConnection: () => undefined,
+        onOpenSettings: () => undefined
+      })
+    )
+
+    expect(html).toContain('role="status"')
+    expect(html).toMatch(/Compacting context|compactionRunning|正在压缩上下文/)
+    expect(html).not.toContain('aria-expanded=')
+  })
+
+  it('keeps completed runtime errors visible instead of folding them into the work summary', () => {
+    const blocks: ChatBlock[] = [
+      {
+        kind: 'user',
+        id: 'user_1',
+        text: 'draw this'
+      },
+      {
+        kind: 'system',
+        id: 'error_1',
+        text: 'model request failed with status 400',
+        detail: [
+          'Code: http_400',
+          '',
+          'Severity: error',
+          '',
+          'Message:',
+          'full provider body only visible in the expanded error detail'
+        ].join('\n'),
+        code: 'http_400',
+        severity: 'error'
+      }
+    ]
+    useChatStore.setState({
+      busy: false,
+      currentTurnUserId: null,
+      turnStartedAtByUserId: {}
+    })
+
+    const html = renderToStaticMarkup(
+      createElement(MessageTimeline, {
+        blocks,
+        liveReasoning: '',
+        live: '',
+        activeThreadId: 'thr_1',
+        runtimeConnection: 'ready',
+        onRetryConnection: () => undefined,
+        onOpenSettings: () => undefined
+      })
+    )
+
+    expect(html).toContain('request failed with status 400')
+    expect(html).toContain('Code: http_400')
+    expect(html).toContain('full provider body only visible in the expanded error detail')
+  })
+
+  it('adds extra bottom padding only for chat timelines with an active goal banner', () => {
+    expect(goalTimelinePaddingClass('chat', true)).toBe('pb-32 md:pb-40')
+    expect(goalTimelinePaddingClass('chat', false)).toBe('pb-10')
+    expect(goalTimelinePaddingClass('claw', true)).toBe('pb-10')
+  })
+
+  it('pushes the live progress row above the goal banner when a goal is active', () => {
+    expect(liveTurnProgressClass(true)).toContain('mb-16 md:mb-20')
+    expect(liveTurnProgressClass(false)).not.toContain('mb-16 md:mb-20')
+  })
+
+  it('renders the fork action before copy in completed assistant response actions', () => {
+    const blocks: ChatBlock[] = [
+      {
+        kind: 'user',
+        id: 'user_1',
+        turnId: 'turn_1',
+        text: 'say hi'
+      },
+      {
+        kind: 'assistant',
+        id: 'assistant_1',
+        turnId: 'turn_1',
+        text: 'hello'
+      }
+    ]
+
+    const html = renderToStaticMarkup(
+      createElement(MessageTimeline, {
+        blocks,
+        liveReasoning: '',
+        live: '',
+        activeThreadId: 'thr_1',
+        runtimeConnection: 'ready',
+        onRetryConnection: () => undefined,
+        onOpenSettings: () => undefined
+      })
+    )
+
+    expect(html).toMatch(/forkResponse|Fork response|分叉回答/)
+    expect(html).toMatch(/forkFromAssistantResponse|Fork a new thread from this response|从这条回答分叉新会话/)
+    const forkIndex = html.search(/forkFromAssistantResponse|Fork a new thread from this response|从这条回答分叉新会话/)
+    const copyIndex = html.slice(forkIndex).search(/copyMessage|Copy message|复制消息/)
+    expect(forkIndex).toBeGreaterThanOrEqual(0)
+    expect(copyIndex).toBeGreaterThan(0)
+  })
+
+  it('renders the live assistant bubble while busy is true (streaming period)', () => {
+    // Streaming period: the user has just sent a turn, the agent is
+    // running, and the SSE has streamed some `live` text into the chat
+    // store. The chat view must surface the streamed text immediately
+    // (e.g. for the Feishu bot case), not wait until turn_completed.
+    //
+    // We assert against the `ds-chat-answer` class which is only emitted
+    // by the live assistant `MessageBubble`. The process-section fold
+    // in `deriveTurnSections` would render the same text via
+    // `ProcessSectionRow`, so a plain text assertion is not specific
+    // enough — we want the actual `live-assistant` bubble here.
+    const blocks: ChatBlock[] = [
+      {
+        kind: 'user',
+        id: 'user_1',
+        text: 'say hi'
+      }
+    ]
+    useChatStore.setState({
+      busy: true,
+      currentTurnUserId: 'user_1',
+      turnStartedAtByUserId: { user_1: Date.now() }
+    })
+
+    const html = renderToStaticMarkup(
+      createElement(MessageTimeline, {
+        blocks,
+        liveReasoning: '',
+        live: 'hello',
+        activeThreadId: 'thr_1',
+        runtimeConnection: 'ready',
+        onRetryConnection: () => undefined,
+        onOpenSettings: () => undefined
+      })
+    )
+
+    expect(html).toContain('ds-chat-answer')
+    expect(html).toContain('hello')
   })
 })

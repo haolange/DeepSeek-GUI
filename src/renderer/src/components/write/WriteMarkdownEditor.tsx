@@ -1,24 +1,42 @@
-import { useEffect, useRef, type ReactElement } from 'react'
+import { useEffect, useRef, type MutableRefObject, type ReactElement } from 'react'
 import { Annotation, Compartment, EditorSelection, EditorState, type Extension } from '@codemirror/state'
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands'
 import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
 import { bracketMatching, indentOnInput } from '@codemirror/language'
 import { languages } from '@codemirror/language-data'
-import { drawSelection, EditorView, highlightActiveLine, keymap, type ViewUpdate } from '@codemirror/view'
+import { drawSelection, EditorView, highlightActiveLine, keymap, showPanel, type Panel, type ViewUpdate } from '@codemirror/view'
+import { acceptChunk, getChunks, rejectChunk, unifiedMergeView } from '@codemirror/merge'
+import i18n from '../../i18n'
+import {
+  applyWriteBlockTypeToLines,
+  detectWriteBlockTypeFromLine,
+  type WriteBlockType
+} from '../../write/block-type'
 import { buildInlineCompletionExtension, buildInlineCompletionPayload } from '../../write/inline-completion'
 import { writeMarkdownLivePreviewExtensions } from '../../write/markdown-live-preview'
 import { createWriteRecentEdit, type WriteRecentEdit } from '../../write/recent-edits'
+import { isSelectableRasterImageSrc, parseImageMarkdownLine } from '../../write/selected-image'
+import { buildWriteTemplateShortcutExpansion } from '../../write/template-shortcuts'
 import {
   buildWriteCanonicalTermPropagationChanges,
   buildWriteTermPropagationChanges,
   type WriteTermReplacementSeed
 } from '../../write/term-propagation'
+import { writeSelectionStatesEqual } from '../../write/write-selection'
 
 export type WriteSelectionAnchorRect = {
   left: number
   right: number
   top: number
   bottom: number
+  width: number
+  height: number
+}
+
+export type WriteSelectionPageRect = {
+  page: number
+  x: number
+  y: number
   width: number
   height: number
 }
@@ -32,6 +50,7 @@ export type WriteSelectionRange = {
   endColumn: number
   text: string
   charCount: number
+  page?: number
 }
 
 export type WriteEditorSelectionState = {
@@ -39,6 +58,50 @@ export type WriteEditorSelectionState = {
   ranges: WriteSelectionRange[]
   charCount: number
   anchorRect?: WriteSelectionAnchorRect
+  rects?: WriteSelectionPageRect[]
+  sourceKind?: 'text' | 'pdf'
+  pageStart?: number
+  pageEnd?: number
+  /** Block type of the line at the selection start (selection toolbar). */
+  blockType?: WriteBlockType
+  /** Set when a single raster image is selected (TipTap node selection or a
+   * caret on an image markdown line in source mode). */
+  selectedImage?: WriteSelectedImage
+}
+
+export type WriteSelectedImage = {
+  src: string
+  alt: string
+  /** Source-mode only: the document offsets of the image markdown line. */
+  line?: { from: number; to: number }
+}
+
+/**
+ * Imperative surface for the selection toolbar: replaces a document range
+ * through the editor so undo history stays granular and the selection ends up
+ * covering the replacement (allowing chained formatting).
+ */
+export type WriteMarkdownEditorHandle = {
+  applyRangeReplacement: (
+    range: { from: number; to: number },
+    original: string,
+    replacement: string
+  ) => boolean
+  /** Rewrite the block markers of the lines spanning the current selection. */
+  setBlockType: (type: WriteBlockType) => boolean
+  /**
+   * Enters an inline red/green diff review: swaps the document to `nextDoc` and
+   * shows a per-chunk accept/reject merge view against `original`. Returns false
+   * when the editor is read-only/unavailable, a review is already running, or
+   * the texts are identical.
+   */
+  beginDiffReview: (params: { original: string; nextDoc: string }) => boolean
+  /** True while an inline diff review is in progress. */
+  isDiffReviewActive: () => boolean
+  /** Accepts every pending diff chunk and commits the result. */
+  acceptAllDiff: () => void
+  /** Rejects every pending diff chunk (reverting to the original) and commits. */
+  rejectAllDiff: () => void
 }
 
 type Props = {
@@ -63,6 +126,9 @@ type Props = {
   onSaveShortcut: () => void
   onImagePasteSaved?: () => void
   onImagePasteError?: (message: string) => void
+  /** Notified when an inline diff review starts (true) or commits/cancels (false). */
+  onReviewStateChange?: (active: boolean) => void
+  handleRef?: MutableRefObject<WriteMarkdownEditorHandle | null>
 }
 
 const externalValueSyncAnnotation = Annotation.define<boolean>()
@@ -110,7 +176,10 @@ function unionRects(rects: Array<{ left: number; right: number; top: number; bot
   }
 }
 
-function selectionAnchorRect(view: EditorView, ranges: WriteSelectionRange[]): WriteSelectionAnchorRect | undefined {
+function selectionAnchorRect(
+  view: EditorView,
+  ranges: Array<Pick<WriteSelectionRange, 'from' | 'to'>>
+): WriteSelectionAnchorRect | undefined {
   const rects: Array<{ left: number; right: number; top: number; bottom: number }> = []
   for (const range of ranges) {
     const start = view.coordsAtPos(range.from, 1)
@@ -144,11 +213,28 @@ function selectionState(view: EditorView): WriteEditorSelectionState {
     .filter((value): value is WriteSelectionRange => value !== null)
 
   const text = ranges.map((range) => range.text).join('\n\n')
+  const mainFrom = clampOffset(view.state, view.state.selection.main.from)
+  const mainLine = view.state.doc.lineAt(mainFrom)
+
+  // A bare caret on an image markdown line counts as selecting that image
+  // (clicking the live-preview image widget focuses its source line).
+  let selectedImage: WriteSelectedImage | undefined
+  if (ranges.length === 0 && view.state.selection.ranges.length === 1) {
+    const parsed = parseImageMarkdownLine(mainLine.text)
+    if (parsed && isSelectableRasterImageSrc(parsed.src)) {
+      selectedImage = { ...parsed, line: { from: mainLine.from, to: mainLine.to } }
+    }
+  }
+
   return {
     text,
     ranges,
     charCount: ranges.reduce((total, range) => total + range.charCount, 0),
-    anchorRect: selectionAnchorRect(view, ranges)
+    anchorRect: selectedImage
+      ? selectionAnchorRect(view, [{ from: mainLine.from, to: mainLine.to }])
+      : selectionAnchorRect(view, ranges),
+    blockType: detectWriteBlockTypeFromLine(mainLine.text),
+    ...(selectedImage ? { selectedImage } : {})
   }
 }
 
@@ -201,26 +287,32 @@ function buildEditorTheme(appearance: 'source' | 'live'): Extension {
       minHeight: '0',
       color: 'var(--ds-text)',
       backgroundColor: 'transparent',
+      // Prose (live) appearance follows the configured editor font; the raw
+      // source appearance keeps a monospace family but still honors the size.
       fontFamily: sourceMode
         ? 'ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace'
-        : 'Georgia, Charter, "Iowan Old Style", "Noto Serif SC", serif',
-      fontSize: sourceMode ? '14px' : '15px'
+        : "var(--write-editor-font-family, -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans SC', 'Microsoft YaHei', sans-serif)",
+      fontSize: 'var(--write-editor-font-size, 16px)'
     },
     '.cm-scroller': {
       overflow: 'auto',
-      lineHeight: sourceMode ? '1.75' : '1.85',
+      lineHeight: 'var(--write-editor-line-height, 1.75)',
       backgroundColor: 'transparent'
     },
     '.cm-content': {
       minHeight: '100%',
-      padding: '26px 24px 56px',
+      padding: sourceMode ? '26px 24px 56px' : 'clamp(40px, 7vh, 72px) 24px 120px',
       caretColor: 'var(--ds-text)'
     },
     '.cm-cursor, .cm-dropCursor': {
       borderLeftColor: 'var(--ds-text)'
     },
-    '.cm-selectionBackground, ::selection': {
-      backgroundColor: 'var(--ds-selection)'
+    '.cm-selectionBackground': {
+      backgroundColor: 'var(--write-selection-bg, var(--ds-selection))'
+    },
+    '.cm-content::selection, .cm-content *::selection': {
+      backgroundColor: 'var(--write-selection-bg, var(--ds-selection))',
+      color: 'var(--write-selection-text, inherit)'
     },
     '.cm-gutters': {
       display: 'none'
@@ -270,6 +362,28 @@ function buildPastedImageMarkdown(
   }
 }
 
+function expandWriteTemplateShortcut(view: EditorView): boolean {
+  const selection = view.state.selection.main
+  if (!selection.empty) return false
+  const expansion = buildWriteTemplateShortcutExpansion({
+    text: view.state.doc.toString(),
+    cursor: selection.head
+  })
+  if (!expansion) return false
+
+  const nextHead = expansion.from + expansion.insert.length
+  view.dispatch({
+    changes: {
+      from: expansion.from,
+      to: expansion.to,
+      insert: expansion.insert
+    },
+    selection: EditorSelection.cursor(nextHead),
+    scrollIntoView: true
+  })
+  return true
+}
+
 export function WriteMarkdownEditor({
   value,
   workspaceRoot,
@@ -291,7 +405,9 @@ export function WriteMarkdownEditor({
   onSelectionChange,
   onSaveShortcut,
   onImagePasteSaved,
-  onImagePasteError
+  onImagePasteError,
+  onReviewStateChange,
+  handleRef
 }: Props): ReactElement {
   const hostRef = useRef<HTMLDivElement | null>(null)
   const viewRef = useRef<EditorView | null>(null)
@@ -318,7 +434,12 @@ export function WriteMarkdownEditor({
   const onSaveShortcutRef = useRef(onSaveShortcut)
   const onImagePasteSavedRef = useRef(onImagePasteSaved)
   const onImagePasteErrorRef = useRef(onImagePasteError)
+  const onReviewStateChangeRef = useRef(onReviewStateChange)
+  const mergeCompartmentRef = useRef<Compartment | null>(null)
+  const reviewActiveRef = useRef(false)
   const valueRef = useRef(value)
+  const lastSelectionRef = useRef<WriteEditorSelectionState | null>(null)
+  const lastEmittedValueRef = useRef<string | null>(null)
 
   workspaceRootRef.current = workspaceRoot ?? ''
   filePathRef.current = filePath ?? ''
@@ -340,6 +461,7 @@ export function WriteMarkdownEditor({
   onSaveShortcutRef.current = onSaveShortcut
   onImagePasteSavedRef.current = onImagePasteSaved
   onImagePasteErrorRef.current = onImagePasteError
+  onReviewStateChangeRef.current = onReviewStateChange
   valueRef.current = value
 
   useEffect(() => {
@@ -349,9 +471,94 @@ export function WriteMarkdownEditor({
     const themeCompartment = new Compartment()
     const livePreviewCompartment = new Compartment()
     const editableCompartment = new Compartment()
+    const mergeCompartment = new Compartment()
     themeCompartmentRef.current = themeCompartment
     livePreviewCompartmentRef.current = livePreviewCompartment
     editableCompartmentRef.current = editableCompartment
+    mergeCompartmentRef.current = mergeCompartment
+
+    // --- Inline red/green diff review -----------------------------------------
+    // AI rewrites enter a unified merge view (per-line accept/reject) instead of
+    // overwriting the document. While a review is active, onChange is suppressed
+    // so nothing is persisted until the user resolves every chunk.
+    const finishDiffReview = (): void => {
+      const instance = viewRef.current
+      if (!instance || !reviewActiveRef.current) return
+      const finalDoc = instance.state.doc.toString()
+      reviewActiveRef.current = false
+      instance.dispatch({
+        effects: [
+          mergeCompartment.reconfigure([]),
+          // Restore the live-preview decorations that were suspended for review.
+          livePreviewCompartment.reconfigure(
+            appearanceRef.current === 'live' && livePreviewEnabledRef.current
+              ? writeMarkdownLivePreviewExtensions(filePathRef.current, workspaceRootRef.current)
+              : []
+          )
+        ]
+      })
+      lastEmittedValueRef.current = finalDoc
+      onChangeRef.current(finalDoc)
+      onReviewStateChangeRef.current?.(false)
+    }
+    const resolveAllDiffChunks = (mode: 'accept' | 'reject'): void => {
+      const instance = viewRef.current
+      if (!instance || !reviewActiveRef.current) return
+      for (let guard = 0; guard < 10_000; guard += 1) {
+        const data = getChunks(instance.state)
+        if (!data || data.chunks.length === 0) break
+        const pos = data.chunks[0].fromB
+        if (mode === 'accept') acceptChunk(instance, pos)
+        else rejectChunk(instance, pos)
+      }
+      finishDiffReview()
+    }
+    const buildDiffReviewPanel = (): Panel => {
+      const dom = document.createElement('div')
+      dom.className = 'cm-write-diff-panel'
+      const label = document.createElement('span')
+      label.className = 'cm-write-diff-panel-label'
+      label.textContent = i18n.t('writeDiffReviewing', { ns: 'common' })
+      const reject = document.createElement('button')
+      reject.type = 'button'
+      reject.className = 'cm-write-diff-reject-all'
+      reject.textContent = i18n.t('writeDiffRejectAll', { ns: 'common' })
+      reject.addEventListener('mousedown', (event) => event.preventDefault())
+      reject.addEventListener('click', () => resolveAllDiffChunks('reject'))
+      const accept = document.createElement('button')
+      accept.type = 'button'
+      accept.className = 'cm-write-diff-accept-all'
+      accept.textContent = i18n.t('writeDiffAcceptAll', { ns: 'common' })
+      accept.addEventListener('mousedown', (event) => event.preventDefault())
+      accept.addEventListener('click', () => resolveAllDiffChunks('accept'))
+      dom.append(label, reject, accept)
+      return { dom, top: true }
+    }
+    // Restartable: when a review is already active (e.g. the agent edits the
+    // file again mid-turn), this re-points the merge view at the new target
+    // against the same baseline instead of bailing.
+    const beginDiffReview = (original: string, nextDoc: string): boolean => {
+      const instance = viewRef.current
+      if (!instance || readOnlyRef.current) return false
+      if (nextDoc === original) return false
+      reviewActiveRef.current = true
+      instance.dispatch({
+        changes: { from: 0, to: instance.state.doc.length, insert: nextDoc },
+        annotations: externalValueSyncAnnotation.of(true),
+        effects: [
+          // Suspend live-preview decorations so the raw red/green diff (and the
+          // merge view's deleted-line widgets) render cleanly during review.
+          livePreviewCompartment.reconfigure([]),
+          mergeCompartment.reconfigure([
+            unifiedMergeView({ original, gutter: false, collapseUnchanged: { margin: 3, minSize: 4 } }),
+            showPanel.of(buildDiffReviewPanel)
+          ])
+        ]
+      })
+      lastEmittedValueRef.current = nextDoc
+      onReviewStateChangeRef.current?.(true)
+      return true
+    }
     const inlineCompletionExtension = buildInlineCompletionExtension({
       getDebounceMs: () => completionDebounceMsRef.current,
       getMinAcceptScore: () => completionMinAcceptScoreRef.current,
@@ -363,8 +570,8 @@ export function WriteMarkdownEditor({
       language: 'markdown',
       getModel: () => completionModelRef.current,
       requestCompletion: async (context, mode) => {
-        if (typeof window.dsGui?.requestWriteInlineCompletion !== 'function') return null
-        const result = await window.dsGui.requestWriteInlineCompletion(
+        if (typeof window.kunGui?.requestWriteInlineCompletion !== 'function') return null
+        const result = await window.kunGui.requestWriteInlineCompletion(
           buildInlineCompletionPayload(context, {
             model: completionModelRef.current,
             workspaceRoot: workspaceRootRef.current,
@@ -396,10 +603,11 @@ export function WriteMarkdownEditor({
         themeCompartment.of(buildEditorTheme(appearanceRef.current)),
         livePreviewCompartment.of(
           appearanceRef.current === 'live' && livePreviewEnabledRef.current
-            ? writeMarkdownLivePreviewExtensions(filePathRef.current)
+            ? writeMarkdownLivePreviewExtensions(filePathRef.current, workspaceRootRef.current)
             : []
         ),
         editableCompartment.of(buildInteractionExtensions(readOnlyRef.current, appearanceRef.current)),
+        mergeCompartment.of([]),
         markdown({ base: markdownLanguage, codeLanguages: languages }),
         history(),
         drawSelection(),
@@ -410,6 +618,13 @@ export function WriteMarkdownEditor({
         keymap.of([
           ...defaultKeymap,
           ...historyKeymap,
+          {
+            key: 'Tab',
+            run: (view) => {
+              if (readOnlyRef.current) return false
+              return expandWriteTemplateShortcut(view)
+            }
+          },
           indentWithTab,
           {
             key: 'Mod-s',
@@ -430,10 +645,10 @@ export function WriteMarkdownEditor({
               event.preventDefault()
               return true
             }
-            if (typeof window.dsGui?.saveWorkspaceClipboardImage !== 'function') return false
+            if (typeof window.kunGui?.saveWorkspaceClipboardImage !== 'function') return false
 
             event.preventDefault()
-            void window.dsGui
+            void window.kunGui
               .saveWorkspaceClipboardImage({
                 workspaceRoot: nextWorkspaceRoot,
                 currentFilePath: nextFilePath,
@@ -481,18 +696,42 @@ export function WriteMarkdownEditor({
           const termPropagationSync = update.transactions.some((transaction) =>
             transaction.annotation(termPropagationAnnotation)
           )
-          if (update.docChanged && !externalValueSync) {
+          // A diff review resolves once every chunk is accepted/rejected. Commit
+          // it after the dispatch settles to avoid reentrant transactions.
+          if (reviewActiveRef.current && !externalValueSync) {
+            const chunkData = getChunks(update.state)
+            if (!chunkData || chunkData.chunks.length === 0) {
+              queueMicrotask(() => finishDiffReview())
+            }
+          }
+          // Materialise the document string at most once per update; on large
+          // documents doc.toString() walks the whole rope and used to run for
+          // both the onChange emit and the term propagation scan.
+          let docString: string | null = null
+          const docText = (): string => {
+            if (docString === null) docString = update.state.doc.toString()
+            return docString
+          }
+          if (update.docChanged && !externalValueSync && !reviewActiveRef.current) {
             const recentEdits = recentEditsFromUpdate(update, filePathRef.current)
             if (recentEdits.length > 0) onDocumentEditRef.current?.(recentEdits)
-            onChangeRef.current(update.state.doc.toString())
+            lastEmittedValueRef.current = docText()
+            onChangeRef.current(lastEmittedValueRef.current)
           }
           if (update.docChanged || update.selectionSet) {
-            onSelectionChangeRef.current(selectionState(update.view))
+            const nextSelection = selectionState(update.view)
+            if (
+              !lastSelectionRef.current ||
+              !writeSelectionStatesEqual(lastSelectionRef.current, nextSelection)
+            ) {
+              lastSelectionRef.current = nextSelection
+              onSelectionChangeRef.current(nextSelection)
+            }
           }
-          if (update.docChanged && !externalValueSync && !termPropagationSync) {
+          if (update.docChanged && !externalValueSync && !termPropagationSync && !reviewActiveRef.current) {
             const seed = termReplacementSeedFromUpdate(update)
             if (seed) {
-              const content = update.state.doc.toString()
+              const content = docText()
               const rawPropagationChanges = [
                 ...buildWriteTermPropagationChanges(content, seed),
                 ...buildWriteCanonicalTermPropagationChanges(content, seed)
@@ -521,15 +760,66 @@ export function WriteMarkdownEditor({
       parent: hostRef.current
     })
     viewRef.current = view
-    onSelectionChangeRef.current(selectionState(view))
+    lastEmittedValueRef.current = valueRef.current
+    const initialSelection = selectionState(view)
+    lastSelectionRef.current = initialSelection
+    onSelectionChangeRef.current(initialSelection)
+
+    if (handleRef) {
+      handleRef.current = {
+        applyRangeReplacement: (range, original, replacement) => {
+          const instance = viewRef.current
+          if (!instance || readOnlyRef.current) return false
+          const from = clampOffset(instance.state, range.from)
+          const to = clampOffset(instance.state, range.to)
+          if (to < from || instance.state.sliceDoc(from, to) !== original) return false
+          instance.focus()
+          instance.dispatch({
+            changes: { from, to, insert: replacement },
+            selection: EditorSelection.range(from, from + replacement.length),
+            scrollIntoView: true
+          })
+          return true
+        },
+        setBlockType: (type) => {
+          const instance = viewRef.current
+          if (!instance || readOnlyRef.current) return false
+          const { from, to } = instance.state.selection.main
+          const startLine = instance.state.doc.lineAt(from)
+          const endLine = instance.state.doc.lineAt(to)
+          const lines: string[] = []
+          for (let lineNumber = startLine.number; lineNumber <= endLine.number; lineNumber += 1) {
+            lines.push(instance.state.doc.line(lineNumber).text)
+          }
+          const next = applyWriteBlockTypeToLines(lines, type).join('\n')
+          if (instance.state.sliceDoc(startLine.from, endLine.to) === next) return false
+          instance.focus()
+          instance.dispatch({
+            changes: { from: startLine.from, to: endLine.to, insert: next },
+            selection: EditorSelection.range(startLine.from, startLine.from + next.length),
+            scrollIntoView: true
+          })
+          return true
+        },
+        beginDiffReview: ({ original, nextDoc }) => beginDiffReview(original, nextDoc),
+        isDiffReviewActive: () => reviewActiveRef.current,
+        acceptAllDiff: () => resolveAllDiffChunks('accept'),
+        rejectAllDiff: () => resolveAllDiffChunks('reject')
+      }
+    }
 
     return () => {
+      if (handleRef) handleRef.current = null
+      reviewActiveRef.current = false
       view.destroy()
       viewRef.current = null
       themeCompartmentRef.current = null
       livePreviewCompartmentRef.current = null
       editableCompartmentRef.current = null
+      mergeCompartmentRef.current = null
     }
+    // Mount-once editor; handleRef is a stable ref container from the parent.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {
@@ -542,20 +832,32 @@ export function WriteMarkdownEditor({
       effects: [
         themeCompartment.reconfigure(buildEditorTheme(appearance)),
         livePreviewCompartment.reconfigure(
-          appearance === 'live' && livePreviewEnabled ? writeMarkdownLivePreviewExtensions(filePath) : []
+          appearance === 'live' && livePreviewEnabled
+            ? writeMarkdownLivePreviewExtensions(filePath, workspaceRoot)
+            : []
         ),
         editableCompartment.reconfigure(buildInteractionExtensions(readOnly, appearance))
       ]
     })
-  }, [appearance, filePath, livePreviewEnabled, readOnly])
+  }, [appearance, filePath, livePreviewEnabled, readOnly, workspaceRoot])
 
   useEffect(() => {
     const view = viewRef.current
     if (!view) return
+    // While an inline diff review owns the document, never let the controlled
+    // value sync clobber the in-progress merge view.
+    if (reviewActiveRef.current) return
+    // The value usually round-trips from our own onChange emit; comparing the
+    // reference first avoids re-serialising the whole document per keystroke.
+    if (value === lastEmittedValueRef.current) return
     const current = view.state.doc.toString()
-    if (current === value) return
+    if (current === value) {
+      lastEmittedValueRef.current = value
+      return
+    }
     const nextLength = value.length
     const { anchor, head } = view.state.selection.main
+    lastEmittedValueRef.current = value
     view.dispatch({
       changes: { from: 0, to: current.length, insert: value },
       annotations: externalValueSyncAnnotation.of(true),

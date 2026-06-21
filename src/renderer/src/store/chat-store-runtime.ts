@@ -13,7 +13,7 @@ import type {
 import { getProvider } from '../agent/registry'
 import { rendererRuntimeClient } from '../agent/runtime-client'
 import i18n from '../i18n'
-import { formatRuntimeError, getRuntimeErrorCode } from '../lib/format-runtime-error'
+import { describeRuntimeError, formatRuntimeError, getRuntimeErrorCode } from '../lib/format-runtime-error'
 import { isClawWorkspacePath, isInternalTemporaryWorkspace, normalizeWorkspaceRoot } from '../lib/workspace-path'
 import type { ClawImChannelV1 } from '@shared/app-settings'
 import type { ChatState } from './chat-store-types'
@@ -21,13 +21,17 @@ import { isClawThread } from './chat-store-helpers'
 import {
   collectAssistantTextForTurn,
   reconcileOptimisticUserBlock,
+  settlePendingRuntimeWorkAfterInterrupt,
   threadSnapshotLooksRunning,
   upsertUserBlock
 } from './chat-store-runtime-helpers'
 import {
-  isWriteThreadId
+  isWriteThreadId,
+  type WriteThreadRegistry
 } from '../write/write-thread-registry'
 import { isSddAssistantThread } from '../sdd/sdd-thread-registry'
+import { readThreadWorktreeRegistry, saveThreadWorktreeRegistry, forgetThreadWorktree } from '../lib/thread-worktree-registry'
+import { notifySddChatTranscriptMirror } from '../sdd/sdd-chat-transcript'
 import { useWriteWorkspaceStore } from '../write/write-workspace-store'
 import {
   armBusyWatchdog as armBusyWatchdogImpl,
@@ -152,6 +156,17 @@ function isUserInputInterruptError(message: string | undefined): boolean {
   return lowered.includes('cancel') && lowered.includes('awaiting user input')
 }
 
+function isInterruptSettledError(error: unknown, message: string): boolean {
+  const code = getRuntimeErrorCode(error)
+  if (code === 'aborted') return true
+  if (isUserInputInterruptError(message)) return true
+  const lowered = message.toLowerCase()
+  return lowered.includes('interrupted') ||
+    lowered.includes('aborted') ||
+    lowered.includes('cancelled') ||
+    lowered.includes('canceled')
+}
+
 export async function readActiveWriteWorkspace(fallbackWorkspaceRoot: string): Promise<string> {
   try {
     const settings = await rendererRuntimeClient.getSettings()
@@ -183,7 +198,10 @@ export async function readWriteWorkspaceRoots(): Promise<string[]> {
 }
 
 export function runtimeErrorDetail(error: unknown): string {
-  return error instanceof Error ? error.message : String(error ?? '')
+  const view = describeRuntimeError(error)
+  if (view.detail) return view.detail
+  const raw = error instanceof Error ? error.message : String(error ?? '')
+  return raw === view.summary ? '' : raw
 }
 
 export function runtimeStreamRecoveringMessage(): string {
@@ -238,33 +256,57 @@ export function clearWatchedCompletionNotification(threadId: string): void {
 }
 
 function notifyTurnComplete(threadId: string | null, state: ChatState, dedupeKey: string): void {
-  if (!threadId || typeof window.dsGui?.showTurnCompleteNotification !== 'function') return
+  if (!threadId || typeof window.kunGui?.showTurnCompleteNotification !== 'function') return
   if (!rememberCompletionNotificationKey(dedupeKey)) return
 
   const threadTitle =
     state.threads.find((thread) => thread.id === threadId)?.title?.trim() ||
     i18n.t('common:untitledThread')
 
-  void window.dsGui
+  void window.kunGui
     .showTurnCompleteNotification({
       threadId,
       title: i18n.t('common:turnCompleteNotificationTitle'),
       body: i18n.t('common:turnCompleteNotificationBody', { title: threadTitle })
     })
     .then((result) => {
-      if (result.ok || typeof window.dsGui?.logError !== 'function') return
-      void window.dsGui.logError('notification', 'Turn completion notification failed', {
+      if (result.ok || typeof window.kunGui?.logError !== 'function') return
+      void window.kunGui.logError('notification', 'Turn completion notification failed', {
         message: result.message,
         threadId
       }).catch(() => undefined)
     })
     .catch((error: unknown) => {
-      if (typeof window.dsGui?.logError !== 'function') return
-      void window.dsGui.logError('notification', 'Turn completion notification failed', {
+      if (typeof window.kunGui?.logError !== 'function') return
+      void window.kunGui.logError('notification', 'Turn completion notification failed', {
         message: error instanceof Error ? error.message : String(error),
         threadId
       }).catch(() => undefined)
     })
+}
+
+/**
+ * Release the worktree pool slot owned by a thread when the task completes.
+ * This makes worktree slots task-scoped (like Talkcody) rather than
+ * thread-scoped: the slot is returned to the pool as soon as the agent
+ * finishes responding, so the same slot can be reused by a future task.
+ *
+ * Fire-and-forget — a failure to release must not disrupt the UI flow.
+ * The deleteThread action still releases as a safety-net fallback.
+ */
+function releaseThreadWorktreeIfNeeded(threadId: string | null): void {
+  if (!threadId || typeof window === 'undefined') return
+  if (typeof window.kunGui?.releaseWorktree !== 'function') return
+  const record = readThreadWorktreeRegistry().worktrees[threadId]
+  if (!record) return
+  if (record.poolIndex === undefined) return
+  void window.kunGui
+    .releaseWorktree({
+      projectPath: record.projectPath,
+      poolIndex: record.poolIndex
+    })
+    .catch(() => undefined) // best-effort
+  saveThreadWorktreeRegistry(forgetThreadWorktree(threadId))
 }
 
 /**
@@ -334,7 +376,7 @@ function goalTimelineText(goal: NonNullable<ChatState['activeThreadGoal']> | nul
 }
 
 export function shouldOpenSettingsForError(error: unknown): boolean {
-  return getRuntimeErrorCode(error) === 'missing_api_key'
+  return describeRuntimeError(error).settingsAction === 'agents'
 }
 
 export function looksLikeActiveTurnError(error: unknown): boolean {
@@ -344,7 +386,8 @@ export function looksLikeActiveTurnError(error: unknown): boolean {
 
 export function isCodeThread(
   thread: NormalizedThread,
-  clawChannels: ClawImChannelV1[] = []
+  clawChannels: ClawImChannelV1[] = [],
+  writeRegistry?: WriteThreadRegistry
 ): boolean {
   const workspace = normalizeWorkspaceRoot(thread.workspace)
   return Boolean(workspace) &&
@@ -352,7 +395,7 @@ export function isCodeThread(
     !isInternalTemporaryWorkspace(thread.workspace) &&
     !isClawWorkspacePath(thread.workspace) &&
     !isClawThread(thread, clawChannels) &&
-    !isWriteThreadId(thread.id) &&
+    !isWriteThreadId(thread.id, writeRegistry) &&
     !isSddAssistantThread(thread)
 }
 
@@ -400,7 +443,8 @@ function notifyWriteWorkspaceFileRefresh(
   void useWriteWorkspaceStore.getState().syncActiveFileFromDisk(workspaceRoot, {
     path: activeFilePath,
     animate: true,
-    force: true
+    force: true,
+    reviewAsDiff: true
   })
 }
 
@@ -422,6 +466,66 @@ function runtimeStatusText(event: RuntimeStatusEventPayload): string {
 	  return event.message?.trim() || ''
 	}
 
+function runtimeErrorPayloadToError(event: {
+  message: string
+  code?: string
+  details?: unknown
+  severity?: string
+}): Error {
+  return new Error(JSON.stringify({
+    ...(event.code ? { code: event.code } : {}),
+    message: event.message,
+    ...(event.details !== undefined ? { details: event.details } : {}),
+    ...(event.severity ? { severity: event.severity } : {})
+  }))
+}
+
+function normalizeRuntimeErrorText(value: string | undefined): string {
+  return (value ?? '').replace(/\s+/g, ' ').trim()
+}
+
+function sameRuntimeErrorContent(
+  left: Extract<ChatBlock, { kind: 'system' }>,
+  right: Extract<ChatBlock, { kind: 'system' }>
+): boolean {
+  return (
+    left.severity === right.severity &&
+    left.code === right.code &&
+    normalizeRuntimeErrorText(left.text) === normalizeRuntimeErrorText(right.text) &&
+    normalizeRuntimeErrorText(left.detail) === normalizeRuntimeErrorText(right.detail)
+  )
+}
+
+function findSameTurnRuntimeErrorIndex(
+  blocks: ChatBlock[],
+  block: Extract<ChatBlock, { kind: 'system' }>
+): number {
+  for (let index = blocks.length - 1; index >= 0; index -= 1) {
+    const candidate = blocks[index]
+    if (candidate.kind === 'user') break
+    if (candidate.kind === 'system' && sameRuntimeErrorContent(candidate, block)) return index
+  }
+  return -1
+}
+
+function upsertRuntimeErrorBlock(blocks: ChatBlock[], block: Extract<ChatBlock, { kind: 'system' }>): ChatBlock[] {
+  const index = blocks.findIndex((candidate) => candidate.kind === 'system' && candidate.id === block.id)
+  if (index < 0) {
+    const duplicateIndex = findSameTurnRuntimeErrorIndex(blocks, block)
+    if (duplicateIndex < 0) return [...blocks, block]
+    const next = [...blocks]
+    const existing = next[duplicateIndex]
+    next[duplicateIndex] = {
+      ...block,
+      createdAt: existing?.createdAt ?? block.createdAt
+    }
+    return next
+  }
+  const next = [...blocks]
+  next[index] = block
+  return next
+}
+
 export function armBusyWatchdog(
   set: (partial: Partial<ChatState> | ((state: ChatState) => Partial<ChatState>)) => void,
   get: () => ChatState
@@ -430,8 +534,17 @@ export function armBusyWatchdog(
     timeoutMs: BUSY_WATCHDOG_MS,
     maxAttempts: MAX_BUSY_RECOVERY_ATTEMPTS,
     finalizeBusyState: finalizeTurnTiming,
-    flushLiveBlocks,
-    busyTimeoutMessage: () => i18n.t('common:busyTimeout')
+    // Settle stuck running/pending blocks alongside the live flush: a
+    // timed-out turn that leaves a tool block "running" keeps
+    // hasPendingRuntimeWork true, which queues every later message
+    // forever ("queued, sends after current reply") with nothing to
+    // drain it.
+    flushLiveBlocks: (state, base) => {
+      const flushed = flushLiveBlocks(state, base)
+      const blocks = settlePendingRuntimeWorkAfterInterrupt(flushed.blocks ?? state.blocks)
+      return { ...flushed, blocks }
+    },
+    busyTimeoutMessage: () => i18n.t('common:busyTimeout', { minutes: Math.round((BUSY_WATCHDOG_MS * MAX_BUSY_RECOVERY_ATTEMPTS) / 60_000) })
   })
 }
 
@@ -468,20 +581,55 @@ export function syncTurnCompletionPoll(
   })
 }
 
+export type ThreadEventSinkBinding = {
+  threadId?: string
+  signal?: AbortSignal
+  /**
+   * Seq the subscription replays from. Deltas at or below this floor are
+   * duplicates of text already in the timeline (a replayed backlog or a
+   * re-delivered live event) and are dropped instead of appended, so a
+   * stale cursor can no longer re-stream the whole conversation into the
+   * live bubble.
+   */
+  sinceSeq?: number
+}
+
 export function buildThreadEventSink(
   set: (partial: Partial<ChatState> | ((state: ChatState) => Partial<ChatState>)) => void,
-  get: () => ChatState
+  get: () => ChatState,
+  binding: ThreadEventSinkBinding = {}
 ): ThreadEventSink {
+  const boundThreadId = binding.threadId?.trim() ?? ''
+  let appliedDeltaSeqFloor = binding.sinceSeq ?? 0
+  const isCurrentStream = (): boolean => {
+    if (binding.signal?.aborted) return false
+    return !boundThreadId || get().activeThreadId === boundThreadId
+  }
+
   return {
     onSeq: (seq) => {
+      if (!isCurrentStream()) return
       resetBusyRecoveryAttempts()
+      // Re-arm the busy watchdog on every live tick so it behaves as an
+      // *inactivity* timer rather than an absolute one. onSeq fires for
+      // every SSE batch — both content events and the runtime's 15s
+      // heartbeat (kun events route) — so a healthy turn always keeps the
+      // watchdog postponed, even a long-running tool call that produces no
+      // output for minutes. Recovery ("正在恢复运行时事件流…") then only
+      // triggers after the heartbeat genuinely stops for BUSY_WATCHDOG_MS
+      // (a dead stream), instead of on any turn that simply runs past it.
+      if (get().busy) armBusyWatchdog(set, get)
+      // Monotonic: heartbeats and replays must never rewind the cursor —
+      // a rewound lastSeq becomes the next subscription's since_seq and
+      // replays history.
       set((s) => ({
-        lastSeq: seq,
+        lastSeq: Math.max(s.lastSeq, seq),
         error: clearRuntimeStreamRecoveringError(s.error)
       }))
     },
     onUserMessage: (ev) =>
       set((s) => {
+        if (!isCurrentStream()) return {}
         resetBusyRecoveryAttempts()
         const flushed = flushLiveBlocks(s)
         const baseBlocks = flushed.blocks ?? s.blocks
@@ -514,9 +662,18 @@ export function buildThreadEventSink(
           error: clearRuntimeStreamRecoveringError(s.error)
         }
       }),
-    onDeltas: (deltas) =>
+    onDeltas: (rawDeltas) => {
+      if (!isCurrentStream()) return
+      const deltas: typeof rawDeltas = []
+      for (const delta of rawDeltas) {
+        if (typeof delta.seq === 'number') {
+          if (delta.seq <= appliedDeltaSeqFloor) continue
+          appliedDeltaSeqFloor = delta.seq
+        }
+        deltas.push(delta)
+      }
+      if (deltas.length === 0) return
       set((s) => {
-        if (deltas.length === 0) return {}
         resetBusyRecoveryAttempts()
         const nextError = clearRuntimeStreamRecoveringError(s.error)
         const seqs = deltas
@@ -539,25 +696,22 @@ export function buildThreadEventSink(
         let nextReasoningFirstAtByUserId = s.turnReasoningFirstAtByUserId
         let nextReasoningLastAtByUserId = s.turnReasoningLastAtByUserId
         const userId = s.currentTurnUserId
+        let sawReasoning = false
         for (const delta of deltas) {
           if (delta.kind === 'agent_reasoning') {
             liveReasoning += delta.text
-            if (userId) {
-              const now = Date.now()
-              if (typeof nextReasoningFirstAtByUserId[userId] !== 'number') {
-                nextReasoningFirstAtByUserId =
-                  nextReasoningFirstAtByUserId === s.turnReasoningFirstAtByUserId
-                    ? { ...s.turnReasoningFirstAtByUserId, [userId]: now }
-                    : { ...nextReasoningFirstAtByUserId, [userId]: now }
-              }
-              nextReasoningLastAtByUserId =
-                nextReasoningLastAtByUserId === s.turnReasoningLastAtByUserId
-                  ? { ...s.turnReasoningLastAtByUserId, [userId]: now }
-                  : { ...nextReasoningLastAtByUserId, [userId]: now }
-            }
+            sawReasoning = true
             continue
           }
           liveAssistant += delta.text
+        }
+        // Stamp reasoning timings once per batch instead of per delta.
+        if (sawReasoning && userId) {
+          const now = Date.now()
+          if (typeof nextReasoningFirstAtByUserId[userId] !== 'number') {
+            nextReasoningFirstAtByUserId = { ...s.turnReasoningFirstAtByUserId, [userId]: now }
+          }
+          nextReasoningLastAtByUserId = { ...s.turnReasoningLastAtByUserId, [userId]: now }
         }
         return {
           ...base,
@@ -570,8 +724,10 @@ export function buildThreadEventSink(
             ? { turnReasoningLastAtByUserId: nextReasoningLastAtByUserId }
             : {})
         }
-      }),
+      })
+    },
     onTool: (ev) => {
+      if (!isCurrentStream()) return
       notifyWriteWorkspaceFileRefresh(get, ev)
       set((s) => {
         resetBusyRecoveryAttempts()
@@ -627,12 +783,20 @@ export function buildThreadEventSink(
       })
     },
     onCompaction: (ev) => {
+      if (!isCurrentStream()) return
       set((s) => {
         resetBusyRecoveryAttempts()
         const base: Partial<ChatState> = {}
         if (!s.busy && ev.status === 'running') {
           base.busy = true
           armBusyWatchdog(set, get)
+        }
+        // A standalone (manual `/compact`) compaction has no enclosing turn to
+        // flip the thread back to idle, so clear the transient busy flag it set
+        // on the `running` event once the compaction settles.
+        if (s.busy && ev.status !== 'running' && !s.currentTurnId) {
+          base.busy = false
+          clearBusyWatchdog()
         }
         const idx = s.blocks.findIndex((b) => b.kind === 'compaction' && b.id === ev.itemId)
         if (idx >= 0) {
@@ -678,6 +842,7 @@ export function buildThreadEventSink(
       })
     },
     onReview: (ev: ReviewEventPayload) => {
+      if (!isCurrentStream()) return
       set((s) => {
         resetBusyRecoveryAttempts()
         const base: Partial<ChatState> = {}
@@ -728,6 +893,7 @@ export function buildThreadEventSink(
     },
     onApproval: (req) =>
       set((s) => {
+        if (!isCurrentStream()) return {}
         resetBusyRecoveryAttempts()
         if (s.blocks.some((b) => b.kind === 'approval' && b.approvalId === req.approvalId)) {
           return {}
@@ -753,6 +919,7 @@ export function buildThreadEventSink(
         }
       }),
     onUserInput: (req) => {
+      if (!isCurrentStream()) return
       resetBusyRecoveryAttempts()
       clearBusyWatchdog()
       set((s) => {
@@ -779,6 +946,7 @@ export function buildThreadEventSink(
       })
     },
     onUserInputStatus: (ev) => {
+      if (!isCurrentStream()) return
       resetBusyRecoveryAttempts()
       if (ev.status === 'submitted' && get().busy) {
         armBusyWatchdog(set, get)
@@ -800,6 +968,7 @@ export function buildThreadEventSink(
       }))
     },
     onRuntimeStatus: (ev) => {
+      if (!isCurrentStream()) return
       set((s) => {
         resetBusyRecoveryAttempts()
         const base: Partial<ChatState> = {}
@@ -828,7 +997,31 @@ export function buildThreadEventSink(
         }
       })
     },
+    onRuntimeError: (ev) => {
+      if (!isCurrentStream()) return
+      resetBusyRecoveryAttempts()
+      set((s) => {
+        const flushed = flushLiveBlocks(s)
+        const baseBlocks = flushed.blocks ?? s.blocks
+        const view = describeRuntimeError(runtimeErrorPayloadToError(ev))
+        const block: Extract<ChatBlock, { kind: 'system' }> = {
+          kind: 'system',
+          id: ev.itemId,
+          createdAt: ev.createdAt ?? new Date().toISOString(),
+          text: view.summary,
+          ...(view.code ? { code: view.code } : {}),
+          ...(view.detail ? { detail: view.detail } : {}),
+          severity: ev.severity ?? 'error'
+        }
+        return {
+          ...flushed,
+          blocks: upsertRuntimeErrorBlock(baseBlocks, block),
+          error: clearRuntimeStreamRecoveringError(s.error)
+        }
+      })
+    },
     onGoal: (ev) => {
+      if (!isCurrentStream()) return
       if (!ev.threadId) return
       resetBusyRecoveryAttempts()
       set((s) => {
@@ -864,6 +1057,7 @@ export function buildThreadEventSink(
       })
     },
     onTodos: (ev) => {
+      if (!isCurrentStream()) return
       if (!ev.threadId) return
       resetBusyRecoveryAttempts()
       set((s) => {
@@ -889,6 +1083,7 @@ export function buildThreadEventSink(
       })
     },
     onTurnComplete: () => {
+      if (!isCurrentStream()) return
       resetBusyRecoveryAttempts()
       clearBusyWatchdog()
       const completedState = get()
@@ -925,8 +1120,8 @@ export function buildThreadEventSink(
         }
         return base
       })
-      if (pendingMirror && assistantMirrorText && typeof window.dsGui?.mirrorClawChannelMessage === 'function') {
-        void window.dsGui.mirrorClawChannelMessage(
+      if (pendingMirror && assistantMirrorText && typeof window.kunGui?.mirrorClawChannelMessage === 'function') {
+        void window.kunGui.mirrorClawChannelMessage(
           pendingMirror.threadId,
           assistantMirrorText,
           'assistant'
@@ -934,37 +1129,74 @@ export function buildThreadEventSink(
       }
       notifyTurnComplete(completedThreadId, completedState, completedKey)
       notifyWriteWorkspaceFileRefresh(get)
+      notifySddChatTranscriptMirror(get)
       syncTurnCompletionPoll(set, get)
       void get().refreshThreads()
+      // Release worktree when the turn finishes and there are no queued
+      // follow-ups that would start a new turn in the same thread.
+      if (get().queuedMessages.length === 0) {
+        releaseThreadWorktreeIfNeeded(completedThreadId)
+      }
       void get().drainQueuedMessages()
     },
-    onError: (err) => {
+    onError: (err, options) => {
+      if (!isCurrentStream()) return
       resetBusyRecoveryAttempts()
       clearBusyWatchdog()
       const state = get()
+      const message = formatRuntimeError(err)
+      const detail = runtimeErrorDetail(err)
+      const terminal = options?.terminal === true
+      const interrupted = isInterruptSettledError(err, message)
       takePendingClawFeishuMirror(state.currentTurnId)
       set((s) => {
         const wasBusy = s.busy
+        const shouldSettleTurn = terminal || !wasBusy || interrupted
         const out = flushLiveBlocks(s, {
           ...finalizeTurnTiming(s),
-          error: formatRuntimeError(err)
+          error: interrupted ? null : message,
+          runtimeErrorDetail: interrupted ? null : detail || null
         })
         // Keep the busy flag if the turn was active — the interrupt button
         // should stay visible so the user can interrupt a stuck turn. The
         // watchdog (re-armed below) will eventually time out if the turn
         // never recovers.
-        if (!wasBusy) {
+        if (shouldSettleTurn) {
           out.busy = false
           out.currentTurnId = null
+          out.currentTurnUserId = null
+          out.blocks = settlePendingRuntimeWorkAfterInterrupt(out.blocks ?? s.blocks)
+          if (terminal && s.activeThreadId) {
+            const w = { ...s.watchTurnCompletion }
+            delete w[s.activeThreadId]
+            clearWatchedCompletionNotification(s.activeThreadId)
+            out.watchTurnCompletion = w
+            const u = { ...s.unreadThreadIds }
+            delete u[s.activeThreadId]
+            out.unreadThreadIds = u
+          }
         }
         return out
       })
+      if (terminal) {
+        syncTurnCompletionPoll(set, get)
+        void get().refreshThreads?.()
+        if (get().queuedMessages.length === 0) {
+          releaseThreadWorktreeIfNeeded(state.activeThreadId)
+        }
+        void get().drainQueuedMessages?.()
+        return
+      }
       // Re-arm the watchdog so a stuck SSE stream doesn't leave the UI
       // permanently in the busy state.
       if (get().busy) armBusyWatchdog(set, get)
     },
-    onUsage: () => {
-      set((s) => ({ usageRefreshKey: s.usageRefreshKey + 1 }))
+    onUsage: (usage) => {
+      if (!isCurrentStream()) return
+      set((s) => ({
+        usageRefreshKey: s.usageRefreshKey + 1,
+        lastTurnUsage: { threadId: s.activeThreadId ?? '', snapshot: usage }
+      }))
     }
   }
 }

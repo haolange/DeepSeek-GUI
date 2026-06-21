@@ -107,6 +107,13 @@ describe('app-ipc-schemas', () => {
     }).path).toBe('/v1/threads/thr_1/review')
   })
 
+  it('accepts the LLM debug rounds endpoint', () => {
+    expect(runtimeRequestPayloadSchema.parse({
+      path: '/v1/debug/llm-rounds',
+      method: 'GET'
+    }).path).toBe('/v1/debug/llm-rounds')
+  })
+
   it('rejects runtime request paths outside the modeled Kun API surface', () => {
     expect(() =>
       runtimeRequestPayloadSchema.parse({
@@ -132,6 +139,16 @@ describe('app-ipc-schemas', () => {
         kun: {
           port: 9000,
           model: 'deepseek-chat',
+          modelProfiles: {
+            'custom-vision-model': {
+              aliases: ['custom-vision'],
+              contextWindowTokens: 128000,
+              inputModalities: ['text', 'image'],
+              outputModalities: ['text'],
+              supportsToolCalling: true,
+              messageParts: ['text', 'image_url']
+            }
+          },
           tokenEconomy: {
             enabled: true,
             compressToolResults: false,
@@ -145,14 +162,96 @@ describe('app-ipc-schemas', () => {
         inlineCompletion: {
           model: 'deepseek-v4-pro',
           maxTokens: 128
+        },
+        selectionAssist: {
+          infographicPrompt: '手绘风格信息图。',
+          quickActions: [
+            { id: 'polish', label: '润色一下', prompt: '请润色这段文字。' },
+            { id: 'custom-1', label: '', prompt: '' }
+          ]
+        }
+      },
+      disabledSkillIds: ['test-skill-08']
+    })
+
+    expect(payload.agents?.kun?.port).toBe(9000)
+    expect(payload.agents?.kun?.modelProfiles?.['custom-vision-model']?.inputModalities).toEqual(['text', 'image'])
+    expect(payload.agents?.kun?.tokenEconomy?.enabled).toBe(true)
+    expect(payload.agents?.kun?.tokenEconomy?.historyHygiene?.maxToolResultTokens).toBe(4000)
+    expect(payload.write?.inlineCompletion?.model).toBe('deepseek-v4-pro')
+    expect(payload.write?.selectionAssist?.infographicPrompt).toBe('手绘风格信息图。')
+    expect(payload.write?.selectionAssist?.quickActions).toHaveLength(2)
+    expect(payload.disabledSkillIds).toEqual(['test-skill-08'])
+  })
+
+  it('accepts the cursor spotlight preference', () => {
+    expect(settingsPatchSchema.parse({ cursorSpotlight: false }).cursorSpotlight).toBe(false)
+  })
+
+  it('accepts media generation settings and provider capability patches', () => {
+    const payload = settingsPatchSchema.parse({
+      provider: {
+        providers: [{
+          id: 'minimax',
+          name: 'MiniMax',
+          apiKey: 'sk-media',
+          baseUrl: 'https://api.minimaxi.com/anthropic',
+          endpointFormat: 'messages',
+          models: ['MiniMax-M3'],
+          textToSpeech: {
+            protocol: 'minimax-t2a',
+            baseUrl: 'https://api.minimax.io',
+            models: ['speech-2.8-hd']
+          },
+          music: {
+            protocol: 'minimax-music',
+            baseUrl: 'https://api.minimax.io',
+            models: ['music-2.6']
+          },
+          video: {
+            protocol: 'minimax-video',
+            baseUrl: 'https://api.minimax.io',
+            models: ['MiniMax-Hailuo-2.3']
+          }
+        }]
+      },
+      agents: {
+        kun: {
+          textToSpeech: {
+            enabled: true,
+            providerId: 'minimax',
+            protocol: 'minimax-t2a',
+            model: 'speech-2.8-hd',
+            voice: 'male-qn-qingse',
+            format: 'mp3',
+            timeoutMs: 120000
+          },
+          musicGeneration: {
+            enabled: true,
+            providerId: 'minimax',
+            protocol: 'minimax-music',
+            model: 'music-2.6',
+            format: 'mp3',
+            timeoutMs: 300000
+          },
+          videoGeneration: {
+            enabled: true,
+            providerId: 'minimax',
+            protocol: 'minimax-video',
+            model: 'MiniMax-Hailuo-2.3',
+            defaultDuration: 6,
+            defaultResolution: '1080P',
+            timeoutMs: 900000,
+            pollIntervalMs: 10000
+          }
         }
       }
     })
 
-    expect(payload.agents?.kun?.port).toBe(9000)
-    expect(payload.agents?.kun?.tokenEconomy?.enabled).toBe(true)
-    expect(payload.agents?.kun?.tokenEconomy?.historyHygiene?.maxToolResultTokens).toBe(4000)
-    expect(payload.write?.inlineCompletion?.model).toBe('deepseek-v4-pro')
+    expect(payload.provider?.providers?.[0]?.textToSpeech?.models).toEqual(['speech-2.8-hd'])
+    expect(payload.agents?.kun?.textToSpeech?.enabled).toBe(true)
+    expect(payload.agents?.kun?.musicGeneration?.model).toBe('music-2.6')
+    expect(payload.agents?.kun?.videoGeneration?.defaultResolution).toBe('1080P')
   })
 
   it('accepts schedule settings patches and task payloads', () => {
@@ -161,6 +260,7 @@ describe('app-ipc-schemas', () => {
         enabled: true,
         keepAwake: true,
         defaultWorkspaceRoot: '/tmp/schedule',
+        providerId: 'minimax-token-plan',
         model: 'deepseek-v4-flash',
         mode: 'plan',
         promptPrefix: 'Use the project checklist.',
@@ -178,6 +278,8 @@ describe('app-ipc-schemas', () => {
           enabled: true,
           prompt: 'Review the repo',
           workspaceRoot: '/tmp/schedule',
+          clawChannelId: 'channel-1',
+          providerId: 'minimax-token-plan',
           model: 'auto',
           reasoningEffort: 'high',
           mode: 'agent',
@@ -193,28 +295,41 @@ describe('app-ipc-schemas', () => {
     })
 
     expect(payload.schedule?.internal?.port).toBe(9788)
+    expect(payload.schedule?.providerId).toBe('minimax-token-plan')
     expect(payload.schedule?.tasks?.[0]?.schedule?.kind).toBe('daily')
     expect(payload.schedule?.tasks?.[0]?.reasoningEffort).toBe('high')
+    expect(payload.schedule?.tasks?.[0]?.clawChannelId).toBe('channel-1')
+    expect(payload.schedule?.tasks?.[0]?.providerId).toBe('minimax-token-plan')
 
     const fromText = scheduleTaskFromTextPayloadSchema.parse({
       text: 'Remind me tomorrow morning to ship the review',
       workspaceRoot: '/tmp/schedule',
+      clawChannelId: 'channel-1',
       modelHint: 'deepseek-v4-pro',
       mode: 'agent'
     })
 
     expect(fromText.workspaceRoot).toBe('/tmp/schedule')
+    expect(fromText.clawChannelId).toBe('channel-1')
     expect(fromText.modelHint).toBe('deepseek-v4-pro')
   })
 
-  it('strips legacy settings keys before validating settings patches', () => {
+  it('strips legacy settings keys while preserving current skill settings', () => {
     const payload = settingsPatchSchema.parse({
       locale: 'zh',
+      disabledSkillIds: ['legacy-skill'],
       reasonix: { model: 'legacy-reasoner' },
       quickChat: { enabled: true },
+      provider: {
+        providers: [{
+          id: 'legacy-vision-provider',
+          imageRecognition: { enabled: true }
+        }]
+      },
       agents: {
         kun: {
-          port: 9001
+          port: 9001,
+          imageRecognition: { enabled: true }
         },
         reasonix: {
           model: 'legacy-reasoner'
@@ -226,11 +341,114 @@ describe('app-ipc-schemas', () => {
     })
 
     expect(payload.locale).toBe('zh')
+    expect(payload.provider?.providers?.[0]?.imageRecognition).toEqual({ enabled: true })
     expect(payload.agents?.kun?.port).toBe(9001)
+    expect(payload.agents?.kun?.imageRecognition).toEqual({ enabled: true })
+    expect(payload.disabledSkillIds).toEqual(['legacy-skill'])
     expect('reasonix' in payload).toBe(false)
     expect('quickChat' in payload).toBe(false)
     expect('reasonix' in (payload.agents ?? {})).toBe(false)
     expect('quickChat' in (payload.agents ?? {})).toBe(false)
+  })
+
+  it('accepts persisted claw channel welcome markers in full settings snapshots', () => {
+    const payload = settingsPatchSchema.parse({
+      claw: {
+        channels: [{
+          id: 'channel-1',
+          provider: 'weixin',
+          label: 'weixin agent',
+          enabled: true,
+          model: 'auto',
+          threadId: '',
+          workspaceRoot: '',
+          agentProfile: {
+            name: 'weixin agent',
+            description: '',
+            identity: '',
+            personality: '',
+            userContext: '',
+            replyRules: ''
+          },
+          conversations: [],
+          welcomeSentAt: '2026-06-10T00:00:00.000Z',
+          createdAt: '2026-06-10T00:00:00.000Z',
+          updatedAt: '2026-06-10T00:00:00.000Z'
+        }]
+      }
+    })
+
+    expect(payload.claw?.channels?.[0]?.welcomeSentAt).toBe('2026-06-10T00:00:00.000Z')
+  })
+
+  it('accepts partial provider profiles in settings patches', () => {
+    const payload = settingsPatchSchema.parse({
+      provider: {
+        apiKey: 'sk-updated',
+        providers: [{
+          id: 'deepseek',
+          apiKey: 'sk-updated',
+          endpointFormat: 'responses'
+        }]
+      }
+    })
+
+    expect(payload.provider?.apiKey).toBe('sk-updated')
+    expect(payload.provider?.providers?.[0]).toEqual({
+      id: 'deepseek',
+      apiKey: 'sk-updated',
+      endpointFormat: 'responses'
+    })
+  })
+
+  it('accepts model proxy settings in provider patches', () => {
+    const payload = settingsPatchSchema.parse({
+      provider: {
+        proxy: {
+          enabled: true,
+          url: 'socks5://127.0.0.1:1080'
+        }
+      }
+    })
+
+    expect(payload.provider?.proxy).toEqual({
+      enabled: true,
+      url: 'socks5://127.0.0.1:1080'
+    })
+  })
+
+  it('accepts partial keyboard shortcut binding maps in settings patches', () => {
+    const payload = settingsPatchSchema.parse({
+      keyboardShortcuts: {
+        bindings: {
+          settings: ['Ctrl+,']
+        }
+      }
+    })
+
+    expect(payload.keyboardShortcuts?.bindings?.settings).toEqual(['Ctrl+,'])
+  })
+
+  it('accepts a configurable stream idle timeout in runtime tuning patches', () => {
+    const payload = settingsPatchSchema.parse({
+      agents: {
+        kun: {
+          runtimeTuning: {
+            streamIdleTimeoutMs: 300000
+          }
+        }
+      }
+    })
+
+    expect(payload.agents?.kun?.runtimeTuning?.streamIdleTimeoutMs).toBe(300000)
+  })
+
+  it('rejects an out-of-range stream idle timeout', () => {
+    expect(() =>
+      settingsPatchSchema.parse({
+        agents: { kun: { runtimeTuning: { streamIdleTimeoutMs: -1 } } }
+      })
+    ).toThrow()
   })
 
   it('rejects unknown settings patch fields', () => {

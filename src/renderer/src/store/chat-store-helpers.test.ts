@@ -1,20 +1,31 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ClawImChannelV1 } from '@shared/app-settings'
+import type { ModelProviderModelGroup } from '@shared/kun-gui-api'
 import { CLAW_MANAGED_INSTRUCTIONS_HEADING } from '@shared/app-settings'
 import {
   MAX_TURN_MODEL_LABELS,
+  MAX_THREAD_COMPOSER_SELECTIONS,
   MAX_CODE_WORKSPACE_ROOTS,
+  DEFAULT_COMPOSER_CONTEXT_WINDOW_TOKENS,
   clawThreadIdsFromChannels,
   clawThreadTitleLooksManaged,
   compactCodeWorkspaceRoots,
+  fallbackComposerModel,
   hydrateBlockModelLabels,
   isClawThread,
+  mergeComposerPickList,
   newClawChannel,
+  normalizeThreadComposerSelectionMap,
   normalizeTurnModelMap,
-  rememberTurnModel
+  readThreadComposerSelection,
+  reconcileCodeWorkspaceRoots,
+  rememberThreadComposerSelection,
+  rememberTurnModel,
+  resolveComposerContextWindowTokens
 } from './chat-store-helpers'
 
-const TURN_MODEL_STORAGE_KEY = 'deepseekgui.turnModelLabel'
+const TURN_MODEL_STORAGE_KEY = 'kun.turnModelLabel'
+const THREAD_COMPOSER_SELECTION_STORAGE_KEY = 'kun.threadComposerSelection.v1'
 
 function createMemoryStorage(): Storage {
   const items = new Map<string, string>()
@@ -99,6 +110,16 @@ describe('chat-store Claw helpers', () => {
     ])
   })
 
+  it('deduplicates default workspace aliases', () => {
+    expect(
+      compactCodeWorkspaceRoots([
+        '~/.deepseekgui/default_workspace',
+        'C:\\Users\\zxy\\.deepseekgui\\default_workspace',
+        'C:\\Users\\zxy\\.deepseekgui\\default_workspace\\'
+      ])
+    ).toEqual(['~/.deepseekgui/default_workspace'])
+  })
+
   it('caps code workspace roots while keeping the newest unique roots first', () => {
     const roots = Array.from({ length: MAX_CODE_WORKSPACE_ROOTS + 4 }, (_, index) =>
       `/Users/zxy/project-${index}`
@@ -114,6 +135,28 @@ describe('chat-store Claw helpers', () => {
     expect(compacted[0]).toBe('/Users/zxy/project-0')
     expect(compacted.at(-1)).toBe(`/Users/zxy/project-${MAX_CODE_WORKSPACE_ROOTS - 1}`)
     expect(compacted).not.toContain(`/Users/zxy/project-${MAX_CODE_WORKSPACE_ROOTS}`)
+  })
+
+  it('drops remembered write-only workspaces from the code workspace list', () => {
+    expect(
+      reconcileCodeWorkspaceRoots({
+        currentRoots: [
+          '/Users/zxy/code-project',
+          '/Users/zxy/CodeLLMPaper',
+          '/Users/zxy/shared-project'
+        ],
+        codeThreadWorkspaceRoots: ['/Users/zxy/shared-project'],
+        writeWorkspaceRoots: [
+          '/Users/zxy/CodeLLMPaper',
+          '/Users/zxy/shared-project'
+        ],
+        preservedWorkspaceRoots: ['/Users/zxy/active-code']
+      })
+    ).toEqual([
+      '/Users/zxy/shared-project',
+      '/Users/zxy/code-project',
+      '/Users/zxy/active-code'
+    ])
   })
 
   it('collects channel and conversation thread ids for Claw sessions', () => {
@@ -147,6 +190,87 @@ describe('chat-store Claw helpers', () => {
         [clawChannel()]
       )
     ).toBe(true)
+  })
+
+  it('keeps auto out of the composer pick list', () => {
+    const pick = mergeComposerPickList(true, ['auto', 'custom-model', ' '])
+
+    expect(pick).not.toContain('auto')
+    expect(pick).toContain('custom-model')
+    expect(pick).toContain('deepseek-v4-pro')
+    expect(pick).toContain('deepseek-v4-flash')
+    expect(mergeComposerPickList(false, ['upstream-model'])).not.toContain('upstream-model')
+  })
+
+  it('falls back to the runtime default model, then known defaults', () => {
+    const pick = ['a-model', 'custom-model', 'deepseek-v4-flash', 'deepseek-v4-pro']
+
+    expect(fallbackComposerModel(pick, 'custom-model')).toBe('custom-model')
+    expect(fallbackComposerModel(pick, 'auto')).toBe('deepseek-v4-pro')
+    expect(fallbackComposerModel(pick, 'missing-model')).toBe('deepseek-v4-pro')
+    expect(fallbackComposerModel(['a-model'], '')).toBe('a-model')
+    expect(fallbackComposerModel([], '')).toBe('')
+  })
+
+  it('resolves context windows from the selected provider model profile', () => {
+    const modelGroups: ModelProviderModelGroup[] = [
+      {
+        providerId: 'other',
+        label: 'Other',
+        modelIds: ['glm-4.5'],
+        modelProfiles: {
+          'glm-4.5': {
+            contextWindowTokens: 256_000,
+            inputModalities: ['text'],
+            outputModalities: ['text'],
+            supportsToolCalling: true,
+            messageParts: ['text']
+          }
+        }
+      },
+      {
+        providerId: 'zhipu',
+        label: 'Zhipu',
+        modelIds: ['glm-4.5'],
+        modelProfiles: {
+          'glm-4.5': {
+            contextWindowTokens: 200_000,
+            inputModalities: ['text'],
+            outputModalities: ['text'],
+            supportsToolCalling: true,
+            messageParts: ['text']
+          }
+        }
+      }
+    ]
+
+    expect(resolveComposerContextWindowTokens(modelGroups, 'glm-4.5', 'zhipu')).toBe(200_000)
+  })
+
+  it('falls back to 128k when the selected model lacks a configured window', () => {
+    const modelGroups: ModelProviderModelGroup[] = [
+      {
+        providerId: 'custom',
+        label: 'Custom',
+        modelIds: ['custom-model'],
+        modelProfiles: {
+          'custom-model': {
+            inputModalities: ['text'],
+            outputModalities: ['text'],
+            supportsToolCalling: true,
+            messageParts: ['text']
+          }
+        }
+      }
+    ]
+
+    expect(resolveComposerContextWindowTokens(modelGroups, 'custom-model', 'custom')).toBe(
+      DEFAULT_COMPOSER_CONTEXT_WINDOW_TOKENS
+    )
+    expect(resolveComposerContextWindowTokens(modelGroups, 'missing-model', 'custom')).toBe(
+      DEFAULT_COMPOSER_CONTEXT_WINDOW_TOKENS
+    )
+    expect(resolveComposerContextWindowTokens(modelGroups, '', 'custom')).toBeUndefined()
   })
 
   it('normalizes and caps persisted turn model labels', () => {
@@ -191,5 +315,44 @@ describe('chat-store Claw helpers', () => {
       { kind: 'user', id: 'item-new', text: 'hello', modelLabel: 'deepseek-chat' },
       { kind: 'assistant', id: 'assistant-1', text: 'hi' }
     ])
+  })
+
+  it('normalizes and caps per-thread composer selections', () => {
+    const raw: Record<string, unknown> = {
+      'bad-empty-model': { model: '' },
+      'bad-number': 42
+    }
+    for (let index = 0; index < MAX_THREAD_COMPOSER_SELECTIONS + 5; index += 1) {
+      raw[`thread-${index}`] = {
+        model: ` model-${index} `,
+        providerId: ` provider-${index} `
+      }
+    }
+
+    const normalized = normalizeThreadComposerSelectionMap(raw)
+
+    expect(Object.keys(normalized)).toHaveLength(MAX_THREAD_COMPOSER_SELECTIONS)
+    expect(normalized['thread-0']).toBeUndefined()
+    expect(normalized['thread-5']).toEqual({ model: 'model-5', providerId: 'provider-5' })
+    expect(normalized['bad-empty-model']).toBeUndefined()
+    expect(normalized['bad-number']).toBeUndefined()
+  })
+
+  it('persists composer model selections independently per thread', () => {
+    rememberThreadComposerSelection(' thread-a ', ' deepseek-v4-pro ', ' deepseek ')
+    rememberThreadComposerSelection(' thread-b ', ' MiniMax-M2 ', ' minimax ')
+
+    expect(readThreadComposerSelection('thread-a')).toEqual({
+      model: 'deepseek-v4-pro',
+      providerId: 'deepseek'
+    })
+    expect(readThreadComposerSelection('thread-b')).toEqual({
+      model: 'MiniMax-M2',
+      providerId: 'minimax'
+    })
+    expect(JSON.parse(localStorage.getItem(THREAD_COMPOSER_SELECTION_STORAGE_KEY) ?? '{}')).toMatchObject({
+      'thread-a': { model: 'deepseek-v4-pro', providerId: 'deepseek' },
+      'thread-b': { model: 'MiniMax-M2', providerId: 'minimax' }
+    })
   })
 })

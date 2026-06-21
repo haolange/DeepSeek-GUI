@@ -1,5 +1,5 @@
 import type { ReactElement } from 'react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import type { EditorInfo } from '@shared/editor'
 import type { GuiUpdateState } from '@shared/gui-update'
 import {
@@ -11,6 +11,7 @@ import {
   Download,
   ExternalLink,
   FileEdit,
+  Files,
   FolderOpen,
   Globe2,
   ListTodo,
@@ -22,16 +23,28 @@ import {
 import { useTranslation } from 'react-i18next'
 import { readPreferredEditorId, writePreferredEditorId } from '../../lib/editor-preferences'
 
-export type RightPanelMode = 'todo' | 'changes' | 'browser' | 'file' | 'plan' | 'sdd-ai' | null
+export type RightPanelMode =
+  | 'todo'
+  | 'changes'
+  | 'browser'
+  | 'file'
+  | 'plan'
+  | 'sdd-ai'
+  | null
 
 type Props = {
   rightPanelMode: RightPanelMode
   onToggleRightPanelMode: (mode: Exclude<RightPanelMode, null>) => void
   planPanelEnabled?: boolean
+  terminalOpen?: boolean
+  onToggleTerminal?: () => void
   sideChatCount?: number
   sideChatRunningCount?: number
   sideChatOpen?: boolean
   sideChatEnabled?: boolean
+  fileTreeOpen?: boolean
+  fileTreeEnabled?: boolean
+  onToggleFileTree?: () => void
   onOpenSideChat?: () => void
 }
 
@@ -39,10 +52,15 @@ export function WorkbenchTopBar({
   rightPanelMode,
   onToggleRightPanelMode,
   planPanelEnabled = false,
+  terminalOpen = false,
+  onToggleTerminal,
   sideChatCount = 0,
   sideChatRunningCount = 0,
   sideChatOpen = false,
   sideChatEnabled = true,
+  fileTreeOpen = false,
+  fileTreeEnabled = true,
+  onToggleFileTree,
   onOpenSideChat
 }: Props): ReactElement {
   const { t } = useTranslation(['common', 'settings'])
@@ -66,9 +84,9 @@ export function WorkbenchTopBar({
 
   useEffect(() => {
     let cancelled = false
-    if (typeof window.dsGui?.listEditors !== 'function') return
+    if (typeof window.kunGui?.listEditors !== 'function') return
 
-    void window.dsGui.listEditors()
+    void window.kunGui.listEditors()
       .then((result) => {
         if (cancelled) return
         const available = result.editors.filter((editor) => editor.available)
@@ -100,13 +118,13 @@ export function WorkbenchTopBar({
   }, [editorMenuOpen])
 
   useEffect(() => {
-    if (typeof window.dsGui?.onGuiUpdateState !== 'function') return
+    if (typeof window.kunGui?.onGuiUpdateState !== 'function') return
     const applyState = (state: GuiUpdateState): void => {
       setGuiUpdateState(state)
     }
-    const unsubscribe = window.dsGui.onGuiUpdateState(applyState)
-    if (typeof window.dsGui?.getGuiUpdateState === 'function') {
-      void window.dsGui.getGuiUpdateState().then(applyState).catch(() => undefined)
+    const unsubscribe = window.kunGui.onGuiUpdateState(applyState)
+    if (typeof window.kunGui?.getGuiUpdateState === 'function') {
+      void window.kunGui.getGuiUpdateState().then(applyState).catch(() => undefined)
     }
     return unsubscribe
   }, [])
@@ -193,14 +211,14 @@ export function WorkbenchTopBar({
   const runGuiUpdateAction = async (): Promise<void> => {
     if (!guiUpdateAction || guiUpdateBusy) return
     if (guiUpdateAction.manualOnly) {
-      if (typeof window.dsGui?.openExternal === 'function') {
-        await window.dsGui.openExternal(guiUpdateAction.releaseUrl)
+      if (typeof window.kunGui?.openExternal === 'function') {
+        await window.kunGui.openExternal(guiUpdateAction.releaseUrl)
       }
       return
     }
     if (
-      typeof window.dsGui?.downloadGuiUpdate !== 'function' ||
-      typeof window.dsGui?.installGuiUpdate !== 'function'
+      typeof window.kunGui?.downloadGuiUpdate !== 'function' ||
+      typeof window.kunGui?.installGuiUpdate !== 'function'
     ) {
       return
     }
@@ -208,19 +226,19 @@ export function WorkbenchTopBar({
     setApplyingGuiUpdate(true)
     try {
       if (!guiUpdateAction.downloaded && guiUpdateState.status !== 'downloaded') {
-        const downloadResult = await window.dsGui.downloadGuiUpdate(guiUpdateAction.channel)
+        const downloadResult = await window.kunGui.downloadGuiUpdate(guiUpdateAction.channel)
         if (!downloadResult.ok) return
       }
-      const installResult = await window.dsGui.installGuiUpdate()
-      if (!installResult.ok && typeof window.dsGui?.logError === 'function') {
-        await window.dsGui.logError('gui-update', 'Failed to install GUI update from workbench top bar', {
+      const installResult = await window.kunGui.installGuiUpdate()
+      if (!installResult.ok && typeof window.kunGui?.logError === 'function') {
+        await window.kunGui.logError('gui-update', 'Failed to install GUI update from workbench top bar', {
           version: guiUpdateAction.latestVersion,
           message: installResult.message
         })
       }
     } catch (error) {
-      if (typeof window.dsGui?.logError === 'function') {
-        await window.dsGui.logError('gui-update', 'Failed to apply GUI update from workbench top bar', {
+      if (typeof window.kunGui?.logError === 'function') {
+        await window.kunGui.logError('gui-update', 'Failed to apply GUI update from workbench top bar', {
           version: guiUpdateAction.latestVersion,
           message: error instanceof Error ? error.message : String(error)
         })
@@ -280,7 +298,7 @@ export function WorkbenchTopBar({
         </button>
 
         {editorMenuOpen ? (
-          <div className="ds-card-strong absolute right-0 top-full z-50 mt-2 w-64 overflow-hidden rounded-[18px] border border-ds-border py-1.5 shadow-[0_18px_52px_rgba(15,23,42,0.18)] backdrop-blur-xl dark:shadow-[0_22px_58px_rgba(0,0,0,0.38)]">
+          <div className="ds-card-strong absolute right-0 top-full z-50 mt-2 w-64 overflow-hidden rounded-[18px] border border-ds-border py-1.5 shadow-[0_18px_52px_rgba(20,47,95,0.18)] backdrop-blur-xl dark:shadow-[0_22px_58px_rgba(0,0,0,0.38)]">
             <div className="border-b border-ds-border-muted px-3 pb-2 pt-1.5 text-[11px] font-semibold text-ds-faint">
               {t('editorPickerMenuTitle')}
             </div>
@@ -341,24 +359,60 @@ export function WorkbenchTopBar({
       {items.map((item) => {
         const active = rightPanelMode === item.mode
         const Icon = item.icon
+        const isChanges = item.mode === 'changes'
         return (
-          <button
-            key={item.mode}
-            type="button"
-            onClick={() => onToggleRightPanelMode(item.mode)}
-            className={`rounded-full border px-2.5 py-1.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.45)] transition dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.05)] ${
-              active
-                ? 'border-ds-border-strong bg-white/70 text-ds-ink dark:bg-white/10'
-                : 'border-transparent bg-white/38 text-ds-faint opacity-90 hover:border-ds-border-muted hover:bg-white/55 hover:text-ds-ink hover:opacity-100 dark:bg-white/4 dark:hover:bg-white/8'
-            }`}
-            aria-label={item.label}
-            aria-pressed={active}
-            title={item.label}
-          >
-            <Icon className="h-4 w-4" strokeWidth={1.75} />
-          </button>
+          <Fragment key={item.mode}>
+            <button
+              type="button"
+              onClick={() => onToggleRightPanelMode(item.mode)}
+              className={`rounded-full border px-2.5 py-1.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.45)] transition dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.05)] ${
+                active
+                  ? 'border-ds-border-strong bg-white/70 text-ds-ink dark:bg-white/10'
+                  : 'border-transparent bg-white/38 text-ds-faint opacity-90 hover:border-ds-border-muted hover:bg-white/55 hover:text-ds-ink hover:opacity-100 dark:bg-white/4 dark:hover:bg-white/8'
+              }`}
+              aria-label={item.label}
+              aria-pressed={active}
+              title={item.label}
+            >
+              <Icon className="h-4 w-4" strokeWidth={1.75} />
+            </button>
+            {isChanges && onToggleTerminal ? (
+              <button
+                type="button"
+                onClick={onToggleTerminal}
+                className={`rounded-full border px-2.5 py-1.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.45)] transition dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.05)] ${
+                  terminalOpen
+                    ? 'border-ds-border-strong bg-white/70 text-ds-ink dark:bg-white/10'
+                    : 'border-transparent bg-white/38 text-ds-faint opacity-90 hover:border-ds-border-muted hover:bg-white/55 hover:text-ds-ink hover:opacity-100 dark:bg-white/4 dark:hover:bg-white/8'
+                }`}
+                aria-label={t('rightPanelTerminal')}
+                aria-pressed={terminalOpen}
+                title={t('rightPanelTerminal')}
+              >
+                <Terminal className="h-4 w-4" strokeWidth={1.75} />
+              </button>
+            ) : null}
+          </Fragment>
         )
       })}
+
+      {onToggleFileTree ? (
+        <button
+          type="button"
+          onClick={onToggleFileTree}
+          disabled={!fileTreeEnabled}
+          className={`rounded-full border px-2.5 py-1.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.45)] transition disabled:cursor-not-allowed disabled:opacity-45 dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.05)] ${
+            fileTreeOpen
+              ? 'border-ds-border-strong bg-white/70 text-ds-ink dark:bg-white/10'
+              : 'border-transparent bg-white/38 text-ds-faint opacity-90 hover:border-ds-border-muted hover:bg-white/55 hover:text-ds-ink hover:opacity-100 dark:bg-white/4 dark:hover:bg-white/8'
+          }`}
+          aria-label={t('rightPanelFiles')}
+          aria-pressed={fileTreeOpen}
+          title={t('rightPanelFiles')}
+        >
+          <Files className="h-4 w-4" strokeWidth={1.75} />
+        </button>
+      ) : null}
     </div>
   )
 }

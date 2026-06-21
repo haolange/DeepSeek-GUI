@@ -1,10 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import {
   mergeScheduleSettings,
   defaultClawSettings,
+  defaultKeyboardShortcuts,
   defaultKunRuntimeSettings,
   defaultModelProviderSettings,
   defaultScheduleSettings,
+  defaultWorkflowSettings,
   defaultWriteSettings,
   type AppSettingsPatch,
   type AppSettingsV1
@@ -38,23 +43,32 @@ function settings(): AppSettingsV1 {
     workspaceRoot: '/tmp/workspace',
     log: { enabled: false, retentionDays: 7 },
     notifications: { turnComplete: true },
+    appBehavior: { openAtLogin: false, startMinimized: false, closeToTray: false },
+    keyboardShortcuts: defaultKeyboardShortcuts(),
     write: defaultWriteSettings(),
     claw: defaultClawSettings(),
     schedule: defaultScheduleSettings(),
-    guiUpdate: { channel: 'stable' }
+    workflow: defaultWorkflowSettings(),
+    guiUpdate: { channel: 'stable' },
+    codePromptPrefix: '',
+    disabledSkillIds: []
   }
 }
 
 function registerOptions(overrides: Partial<Parameters<typeof import('./register-app-ipc-handlers').registerAppIpcHandlers>[0]> = {}) {
   const applySettingsPatch = vi.fn(async () => settings())
+  const saveSettingsPatch = vi.fn(async () => settings())
   return {
     store: { load: vi.fn(async () => settings()) } as never,
     getMainWindow: () => null,
     applySettingsPatch,
+    saveSettingsPatch,
     runtimeRequest: vi.fn() as never,
+    restartRuntime: vi.fn(async () => undefined),
     fetchUpstreamModels: vi.fn() as never,
     getClawRuntime: () => null,
     getScheduleRuntime: () => null,
+    getWorkflowRuntime: () => null,
     startFeishuInstallQrcode: vi.fn() as never,
     pollFeishuInstall: vi.fn() as never,
     startWeixinInstallQrcode: vi.fn() as never,
@@ -108,6 +122,88 @@ describe('registerAppIpcHandlers', () => {
     expect(applySettingsPatch).toHaveBeenCalledWith(payload)
   })
 
+  it('accepts telegram phone connection settings patches', async () => {
+    const { registerAppIpcHandlers } = await import('./register-app-ipc-handlers')
+    const applySettingsPatch = vi.fn(async () => settings())
+
+    registerAppIpcHandlers(registerOptions({ applySettingsPatch }))
+
+    const payload = {
+      claw: {
+        enabled: true,
+        im: { enabled: true, workspaceRoot: '' },
+        channels: [{
+          id: 'telegram_1',
+          provider: 'telegram' as const,
+          label: 'telegram agent',
+          enabled: true,
+          model: 'auto',
+          threadId: '',
+          workspaceRoot: '',
+          agentProfile: {
+            name: 'telegram agent',
+            description: '',
+            identity: '',
+            personality: '',
+            userContext: '',
+            replyRules: ''
+          },
+          platformCredential: {
+            kind: 'telegram' as const,
+            botToken: '123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi',
+            allowedChatIds: '123456789',
+            botUsername: 'kun_test_bot',
+            createdAt: '2026-06-19T00:00:00.000Z'
+          },
+          conversations: [],
+          createdAt: '2026-06-19T00:00:00.000Z',
+          updatedAt: '2026-06-19T00:00:00.000Z'
+        }]
+      }
+    }
+
+    const handler = handlers.get('settings:set')
+    await expect(handler?.({}, payload)).resolves.toEqual(settings())
+    expect(applySettingsPatch).toHaveBeenCalledWith(payload)
+  })
+
+  it('restarts the managed runtime through the restart IPC handler', async () => {
+    const { registerAppIpcHandlers } = await import('./register-app-ipc-handlers')
+    const restartRuntime = vi.fn(async () => undefined)
+
+    registerAppIpcHandlers(registerOptions({ restartRuntime }))
+
+    await expect(handlers.get('runtime:restart')?.({})).resolves.toBeUndefined()
+    expect(restartRuntime).toHaveBeenCalledTimes(1)
+  })
+
+  it('saves generated files to a user-selected path', async () => {
+    const { dialog } = await import('electron')
+    const { registerAppIpcHandlers } = await import('./register-app-ipc-handlers')
+    const temp = mkdtempSync(join(tmpdir(), 'kun-save-as-'))
+    const source = join(temp, 'source.png')
+    const target = join(temp, 'downloaded.png')
+    writeFileSync(source, 'generated-image')
+    ;(dialog as unknown as { showSaveDialog: ReturnType<typeof vi.fn> }).showSaveDialog = vi.fn(async () => ({
+      canceled: false,
+      filePath: target
+    }))
+
+    try {
+      registerAppIpcHandlers(registerOptions())
+
+      const handler = handlers.get('file:save-as')
+      await expect(handler?.({}, {
+        sourcePath: source,
+        suggestedName: 'source.png',
+        mimeType: 'image/png'
+      })).resolves.toEqual({ ok: true, path: target })
+      expect(readFileSync(target, 'utf8')).toBe('generated-image')
+    } finally {
+      rmSync(temp, { recursive: true, force: true })
+    }
+  })
+
   it('accepts the full settings snapshot emitted by SettingsView auto-apply', async () => {
     const { registerAppIpcHandlers } = await import('./register-app-ipc-handlers')
     const applySettingsPatch = vi.fn(async () => settings())
@@ -151,6 +247,62 @@ describe('registerAppIpcHandlers', () => {
       }
     })
     expect(applySettingsPatch).toHaveBeenCalledWith(payload)
+  })
+
+  it('writes MCP config JSON and notifies the runtime apply hook', async () => {
+    const { registerAppIpcHandlers } = await import('./register-app-ipc-handlers')
+    const tempRoot = mkdtempSync(join(tmpdir(), 'deepseek-gui-ipc-'))
+    const configPath = join(tempRoot, 'mcp.json')
+    const onKunMcpConfigWritten = vi.fn(async () => undefined)
+    const content = `${JSON.stringify({
+      servers: {
+        filesystem: {
+          command: 'npx',
+          args: ['-y', '@modelcontextprotocol/server-filesystem', '/tmp/project']
+        }
+      }
+    }, null, 2)}\n`
+
+    try {
+      registerAppIpcHandlers(registerOptions({
+        resolveKunConfigPath: () => configPath,
+        onKunMcpConfigWritten
+      }))
+
+      await expect(handlers.get('kun:config:write')?.({}, content)).resolves.toEqual({
+        ok: true,
+        path: configPath
+      })
+      expect(readFileSync(configPath, 'utf8')).toBe(content)
+      expect(onKunMcpConfigWritten).toHaveBeenCalledWith(configPath, content)
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects invalid MCP config JSON before writing or applying it', async () => {
+    const { registerAppIpcHandlers } = await import('./register-app-ipc-handlers')
+    const tempRoot = mkdtempSync(join(tmpdir(), 'deepseek-gui-ipc-'))
+    const configPath = join(tempRoot, 'mcp.json')
+    const onKunMcpConfigWritten = vi.fn(async () => undefined)
+
+    try {
+      registerAppIpcHandlers(registerOptions({
+        resolveKunConfigPath: () => configPath,
+        onKunMcpConfigWritten
+      }))
+
+      await expect(handlers.get('kun:config:write')?.({}, '{')).rejects.toThrow(
+        /MCP config must be JSON/
+      )
+      await expect(handlers.get('kun:config:write')?.({}, '[]')).rejects.toThrow(
+        /MCP config must be a JSON object/
+      )
+      expect(existsSync(configPath)).toBe(false)
+      expect(onKunMcpConfigWritten).not.toHaveBeenCalled()
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true })
+    }
   })
 
   it('uses the GUI-managed WeChat bridge for WeChat install handlers', async () => {
@@ -216,6 +368,7 @@ describe('registerAppIpcHandlers', () => {
       handlers.get('schedule:task:create-from-text')?.({}, {
         text: 'Remind me tomorrow.',
         workspaceRoot: '/tmp/schedule',
+        clawChannelId: 'channel-1',
         modelHint: 'deepseek-v4-flash',
         mode: 'plan'
       })
@@ -227,6 +380,7 @@ describe('registerAppIpcHandlers', () => {
     expect(scheduleRuntime.runTask).toHaveBeenCalledWith('task-1')
     expect(scheduleRuntime.createScheduledTaskFromText).toHaveBeenCalledWith('Remind me tomorrow.', {
       workspaceRoot: '/tmp/schedule',
+      clawChannelId: 'channel-1',
       modelHint: 'deepseek-v4-flash',
       mode: 'plan'
     })

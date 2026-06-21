@@ -1,6 +1,6 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { basename, dirname, join } from 'node:path'
+import { basename, dirname, join, posix } from 'node:path'
 import type { AppSettingsV1 } from '../shared/app-settings'
 
 const CLAW_SCHEDULE_MCP_MARKER_START = '# DeepSeek GUI plugin:mcp:claw-schedule START'
@@ -57,10 +57,21 @@ export function buildClawScheduleMcpArgs(
   if (secret) {
     args.push('--secret', secret)
   }
+  // Also advertise the workflow tools (list_workflows / run_workflow), which the
+  // same bridge serves by calling the WorkflowRuntime's local /workflow/internal/*
+  // endpoints (hosted on the workflow webhook port + secret).
+  args.push('--workflow-base-url', `http://127.0.0.1:${settings.workflow.webhookPort}`)
+  const workflowSecret = settings.workflow.webhookSecret.trim()
+  if (workflowSecret) {
+    args.push('--workflow-secret', workflowSecret)
+  }
   return args
 }
 
 export function resolveClawScheduleMcpNodeEntryPath(launch: ClawScheduleMcpLaunchConfig): string {
+  if (launch.appPath.includes('/') && !launch.appPath.includes('\\')) {
+    return posix.join(launch.appPath, GUI_SCHEDULE_MCP_NODE_ENTRY)
+  }
   return join(launch.appPath, GUI_SCHEDULE_MCP_NODE_ENTRY)
 }
 
@@ -71,10 +82,10 @@ export function resolveClawScheduleMcpCommand(
   if (platform !== 'darwin') return launch.execPath
   if (!launch.execPath.includes('/Contents/MacOS/')) return launch.execPath
 
-  const appContentsDir = dirname(dirname(launch.execPath))
-  const appName = basename(launch.execPath)
+  const appContentsDir = posix.dirname(posix.dirname(launch.execPath))
+  const appName = posix.basename(launch.execPath)
   const helperName = `${appName} Helper`
-  return join(
+  return posix.join(
     appContentsDir,
     'Frameworks',
     `${helperName}.app`,
@@ -212,7 +223,9 @@ async function cleanupLegacyTomlConfig(path: string): Promise<void> {
 export function clawScheduleMcpSettingsChanged(prev: AppSettingsV1, next: AppSettingsV1): boolean {
   return (
     prev.schedule.internal.port !== next.schedule.internal.port ||
-    prev.schedule.internal.secret.trim() !== next.schedule.internal.secret.trim()
+    prev.schedule.internal.secret.trim() !== next.schedule.internal.secret.trim() ||
+    prev.workflow.webhookPort !== next.workflow.webhookPort ||
+    prev.workflow.webhookSecret.trim() !== next.workflow.webhookSecret.trim()
   )
 }
 

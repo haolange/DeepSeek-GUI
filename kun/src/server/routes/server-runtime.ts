@@ -9,10 +9,17 @@ import type { UserInputGate } from '../../ports/user-input-gate.js'
 import type { WorkspaceInspector } from '../../ports/workspace-inspector.js'
 import type { ToolHost, ToolProviderPolicy } from '../../ports/tool-host.js'
 import type { RuntimeEventRecorder } from '../../services/runtime-event-recorder.js'
+import type { LlmDebugRecorder } from '../../services/llm-debug-recorder.js'
 import type { RuntimeInfoResponse } from '../../contracts/runtime-info.js'
 import type { McpServerDiagnostic } from '../../adapters/tool/mcp-tool-provider.js'
 import type { McpSearchRuntimeDiagnostic } from '../../adapters/tool/mcp-tool-search.js'
 import type { WebProviderDiagnostic } from '../../adapters/tool/web-tool-provider.js'
+import type { ImageGenDiagnostic } from '../../adapters/tool/image-gen-tool-provider.js'
+import type {
+  MusicGenDiagnostic,
+  SpeechGenDiagnostic,
+  VideoGenDiagnostic
+} from '../../adapters/tool/media-gen-tool-provider.js'
 import type { SkillRuntimeDiagnostics } from '../../skills/skill-runtime.js'
 import type { AttachmentDiagnostics } from '../../contracts/attachments.js'
 import type { AttachmentStore } from '../../attachments/attachment-store.js'
@@ -28,6 +35,10 @@ export type RuntimeToolDiagnostics = {
   skills: SkillRuntimeDiagnostics
   attachments: AttachmentDiagnostics
   memory: MemoryDiagnostics
+  imageGen?: ImageGenDiagnostic[]
+  speechGen?: SpeechGenDiagnostic[]
+  musicGen?: MusicGenDiagnostic[]
+  videoGen?: VideoGenDiagnostic[]
 }
 
 /**
@@ -43,6 +54,8 @@ export type ServerRuntime = {
   eventBus: EventBus
   sessionStore: SessionStore
   events: RuntimeEventRecorder
+  /** Optional troubleshooting buffer of the most recent LLM rounds (in-memory). */
+  llmDebug?: LlmDebugRecorder
   approvalGate: ApprovalGate
   userInputGate: UserInputGate
   workspaceInspector: WorkspaceInspector
@@ -50,6 +63,12 @@ export type ServerRuntime = {
   attachmentStore?: AttachmentStore
   memoryStore?: MemoryStore
   runTurn(threadId: string, turnId: string): Promise<'completed' | 'failed' | 'aborted'> | void
+  /**
+   * Relaunch goal continuation turns for threads whose in-flight turn was
+   * just reconciled to `failed` after a runtime restart. Returns the number
+   * of goals resumed. Optional so embedders without the agent loop can omit it.
+   */
+  resumeInterruptedGoals?(threadIds: readonly string[]): Promise<number>
   runReview?(input: {
     threadId: string
     turnId: string

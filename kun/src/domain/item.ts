@@ -10,8 +10,18 @@ export function makeUserItem(input: {
   text: string
   displayText?: string
   attachmentIds?: string[]
+  fileReferences?: Array<{ path: string; relativePath: string; name: string; kind?: 'file' | 'directory' }>
+  workspaceCheckpointId?: string
 }): TurnItem {
   const attachmentIds = input.attachmentIds?.filter((id) => id.trim().length > 0)
+  const fileReferences = input.fileReferences
+    ?.map((reference) => ({
+      path: reference.path.trim(),
+      relativePath: reference.relativePath.trim(),
+      name: reference.name.trim(),
+      ...(reference.kind === 'directory' ? { kind: 'directory' as const } : { kind: 'file' as const })
+    }))
+    .filter((reference) => reference.path && reference.relativePath && reference.name)
   const displayText = input.displayText?.trim()
   return {
     id: input.id,
@@ -24,7 +34,9 @@ export function makeUserItem(input: {
     kind: 'user_message',
     text: input.text,
     ...(displayText && displayText !== input.text ? { displayText } : {}),
-    ...(attachmentIds?.length ? { attachmentIds } : {})
+    ...(attachmentIds?.length ? { attachmentIds } : {}),
+    ...(fileReferences?.length ? { fileReferences } : {}),
+    ...(input.workspaceCheckpointId ? { workspaceCheckpointId: input.workspaceCheckpointId } : {})
   }
 }
 
@@ -183,6 +195,7 @@ export function makeCompactionItem(input: {
   summary: string
   replacedTokens: number
   pinnedConstraints: string[]
+  auto?: boolean
   sourceDigest?: string
   digestMarker?: string
   sourceItemIds?: string[]
@@ -199,6 +212,7 @@ export function makeCompactionItem(input: {
     summary: input.summary,
     replacedTokens: input.replacedTokens,
     pinnedConstraints: input.pinnedConstraints,
+    ...(input.auto === undefined ? {} : { auto: input.auto }),
     ...(input.sourceDigest ? { sourceDigest: input.sourceDigest } : {}),
     ...(input.digestMarker ? { digestMarker: input.digestMarker } : {}),
     ...(input.sourceItemIds ? { sourceItemIds: [...input.sourceItemIds] } : {})
@@ -243,6 +257,8 @@ export function makeErrorItem(input: {
   threadId: string
   message: string
   code?: string
+  details?: unknown
+  severity?: 'info' | 'warning' | 'error'
 }): TurnItem {
   return {
     id: input.id,
@@ -254,6 +270,8 @@ export function makeErrorItem(input: {
     finishedAt: new Date().toISOString(),
     kind: 'error',
     message: input.message,
-    code: input.code
+    ...(input.code ? { code: input.code } : {}),
+    ...(input.details !== undefined ? { details: input.details } : {}),
+    ...(input.severity ? { severity: input.severity } : {})
   }
 }

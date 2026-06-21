@@ -5,7 +5,11 @@ import { CheckCircle2, ChevronDown, ChevronRight, FileEdit, Hammer, ListTodo, Me
 import type { ReviewBlock, ToolBlock } from '../../agent/types'
 import { countDiffStats, sumDiffStats } from '../../lib/diff-stats'
 import { useDeferredRender } from '../../hooks/use-deferred-render'
-import type { WritePromptDisplay, WritePromptDisplayQuote } from '../../write/quoted-selection'
+import type {
+  WritePromptDisplay,
+  WritePromptDisplayQuote,
+  WritePromptDisplayRetrieval
+} from '../../write/quoted-selection'
 import { DiffView } from '../DiffView'
 import { formatDuration } from './message-timeline-tools'
 
@@ -31,7 +35,7 @@ export function ReviewPlanCard({
   return (
     <div
       title={relativePath}
-      className="flex min-h-[64px] w-full items-center gap-3 rounded-[18px] border border-ds-border-muted bg-white/[0.78] px-4 py-3 shadow-[0_12px_34px_rgba(15,23,42,0.07)] backdrop-blur-xl dark:border-white/[0.09] dark:bg-white/[0.045]"
+      className="flex min-h-[64px] w-full items-center gap-3 rounded-[18px] border border-ds-border-muted bg-white/[0.78] px-4 py-3 shadow-[0_12px_34px_rgba(20,47,95,0.07)] backdrop-blur-xl dark:border-white/[0.09] dark:bg-white/[0.045]"
     >
       <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-accent/20 bg-accent/10 text-accent">
         <ListTodo className="h-5 w-5" strokeWidth={1.9} />
@@ -55,7 +59,7 @@ export function ReviewPlanCard({
           type="button"
           onClick={onBuild}
           disabled={busy}
-          className="inline-flex h-9 shrink-0 items-center gap-1.5 rounded-full bg-accent px-4 text-[13px] font-semibold text-white shadow-[0_10px_24px_rgba(0,136,255,0.22)] transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
+          className="inline-flex h-9 shrink-0 items-center gap-1.5 rounded-full bg-accent px-4 text-[13px] font-semibold text-white shadow-[0_10px_24px_rgba(59,130,216,0.22)] transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
         >
           <Hammer className="h-3.5 w-3.5" strokeWidth={1.9} />
           {t('planBuild')}
@@ -171,10 +175,12 @@ export function ReviewSummaryCard({ review }: { review: ReviewBlock }): ReactEle
 
 export function TurnChangeSummary({
   changes,
-  viewportRef
+  viewportRef,
+  compact = false
 }: {
   changes: ToolBlock[]
   viewportRef: RefObject<HTMLDivElement | null>
+  compact?: boolean
 }): ReactElement {
   const { t } = useTranslation('common')
   const [expanded, setExpanded] = useState(false)
@@ -207,22 +213,36 @@ export function TurnChangeSummary({
   })
 
   return (
-    <section className="ds-card-strong overflow-hidden rounded-[24px] border border-ds-border shadow-[0_16px_40px_rgba(86,103,136,0.08)]">
+    <section
+      className={`ds-card-strong overflow-hidden border border-ds-border shadow-[0_16px_40px_rgba(86,103,136,0.08)] ${
+        compact ? 'rounded-[20px]' : 'rounded-[24px]'
+      }`}
+    >
       <button
         type="button"
         onClick={() => setExpanded((value) => !value)}
         aria-expanded={expanded}
-        className="flex w-full items-center gap-4 px-5 py-4 text-left transition hover:bg-ds-hover/40"
+        className={`flex w-full items-center text-left transition hover:bg-ds-hover/40 ${
+          compact ? 'gap-3 px-4 py-3' : 'gap-4 px-5 py-4'
+        }`}
       >
-        <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-[16px] bg-ds-card-muted text-ds-muted">
-          <FileEdit className="h-5 w-5" strokeWidth={1.85} />
+        <span
+          className={`flex shrink-0 items-center justify-center bg-ds-card-muted text-ds-muted ${
+            compact ? 'h-10 w-10 rounded-[14px]' : 'h-12 w-12 rounded-[16px]'
+          }`}
+        >
+          <FileEdit className={compact ? 'h-4.5 w-4.5' : 'h-5 w-5'} strokeWidth={1.85} />
         </span>
         <span className="min-w-0 flex-1">
-          <span className="block text-[18px] font-semibold tracking-[-0.02em] text-ds-ink">
+          <span
+            className={`block font-semibold tracking-[-0.02em] text-ds-ink ${
+              compact ? 'text-[15px]' : 'text-[18px]'
+            }`}
+          >
             {title}
           </span>
           {totals ? (
-            <span className="mt-1 block font-mono text-[12px]">
+            <span className={`block font-mono ${compact ? 'mt-0.5 text-[11px]' : 'mt-1 text-[12px]'}`}>
               <span className="text-ds-diff-added">+{totals.added}</span>
               <span className="mx-1.5 text-ds-faint">·</span>
               <span className="text-ds-diff-removed">-{totals.removed}</span>
@@ -240,7 +260,7 @@ export function TurnChangeSummary({
         <div
           ref={deferredBodyRef}
           className="border-t border-ds-border-muted/70"
-          style={{ contentVisibility: 'auto', containIntrinsicSize: 'auto 280px' }}
+          style={{ contentVisibility: 'auto', containIntrinsicSize: compact ? 'auto 180px' : 'auto 280px' }}
         >
           {shouldRenderBody
             ? changes.map((change) => {
@@ -254,17 +274,20 @@ export function TurnChangeSummary({
                   type="button"
                   onClick={() => setActiveId(open ? null : change.id)}
                   aria-expanded={open}
-                  className={`flex w-full items-start gap-3 px-5 py-3 text-left transition ${
+                  className={`flex w-full items-start text-left transition ${
                     open ? 'bg-ds-hover/45' : 'hover:bg-ds-hover/35'
-                  }`}
+                  } ${compact ? 'gap-2.5 px-4 py-2.5' : 'gap-3 px-5 py-3'}`}
                 >
                   <span className="min-w-0 flex-1">
-                    <span className="block break-all text-[14px] font-medium text-ds-ink">
+                    <span
+                      className={`block truncate font-medium text-ds-ink ${compact ? 'text-[12px]' : 'text-[13px]'}`}
+                      title={primary}
+                    >
                       {primary}
                     </span>
                   </span>
                   {stats ? (
-                    <span className="shrink-0 font-mono text-[12px] tabular-nums">
+                    <span className={`shrink-0 font-mono tabular-nums ${compact ? 'text-[11px]' : 'text-[12px]'}`}>
                       <span className="text-ds-diff-added">+{stats.added}</span>
                       <span className="ml-1.5 text-ds-diff-removed">-{stats.removed}</span>
                     </span>
@@ -277,11 +300,11 @@ export function TurnChangeSummary({
                 </button>
 
                 {open && change.detail ? (
-                  <div className="bg-ds-card-muted/45 px-4 pb-4 pt-1">
+                  <div className={`bg-ds-card-muted/45 ${compact ? 'px-3 pb-2.5 pt-1' : 'px-4 pb-3 pt-1'}`}>
                     <DiffView
                       patch={change.detail}
                       filePath={change.filePath}
-                      maxHeight={440}
+                      maxHeight={compact ? 148 : 260}
                       className="border border-ds-border-muted/70"
                     />
                   </div>
@@ -296,14 +319,15 @@ export function TurnChangeSummary({
   )
 }
 
-/** Turn-level work-process summary. It auto-collapses when the turn finishes. */
+/** Turn-level work-process summary. Details stay collapsed until the user opens them. */
 export function WorkMetaRow({
   processing,
   stepCount,
   durationMs,
   reasoningDurationMs,
   expanded,
-  onToggle
+  onToggle,
+  collapsible = true
 }: {
   processing: boolean
   stepCount: number
@@ -311,6 +335,7 @@ export function WorkMetaRow({
   reasoningDurationMs?: number
   expanded: boolean
   onToggle: () => void
+  collapsible?: boolean
 }): ReactElement {
   const { t } = useTranslation('common')
 
@@ -327,6 +352,35 @@ export function WorkMetaRow({
     typeof reasoningDurationMs === 'number' &&
     reasoningDurationMs >= 1000
 
+  const content = (
+    <>
+      <span className={`tabular-nums ${processing ? 'ds-shiny-text' : ''}`}>{mainLabel}</span>
+      {showThoughtSuffix ? (
+        <span className="text-ds-faint">
+          · {t('thoughtFor', { duration: formatDuration(reasoningDurationMs!) })}
+        </span>
+      ) : null}
+      {collapsible ? (
+        expanded ? (
+          <ChevronDown className="h-3.5 w-3.5 shrink-0 opacity-45" strokeWidth={1.8} />
+        ) : (
+          <ChevronRight
+            className="h-3.5 w-3.5 shrink-0 opacity-40 transition group-hover:opacity-65"
+            strokeWidth={1.8}
+          />
+        )
+      ) : null}
+    </>
+  )
+
+  if (!collapsible) {
+    return (
+      <div className="flex w-fit max-w-full items-center gap-1.5 rounded-md py-1 text-left text-[15px] font-medium text-ds-muted">
+        {content}
+      </div>
+    )
+  }
+
   return (
     <button
       type="button"
@@ -334,20 +388,7 @@ export function WorkMetaRow({
       aria-expanded={expanded}
       className="group flex w-fit max-w-full items-center gap-1.5 rounded-md py-1 text-left text-[15px] font-medium text-ds-muted transition hover:opacity-85"
     >
-      <span className={`tabular-nums ${processing ? 'ds-shiny-text' : ''}`}>{mainLabel}</span>
-      {showThoughtSuffix ? (
-        <span className="text-ds-faint">
-          · {t('thoughtFor', { duration: formatDuration(reasoningDurationMs!) })}
-        </span>
-      ) : null}
-      {expanded ? (
-        <ChevronDown className="h-3.5 w-3.5 shrink-0 opacity-45" strokeWidth={1.8} />
-      ) : (
-        <ChevronRight
-          className="h-3.5 w-3.5 shrink-0 opacity-40 transition group-hover:opacity-65"
-          strokeWidth={1.8}
-        />
-      )}
+      {content}
     </button>
   )
 }
@@ -385,6 +426,9 @@ function writePromptMetaSummary(
   const parts: string[] = []
   if (display.quotes.length > 0) {
     parts.push(t('writePromptReferencesCount', { count: display.quotes.length }))
+  }
+  if (display.retrieval && display.retrieval.snippets.length > 0) {
+    parts.push(t('writePromptRetrievalCount', { count: display.retrieval.snippets.length }))
   }
   if (display.context) {
     parts.push(t('writePromptContextShort'))
@@ -445,6 +489,10 @@ export function WritePromptMetaDisclosure({
           {display.quotes.map((quote, index) => (
             <WritePromptQuoteCard key={`${quote.sourceTitle}-${index}`} quote={quote} />
           ))}
+
+          {display.retrieval && display.retrieval.snippets.length > 0 ? (
+            <WritePromptRetrievalCard retrieval={display.retrieval} />
+          ) : null}
         </div>
       ) : null}
     </div>
@@ -457,6 +505,13 @@ function WritePromptQuoteCard({ quote }: { quote: WritePromptDisplayQuote }): Re
     quote.lineStart != null && quote.lineEnd != null
       ? t('writePromptReferenceLines', { start: quote.lineStart, end: quote.lineEnd })
       : null
+  const pageLabel =
+    quote.pageStart != null && quote.pageEnd != null
+      ? quote.pageStart === quote.pageEnd
+        ? t('writePromptReferencePage', { page: quote.pageStart })
+        : t('writePromptReferencePages', { start: quote.pageStart, end: quote.pageEnd })
+      : null
+  const rangeLabel = lineLabel ?? pageLabel
 
   return (
     <figure className="rounded-xl border border-accent/15 bg-accent/[0.055] px-3 py-2.5 text-left shadow-sm">
@@ -465,9 +520,9 @@ function WritePromptQuoteCard({ quote }: { quote: WritePromptDisplayQuote }): Re
         <span className="min-w-0 flex-1 truncate font-medium text-ds-ink">
           {quote.sourceTitle || t('writePromptReference')}
         </span>
-        {lineLabel ? (
+        {rangeLabel ? (
           <span className="shrink-0 rounded-full bg-white/65 px-2 py-0.5 font-mono text-[11px] text-ds-faint dark:bg-white/8">
-            {lineLabel}
+            {rangeLabel}
           </span>
         ) : null}
       </figcaption>
@@ -482,5 +537,64 @@ function WritePromptQuoteCard({ quote }: { quote: WritePromptDisplayQuote }): Re
         </div>
       ) : null}
     </figure>
+  )
+}
+
+/**
+ * Collapsed view of the auto-attached retrieval context ([相关文献上下文]).
+ * Snippets used to be dumped verbatim into the user bubble; here they render
+ * as compact numbered cards with location, optional title and matched terms.
+ */
+function WritePromptRetrievalCard({
+  retrieval
+}: {
+  retrieval: WritePromptDisplayRetrieval
+}): ReactElement {
+  const { t } = useTranslation('common')
+  return (
+    <div className="rounded-xl border border-black/5 bg-white/55 px-3 py-2.5 text-left shadow-sm dark:border-white/10 dark:bg-white/6">
+      <div className="flex min-w-0 items-center gap-2 text-[12px] leading-5">
+        <SearchCode className="h-3.5 w-3.5 shrink-0 text-accent" strokeWidth={1.9} />
+        <span className="min-w-0 flex-1 truncate font-medium text-ds-ink">
+          {t('writePromptRetrievalLabel')}
+        </span>
+        {retrieval.keywords ? (
+          <span
+            className="min-w-0 shrink truncate rounded-full bg-white/65 px-2 py-0.5 font-mono text-[11px] text-ds-faint dark:bg-white/8"
+            title={retrieval.keywords}
+          >
+            {retrieval.keywords}
+          </span>
+        ) : null}
+      </div>
+      <div className="mt-2 flex flex-col gap-2">
+        {retrieval.snippets.map((snippet, index) => (
+          <div
+            key={`${snippet.location}-${index}`}
+            className="rounded-lg border border-black/5 bg-white/45 px-2.5 py-2 dark:border-white/8 dark:bg-white/4"
+          >
+            <div className="flex min-w-0 items-center gap-2 text-[11.5px] leading-4">
+              <span className="shrink-0 rounded-md bg-accent/10 px-1.5 py-0.5 font-mono text-[10.5px] font-semibold text-accent">
+                {index + 1}
+              </span>
+              <span className="min-w-0 flex-1 truncate font-mono text-ds-muted" title={snippet.location}>
+                {snippet.location}
+              </span>
+            </div>
+            {snippet.title ? (
+              <div className="mt-1.5 truncate text-[12px] font-medium text-ds-ink">{snippet.title}</div>
+            ) : null}
+            <div className="mt-1 max-h-28 overflow-auto whitespace-pre-wrap break-words text-[12px] font-normal leading-5 text-ds-muted [overflow-wrap:anywhere]">
+              {snippet.text}
+            </div>
+            {snippet.keywords ? (
+              <div className="mt-1.5 truncate text-[11px] text-ds-faint" title={snippet.keywords}>
+                {t('writePromptRetrievalMatched', { keywords: snippet.keywords })}
+              </div>
+            ) : null}
+          </div>
+        ))}
+      </div>
+    </div>
   )
 }

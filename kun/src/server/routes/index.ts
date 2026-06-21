@@ -19,6 +19,7 @@ import {
   compactTurn,
   getTurn,
   interruptTurn,
+  rewindThread,
   startTurn,
   steerTurn
 } from './turns.js'
@@ -28,6 +29,7 @@ import { decideApproval } from './approvals.js'
 import { resolveUserInput } from './user-inputs.js'
 import { resumeSession } from './sessions.js'
 import { usageJsonResponse } from './usage.js'
+import { llmDebugRoundsResponse } from './debug-llm.js'
 import { runtimeInfoJsonResponse, runtimeToolDiagnosticsJsonResponse } from './runtime-info.js'
 import { listSkills } from './skills.js'
 import {
@@ -74,6 +76,7 @@ import type { ServerRuntime } from './server-runtime.js'
  * - `POST /v1/user-inputs/{id}` and `/v1/user-input/{id}` (auth)
  * - `POST /v1/sessions/{id}/resume-thread` (auth)
  * - `GET /v1/usage` (auth)
+ * - `GET /v1/debug/llm-rounds` (auth)
  */
 export function buildRouter(runtime: ServerRuntime): Router {
   const router = new Router()
@@ -124,7 +127,7 @@ export function buildRouter(runtime: ServerRuntime): Router {
   })
   router.add('DELETE', '/v1/memory/:id', async (request, ctx) => {
     if (!authorize(request, runtime)) return ERRORS.unauthorized()
-    return deleteMemory(runtime.memoryStore, ctx.params.id)
+    return deleteMemory(runtime.memoryStore, ctx.params.id, request)
   })
   router.add('GET', '/v1/workspace/status', async (request) => {
     if (!authorize(request, runtime)) return ERRORS.unauthorized()
@@ -186,6 +189,10 @@ export function buildRouter(runtime: ServerRuntime): Router {
       runtime.runTurn(threadId, turnId)
     })
   })
+  router.add('POST', '/v1/threads/:id/rewind', async (request, ctx) => {
+    if (!authorize(request, runtime)) return ERRORS.unauthorized()
+    return rewindThread(runtime.turnService, ctx.params.id, request)
+  })
   router.add('POST', '/v1/threads/:id/review', async (request, ctx) => {
     if (!authorize(request, runtime)) return ERRORS.unauthorized()
     if (!runtime.reviewService || !runtime.runReview) {
@@ -222,8 +229,7 @@ export function buildRouter(runtime: ServerRuntime): Router {
       request,
       threadId: ctx.params.id,
       eventBus: runtime.eventBus,
-      sessionStore: runtime.sessionStore,
-      allocateSeq: runtime.allocateSeq
+      sessionStore: runtime.sessionStore
     })
   })
   router.add('POST', '/v1/approvals/:id', async (request, ctx) => {
@@ -260,6 +266,10 @@ export function buildRouter(runtime: ServerRuntime): Router {
   router.add('GET', '/v1/usage', async (request) => {
     if (!authorize(request, runtime)) return ERRORS.unauthorized()
     return usageJsonResponse(request, runtime)
+  })
+  router.add('GET', '/v1/debug/llm-rounds', async (request) => {
+    if (!authorize(request, runtime)) return ERRORS.unauthorized()
+    return llmDebugRoundsResponse(runtime)
   })
   return router
 }

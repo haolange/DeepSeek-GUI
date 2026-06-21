@@ -1,14 +1,30 @@
 import { describe, expect, it } from 'vitest'
+import type { SkillRootListItem } from '@shared/kun-gui-api'
 import {
   buildMcpConfig,
   customMcpConfigFragment,
   mcpConfigHasServer,
   mcpMarketplaceItemsFromConfigAndDiagnostics,
   mergeMcpJsonConfig,
-  skillMarketplaceItemsFromDiscoveredSkills
+  recommendedMarketplaceItemIds,
+  setMcpServerEnabled,
+  skillMarketplaceItemsFromDiscoveredSkills,
+  skillRootOptionsFromRoots
 } from './PluginMarketplaceView'
 
 describe('PluginMarketplaceView MCP config helpers', () => {
+  it('does not recommend the filesystem MCP server because Kun has built-in file tools', () => {
+    expect(recommendedMarketplaceItemIds()).not.toContain('filesystem')
+  })
+
+  it('recommends mainstream MCP servers for reasoning, memory, and web search', () => {
+    expect(recommendedMarketplaceItemIds()).toEqual(expect.arrayContaining([
+      'sequential-thinking',
+      'memory',
+      'brave-search'
+    ]))
+  })
+
   it('merges recommended MCP servers into JSON config without dropping existing fields', () => {
     const existing = JSON.stringify({
       timeouts: { read_timeout: 120 },
@@ -162,9 +178,63 @@ describe('PluginMarketplaceView MCP config helpers', () => {
         id: 'github',
         sourceLabel: 'Connected',
         statusTone: 'success',
-        description: expect.stringContaining('github-mcp')
+        descriptionKey: 'pluginMcpGithubDesc',
+        detail: expect.stringContaining('github-mcp')
       })
     ])
+  })
+
+  it('toggles top-level MCP servers without dropping config fields', () => {
+    const disabled = setMcpServerEnabled(JSON.stringify({
+      timeouts: { read_timeout: 120 },
+      servers: {
+        docs: {
+          transport: 'stdio',
+          command: 'docs-mcp',
+          args: ['--stdio']
+        }
+      }
+    }), 'docs', false)
+    const disabledParsed = JSON.parse(disabled) as Record<string, any>
+
+    expect(disabledParsed.timeouts).toEqual({ read_timeout: 120 })
+    expect(disabledParsed.servers.docs).toMatchObject({
+      transport: 'stdio',
+      command: 'docs-mcp',
+      args: ['--stdio'],
+      enabled: false
+    })
+
+    const enabled = setMcpServerEnabled(disabled, 'docs', true)
+    const enabledParsed = JSON.parse(enabled) as Record<string, any>
+    expect(enabledParsed.servers.docs.enabled).toBe(true)
+    expect(enabledParsed.servers.docs.command).toBe('docs-mcp')
+  })
+
+  it('toggles nested Kun capability MCP servers', () => {
+    const text = setMcpServerEnabled(JSON.stringify({
+      capabilities: {
+        mcp: {
+          enabled: true,
+          servers: {
+            github: {
+              transport: 'stdio',
+              command: 'github-mcp',
+              disabled: true
+            }
+          }
+        }
+      }
+    }), 'github', true)
+    const parsed = JSON.parse(text) as Record<string, any>
+
+    expect(parsed.capabilities.mcp.enabled).toBe(true)
+    expect(parsed.capabilities.mcp.servers.github).toMatchObject({
+      transport: 'stdio',
+      command: 'github-mcp',
+      enabled: true
+    })
+    expect(parsed.capabilities.mcp.servers.github).not.toHaveProperty('disabled')
   })
 })
 
@@ -205,5 +275,57 @@ describe('skillMarketplaceItemsFromDiscoveredSkills', () => {
         sourceLabel: 'Global'
       })
     ])
+  })
+})
+
+describe('skillRootOptionsFromRoots', () => {
+  const roots: SkillRootListItem[] = [
+    {
+      id: 'workspace-claude',
+      disableKey: 'workspace-claude',
+      path: '/ws/.claude/skills',
+      scope: 'project',
+      source: 'common',
+      labelKey: 'pluginSkillRootWorkspaceClaude',
+      exists: true,
+      enabled: true,
+      skillCount: 2
+    },
+    {
+      id: 'global-codex',
+      disableKey: 'global-codex',
+      path: '/home/me/.codex/skills',
+      scope: 'global',
+      source: 'common',
+      labelKey: 'pluginSkillRootGlobalCodex',
+      exists: false,
+      enabled: false,
+      skillCount: 0
+    },
+    {
+      id: '/opt/team/skills',
+      disableKey: '/opt/team/skills',
+      path: '/opt/team/skills',
+      scope: 'global',
+      source: 'extra',
+      exists: true,
+      enabled: true,
+      skillCount: 5
+    }
+  ]
+
+  it('maps backend roots — common (.claude/.codex) and custom dirs — into picker options synced with settings', () => {
+    const options = skillRootOptionsFromRoots(roots, (key) => `t:${key}`)
+
+    expect(options).toEqual([
+      { id: 'workspace-claude', label: 't:pluginSkillRootWorkspaceClaude', path: '/ws/.claude/skills', scope: 'project', enabled: true, exists: true, skillCount: 2 },
+      { id: 'global-codex', label: 't:pluginSkillRootGlobalCodex', path: '/home/me/.codex/skills', scope: 'global', enabled: false, exists: false, skillCount: 0 },
+      // Custom extra dir has no i18n labelKey, so it falls back to a short path label.
+      { id: '/opt/team/skills', label: 'team/skills', path: '/opt/team/skills', scope: 'global', enabled: true, exists: true, skillCount: 5 }
+    ])
+  })
+
+  it('returns an empty list when the backend reports no roots', () => {
+    expect(skillRootOptionsFromRoots([], (key) => key)).toEqual([])
   })
 })

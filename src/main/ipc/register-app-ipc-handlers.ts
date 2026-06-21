@@ -1,8 +1,9 @@
 import { app, dialog, ipcMain, shell, type BrowserWindow, type WebContents } from 'electron'
 import { watch, type FSWatcher } from 'node:fs'
 import { randomUUID } from 'node:crypto'
-import { dirname, join } from 'node:path'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { basename, dirname, extname, join, resolve } from 'node:path'
+import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { z } from 'zod'
 import {
   type AppSettingsPatch,
@@ -12,7 +13,11 @@ import {
   type ClawRuntimeStatus,
   type ScheduleRunResult,
   type ScheduleRuntimeStatus,
-  type ScheduleTaskFromTextResult
+  type ScheduleTaskFromTextResult,
+  type WorkflowCodeCheckResult,
+  type WorkflowNodeTestResult,
+  type WorkflowRunResult,
+  type WorkflowRuntimeStatus
 } from '../../shared/app-settings'
 import type {
   ClawImInstallPollResult,
@@ -22,23 +27,38 @@ import type {
   SystemNotificationResult,
   TurnCompleteNotificationPayload,
   UpstreamModelsResult,
-  WindowsTitleBarTheme,
   WorkspacePickResult
-} from '../../shared/ds-gui-api'
+} from '../../shared/kun-gui-api'
+import type { WorkspaceFileSaveAsResult } from '../../shared/workspace-file'
 import type { GuiUpdateDownloadResult, GuiUpdateInfo, GuiUpdateInstallResult, GuiUpdateState } from '../../shared/gui-update'
 import {
   clawMirrorPayloadSchema,
   clawImInstallPollPayloadSchema,
+  clawImTelegramTokenPayloadSchema,
+  confirmDialogPayloadSchema,
   clawTaskFromTextPayloadSchema,
+  computerUsePermissionKindSchema,
   deepseekConfigContentSchema,
   desktopCommandSchema,
   defaultPathSchema,
   gitBranchPayloadSchema,
+  gitCheckpointCreatePayloadSchema,
+  gitCheckpointRestorePayloadSchema,
+  gitWorktreeRemoveSchema,
   guiUpdateChannelSchema,
   logErrorPayloadSchema,
   notificationPayloadSchema,
   openEditorPathPayloadSchema,
+  providerProbePayloadSchema,
   rootPathSchema,
+  worktreeCommitSchema,
+  worktreeContinueMergeSchema,
+  worktreeMergeSchema,
+  worktreePoolIndexSchema,
+  worktreePoolSchema,
+  worktreeProjectPathSchema,
+  worktreeOptionalRootSchema,
+  worktreePathSchema,
   runtimeRequestPayloadSchema,
   scheduleTaskFromTextPayloadSchema,
   shellOpenExternalUrlSchema,
@@ -46,25 +66,72 @@ import {
   skillSaveFilePayloadSchema,
   settingsPatchSchema,
   streamIdSchema,
+  workflowRunNodePayloadSchema,
+  workflowTestNodePayloadSchema,
+  workflowResolveApprovalPayloadSchema,
+  workflowCodeCheckPayloadSchema,
+  uiPluginIdPayloadSchema,
   workspaceDirectoryCreatePayloadSchema,
   workspaceClipboardImageSavePayloadSchema,
   workspaceDirectoryTargetPayloadSchema,
   workspaceEntryDeletePayloadSchema,
   workspaceEntryRenamePayloadSchema,
   workspaceFileCreatePayloadSchema,
+  workspaceFileSaveAsPayloadSchema,
   workspaceFileTargetPayloadSchema,
   workspaceFileWatchPayloadSchema,
   workspaceFileWritePayloadSchema,
+  speechTranscribePayloadSchema,
   writeExportPayloadSchema,
   writeRichClipboardPayloadSchema,
+  writeInfographicPayloadSchema,
   writeInlineCompletionPayloadSchema,
-  windowsTitleBarThemeSchema,
-  workspaceRootSchema
+  writePrototypeFilePayloadSchema,
+  writeRetrievalPayloadSchema,
+  workspaceRootSchema,
+  legacySessionImportPayloadSchema
 } from './app-ipc-schemas'
+import { DEFAULT_KUN_DATA_DIR, resolveKunRuntimeSettings } from '../../shared/app-settings'
+import { detectLegacySessions, importLegacySessions } from '../services/legacy-session-import-service'
 import type { JsonSettingsStore } from '../settings-store'
+import { probeModelProvider } from '../provider-connection'
 import type { ClawRuntime } from '../claw-runtime'
 import type { ScheduleRuntime } from '../schedule-runtime'
-import { createAndSwitchGitBranch, getGitBranches, switchGitBranch } from '../services/git-service'
+import { verifyTelegramBotToken } from '../telegram-runtime'
+import type { WorkflowRuntime } from '../workflow-runtime'
+import { checkWorkflowCode } from '../workflow-runtime'
+import {
+  checkoutGitBranchWorktree,
+  createAndSwitchGitBranch,
+  createGitBranchWorktree,
+  getGitBranches,
+  listGitBranchWorktrees,
+  removeGitBranchWorktree,
+  switchGitBranch
+} from '../services/git-service'
+import { createGitCheckpoint, restoreGitCheckpoint } from '../services/git-checkpoint-service'
+import {
+  abortMerge,
+  abortRebase,
+  acquireWorktree,
+  cleanupWorktrees,
+  commitWorktree,
+  continueMerge,
+  findAvailablePoolIndex,
+  getWorktreeChanges,
+  listWorktrees,
+  mergeWorktreeToMain,
+  releaseWorktree,
+  removeWorktree,
+  syncWorktreeFromMain
+} from '../services/worktree-service'
+import {
+  installUiPluginFromDirectory,
+  listUiPlugins,
+  loadUiPluginFigures,
+  removeUiPlugin
+} from '../services/ui-plugin-service'
+import { ensureBundledUiPlugins } from '../ui-plugin-bundled'
 import {
   createWorkspaceDirectory,
   createWorkspaceFile,
@@ -78,7 +145,9 @@ import {
   readClipboardImage,
   readWorkspaceImage,
   readWorkspaceFile,
+  readWorkspacePdf,
   renameWorkspaceEntry,
+  resolveOpenTargetPath,
   resolveWorkspaceFile,
   saveWorkspaceClipboardImage,
   writeWorkspaceFile
@@ -88,8 +157,16 @@ import {
   listWriteInlineCompletionDebugEntries,
   requestWriteInlineCompletion
 } from '../services/write-inline-completion-service'
+import { retrieveWriteContext } from '../services/write-retrieval-service'
+import { requestWriteInfographic } from '../services/write-infographic-service'
+import { authorizePrototypePath } from '../services/prototype-embed-registry'
+import { requestSpeechTranscription } from '../services/speech-to-text-service'
+import {
+  getComputerUsePermissions,
+  requestComputerUsePermission
+} from '../services/computer-use-permissions'
 import { copyWriteDocumentAsRichText, exportWriteDocument } from '../services/write-export-service'
-import { listGuiSkills } from '../services/skill-service'
+import { listGuiSkillRoots, listGuiSkills } from '../services/skill-service'
 
 type GuiUpdaterModule = typeof import('../gui-updater')
 
@@ -105,19 +182,23 @@ type RegisterAppIpcHandlersOptions = {
   store: JsonSettingsStore
   getMainWindow: () => BrowserWindow | null
   applySettingsPatch: (partial: AppSettingsPatch) => Promise<AppSettingsV1>
+  saveSettingsPatch: (partial: AppSettingsPatch) => Promise<AppSettingsV1>
   runtimeRequest: (
     path: string,
     method?: string,
     body?: string
   ) => Promise<RuntimeRequestResult>
+  restartRuntime: () => Promise<void>
   fetchUpstreamModels: () => Promise<UpstreamModelsResult>
   getClawRuntime: () => ClawRuntime | null
   getScheduleRuntime: () => ScheduleRuntime | null
+  getWorkflowRuntime: () => WorkflowRuntime | null
   startFeishuInstallQrcode: (isLark: boolean) => Promise<ClawImInstallQrResult>
   pollFeishuInstall: (deviceCode: string) => Promise<ClawImInstallPollResult>
   startWeixinInstallQrcode: (weixinBridgeUrl?: string) => Promise<ClawImInstallQrResult>
   pollWeixinInstall: (deviceCode: string, weixinBridgeUrl?: string) => Promise<ClawImInstallPollResult>
   resolveKunConfigPath: () => string
+  onKunMcpConfigWritten?: (path: string, content: string) => Promise<void> | void
   showTurnCompleteNotification: (
     payload: TurnCompleteNotificationPayload
   ) => Promise<SystemNotificationResult>
@@ -135,13 +216,83 @@ function parseIpcPayload<T>(channel: string, schema: z.ZodType<T>, payload: unkn
   throw new Error(`Invalid payload for ${channel}: ${issue?.message ?? 'Bad request.'}`)
 }
 
-const DESKTOP_TITLEBAR_OVERLAY_HEIGHT = 40
+function safeSaveAsFileName(input: string | undefined, fallback = 'generated-file'): string {
+  const candidate = (input ?? '').trim().replace(/\0/g, '')
+  const name = basename(candidate) || fallback
+  if (name === '.' || name === '..') return fallback
+  return name
+}
 
-function desktopTitleBarOverlayForTheme(theme: WindowsTitleBarTheme): Electron.TitleBarOverlayOptions {
-  return {
-    color: theme === 'dark' ? '#101010' : '#f5f7fa',
-    symbolColor: theme === 'dark' ? '#ffffff' : '#222222',
-    height: DESKTOP_TITLEBAR_OVERLAY_HEIGHT
+function saveDialogFilters(fileName: string, mimeType: string | undefined): Electron.FileFilter[] {
+  const ext = extname(fileName).replace(/^\./, '').trim()
+  const mime = mimeType?.toLowerCase().trim() ?? ''
+  const filters: Electron.FileFilter[] = []
+  if (mime.startsWith('image/')) {
+    filters.push({ name: 'Images', extensions: ext ? [ext] : ['png', 'jpg', 'jpeg', 'webp', 'gif'] })
+  } else if (mime.startsWith('video/')) {
+    filters.push({ name: 'Videos', extensions: ext ? [ext] : ['mp4', 'webm', 'mov', 'm4v'] })
+  } else if (ext) {
+    filters.push({ name: `${ext.toUpperCase()} file`, extensions: [ext] })
+  }
+  filters.push({ name: 'All Files', extensions: ['*'] })
+  return filters
+}
+
+async function saveWorkspaceFileAs(
+  payload: unknown,
+  getMainWindow: () => BrowserWindow | null
+): Promise<WorkspaceFileSaveAsResult> {
+  const request = parseIpcPayload('file:save-as', workspaceFileSaveAsPayloadSchema, payload)
+  try {
+    const sourcePath = request.sourcePath
+      ? await resolveOpenTargetPath(request.sourcePath, request.workspaceRoot, { allowBasenameFallback: false })
+      : ''
+    const fileName = safeSaveAsFileName(request.suggestedName || (sourcePath ? basename(sourcePath) : undefined))
+    const defaultPath = request.workspaceRoot?.trim()
+      ? join(expandHomePath(request.workspaceRoot), fileName)
+      : fileName
+    const options: Electron.SaveDialogOptions = {
+      title: 'Save generated file',
+      defaultPath,
+      filters: saveDialogFilters(fileName, request.mimeType)
+    }
+    const mainWindow = getMainWindow()
+    const result = mainWindow
+      ? await dialog.showSaveDialog(mainWindow, options)
+      : await dialog.showSaveDialog(options)
+    if (result.canceled || !result.filePath) {
+      return { ok: false, canceled: true, message: 'Save cancelled.' }
+    }
+
+    const targetPath = resolve(result.filePath)
+    await mkdir(dirname(targetPath), { recursive: true })
+    if (sourcePath) {
+      if (resolve(sourcePath) !== targetPath) {
+        await copyFile(sourcePath, targetPath)
+      }
+    } else if (request.dataBase64) {
+      await writeFile(targetPath, Buffer.from(request.dataBase64, 'base64'))
+    } else {
+      return { ok: false, message: 'No file data was available to save.' }
+    }
+    return { ok: true, path: targetPath }
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+function validateMcpConfigContent(content: string): void {
+  const trimmed = content.trim()
+  if (!trimmed) return
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(trimmed) as unknown
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    throw new Error(`MCP config must be JSON: ${message}`)
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('MCP config must be a JSON object.')
   }
 }
 
@@ -212,15 +363,19 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
     store,
     getMainWindow,
     applySettingsPatch,
+    saveSettingsPatch,
     runtimeRequest,
+    restartRuntime,
     fetchUpstreamModels,
     getClawRuntime,
     getScheduleRuntime,
+    getWorkflowRuntime,
     startFeishuInstallQrcode,
     pollFeishuInstall,
     startWeixinInstallQrcode,
     pollWeixinInstall,
     resolveKunConfigPath,
+    onKunMcpConfigWritten,
     showTurnCompleteNotification,
     getAppVersion,
     readGuiUpdateState,
@@ -318,13 +473,25 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
       parseIpcPayload('settings:set', settingsPatchSchema, partial) as AppSettingsPatch
     )
   )
+  ipcMain.handle('settings:save-silent', async (_, partial: unknown) =>
+    saveSettingsPatch(
+      parseIpcPayload('settings:save-silent', settingsPatchSchema, partial) as AppSettingsPatch
+    )
+  )
 
   ipcMain.handle('runtime:request', async (_, payload: unknown) => {
     const request = parseIpcPayload('runtime:request', runtimeRequestPayloadSchema, payload)
     return runtimeRequest(request.path, request.method, request.body)
   })
 
+  ipcMain.handle('runtime:restart', async () => restartRuntime())
+
   ipcMain.handle('upstream:models', async () => fetchUpstreamModels())
+
+  ipcMain.handle('provider:probe', async (_, payload: unknown) => {
+    const request = parseIpcPayload('provider:probe', providerProbePayloadSchema, payload)
+    return probeModelProvider(request, await store.load())
+  })
 
   ipcMain.handle('claw:status', async (): Promise<ClawRuntimeStatus> =>
     getClawRuntime()?.status() ?? {
@@ -355,6 +522,57 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
     const scheduleRuntime = getScheduleRuntime()
     if (!scheduleRuntime) return { ok: false, message: 'Schedule runtime is not initialized.' }
     return scheduleRuntime.runTask(normalizedTaskId)
+  })
+
+  ipcMain.handle('workflow:status', async (): Promise<WorkflowRuntimeStatus> =>
+    getWorkflowRuntime()?.status() ?? {
+      runningWorkflowIds: [],
+      nodeStatus: {},
+      nodeResults: {},
+      powerSaveBlockerActive: false,
+      pendingApprovals: []
+    }
+  )
+
+  ipcMain.handle('workflow:run', async (_, workflowId: unknown, input?: unknown): Promise<WorkflowRunResult> => {
+    const normalizedId = parseIpcPayload('workflow:run', streamIdSchema, workflowId)
+    const workflowRuntime = getWorkflowRuntime()
+    if (!workflowRuntime) return { ok: false, message: 'Workflow runtime is not initialized.' }
+    // input is validated/coerced against the trigger's input schema inside runWorkflow.
+    return workflowRuntime.runWorkflow(normalizedId, input)
+  })
+
+  ipcMain.handle('workflow:stop', async (_, workflowId: unknown): Promise<WorkflowRunResult> => {
+    const normalizedId = parseIpcPayload('workflow:stop', streamIdSchema, workflowId)
+    const workflowRuntime = getWorkflowRuntime()
+    if (!workflowRuntime) return { ok: false, message: 'Workflow runtime is not initialized.' }
+    return workflowRuntime.stopWorkflow(normalizedId)
+  })
+
+  ipcMain.handle('workflow:node:run', async (_, payload: unknown): Promise<WorkflowRunResult> => {
+    const request = parseIpcPayload('workflow:node:run', workflowRunNodePayloadSchema, payload)
+    const workflowRuntime = getWorkflowRuntime()
+    if (!workflowRuntime) return { ok: false, message: 'Workflow runtime is not initialized.' }
+    return workflowRuntime.runSingleNode(request.workflowId, request.nodeId)
+  })
+
+  ipcMain.handle('workflow:node:test', async (_, payload: unknown): Promise<WorkflowNodeTestResult> => {
+    const request = parseIpcPayload('workflow:node:test', workflowTestNodePayloadSchema, payload)
+    const workflowRuntime = getWorkflowRuntime()
+    if (!workflowRuntime) return { ok: false, message: 'Workflow runtime is not initialized.' }
+    return workflowRuntime.testNode(request.workflowId, request.nodeId, request.mockJson)
+  })
+
+  ipcMain.handle('workflow:approval:resolve', async (_, payload: unknown): Promise<{ ok: boolean }> => {
+    const request = parseIpcPayload('workflow:approval:resolve', workflowResolveApprovalPayloadSchema, payload)
+    const workflowRuntime = getWorkflowRuntime()
+    if (!workflowRuntime) return { ok: false }
+    return { ok: workflowRuntime.resolveApproval(request.token, request.decision) }
+  })
+
+  ipcMain.handle('workflow:code:check', async (_, payload: unknown): Promise<WorkflowCodeCheckResult> => {
+    const request = parseIpcPayload('workflow:code:check', workflowCodeCheckPayloadSchema, payload)
+    return checkWorkflowCode(request.language, request.code)
   })
 
   ipcMain.handle(
@@ -401,7 +619,10 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
         : undefined
       return scheduleRuntime.createScheduledTaskFromText(request.text, {
         workspaceRoot: channel?.workspaceRoot || settings.schedule.defaultWorkspaceRoot || settings.workspaceRoot,
+        clawChannelId: channel?.id ?? request.channelId,
+        providerId: request.providerId,
         modelHint: request.modelHint,
+        reasoningEffort: request.reasoningEffort,
         mode: request.mode
       })
     }
@@ -419,7 +640,10 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
       if (!scheduleRuntime) return { kind: 'error', message: 'Schedule runtime is not initialized.' }
       return scheduleRuntime.createScheduledTaskFromText(request.text, {
         workspaceRoot: request.workspaceRoot,
+        clawChannelId: request.clawChannelId,
+        providerId: request.providerId,
         modelHint: request.modelHint,
+        reasoningEffort: request.reasoningEffort,
         mode: request.mode
       })
     }
@@ -451,6 +675,18 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
     }
   )
 
+  ipcMain.handle(
+    'claw:im-install:telegram-token',
+    async (_, payload: unknown) => {
+      const request = parseIpcPayload(
+        'claw:im-install:telegram-token',
+        clawImTelegramTokenPayloadSchema,
+        payload
+      )
+      return verifyTelegramBotToken(request.botToken)
+    }
+  )
+
   ipcMain.handle('workspace:pick-directory', async (_, defaultPath: unknown): Promise<WorkspacePickResult> => {
     const normalizedDefaultPath = parseIpcPayload(
       'workspace:pick-directory',
@@ -470,6 +706,27 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
       canceled: result.canceled,
       path: result.canceled ? null : (result.filePaths[0] ?? null)
     }
+  })
+
+  // Replaces window.confirm in the renderer: the synchronous native confirm
+  // leaves the WebContents unable to focus inputs after it closes
+  // (electron/electron#19977), which froze the composer after deleting threads.
+  ipcMain.handle('dialog:confirm', async (_, payload: unknown): Promise<boolean> => {
+    const request = parseIpcPayload('dialog:confirm', confirmDialogPayloadSchema, payload)
+    const options: Electron.MessageBoxOptions = {
+      type: 'warning',
+      buttons: [request.confirmLabel ?? 'OK', request.cancelLabel ?? 'Cancel'],
+      defaultId: 0,
+      cancelId: 1,
+      message: request.message,
+      detail: request.detail,
+      noLink: true
+    }
+    const mainWindow = getMainWindow()
+    const result = mainWindow
+      ? await dialog.showMessageBox(mainWindow, options)
+      : await dialog.showMessageBox(options)
+    return result.response === 0
   })
 
   ipcMain.handle(
@@ -502,6 +759,12 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
     return listGuiSkills(settings, request.workspaceRoot)
   })
 
+  ipcMain.handle('skill:list-roots', async (_, payload: unknown) => {
+    const request = parseIpcPayload('skill:list-roots', skillListPayloadSchema, payload)
+    const settings = await store.load()
+    return listGuiSkillRoots(settings, request.workspaceRoot)
+  })
+
   ipcMain.handle('skill:open-root', async (_, rootPath: unknown) => {
     const normalizedRootPath = parseIpcPayload('skill:open-root', rootPathSchema, rootPath)
     try {
@@ -519,7 +782,45 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
     }
   })
 
-  ipcMain.handle('deepseek:config:read', async () => {
+  ipcMain.handle('ui-plugin:list', async () => {
+    const kunHomeDir = join(homedir(), '.kun')
+    await ensureBundledUiPlugins(kunHomeDir)
+    return { plugins: await listUiPlugins(kunHomeDir) }
+  })
+
+  ipcMain.handle('ui-plugin:install', async () => {
+    const mainWindow = getMainWindow()
+    const options: Electron.OpenDialogOptions = {
+      title: 'Select a UI plugin folder',
+      properties: ['openDirectory', 'dontAddToRecent']
+    }
+    const picked = mainWindow
+      ? await dialog.showOpenDialog(mainWindow, options)
+      : await dialog.showOpenDialog(options)
+    const sourceDir = picked.filePaths[0]
+    if (picked.canceled || !sourceDir) {
+      return { canceled: true as const }
+    }
+    const result = await installUiPluginFromDirectory(join(homedir(), '.kun'), sourceDir)
+    if (!result.ok) {
+      return { canceled: false as const, ok: false as const, errors: result.errors }
+    }
+    return { canceled: false as const, ok: true as const, plugin: result.plugin }
+  })
+
+  ipcMain.handle('ui-plugin:remove', async (_, payload: unknown) => {
+    const request = parseIpcPayload('ui-plugin:remove', uiPluginIdPayloadSchema, payload)
+    return { ok: await removeUiPlugin(join(homedir(), '.kun'), request.id) }
+  })
+
+  ipcMain.handle('ui-plugin:load', async (_, payload: unknown) => {
+    const request = parseIpcPayload('ui-plugin:load', uiPluginIdPayloadSchema, payload)
+    const kunHomeDir = join(homedir(), '.kun')
+    await ensureBundledUiPlugins(kunHomeDir)
+    return loadUiPluginFigures(kunHomeDir, request.id)
+  })
+
+  ipcMain.handle('kun:config:read', async () => {
     const path = resolveKunConfigPath()
     try {
       const content = await readFile(path, 'utf8')
@@ -532,19 +833,28 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
     }
   })
 
-  ipcMain.handle('deepseek:config:write', async (_, content: unknown) => {
+  ipcMain.handle('kun:config:write', async (_, content: unknown) => {
     const validatedContent = parseIpcPayload(
-      'deepseek:config:write',
+      'kun:config:write',
       deepseekConfigContentSchema,
       content
     )
     const path = resolveKunConfigPath()
+    validateMcpConfigContent(validatedContent)
     await mkdir(dirname(path), { recursive: true })
     await writeFile(path, validatedContent, 'utf8')
+    try {
+      await onKunMcpConfigWritten?.(path, validatedContent)
+    } catch (error: unknown) {
+      logError('mcp-config', 'Failed to apply MCP config change after write', {
+        path,
+        message: error instanceof Error ? error.message : String(error)
+      })
+    }
     return { ok: true as const, path }
   })
 
-  ipcMain.handle('deepseek:config:open-dir', async () => {
+  ipcMain.handle('kun:config:open-dir', async () => {
     try {
       const path = resolveKunConfigPath()
       const dirPath = dirname(path)
@@ -555,6 +865,49 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
         ok: false as const,
         message: error instanceof Error ? error.message : String(error)
       }
+    }
+  })
+
+  const resolveKunThreadsDataDir = async (): Promise<string> => {
+    const settings = await store.load()
+    const runtime = resolveKunRuntimeSettings(settings)
+    return expandHomePath(runtime.dataDir?.trim() || DEFAULT_KUN_DATA_DIR)
+  }
+
+  ipcMain.handle('kun:sessions:detect-legacy', async () =>
+    detectLegacySessions({ homeDir: homedir(), destDataDir: await resolveKunThreadsDataDir() })
+  )
+
+  ipcMain.handle('kun:sessions:import-legacy', async (_, payload: unknown) => {
+    const request = parseIpcPayload('kun:sessions:import-legacy', legacySessionImportPayloadSchema, payload)
+    try {
+      const summary = await importLegacySessions({
+        homeDir: homedir(),
+        destDataDir: await resolveKunThreadsDataDir(),
+        ...(request.sourceDir ? { sourceDir: request.sourceDir } : {}),
+        log: (message, detail) => logError('legacy-session-import', message, detail)
+      })
+      return { ok: true as const, ...summary }
+    } catch (error) {
+      return {
+        ok: false as const,
+        message: error instanceof Error ? error.message : String(error)
+      }
+    }
+  })
+
+  ipcMain.handle('kun:sessions:pick-source-dir', async (): Promise<WorkspacePickResult> => {
+    const options: Electron.OpenDialogOptions = {
+      title: 'Select a folder containing previous conversations',
+      properties: ['openDirectory', 'dontAddToRecent']
+    }
+    const mainWindow = getMainWindow()
+    const result = mainWindow
+      ? await dialog.showOpenDialog(mainWindow, options)
+      : await dialog.showOpenDialog(options)
+    return {
+      canceled: result.canceled,
+      path: result.canceled ? null : (result.filePaths[0] ?? null)
     }
   })
 
@@ -579,6 +932,116 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
       return createAndSwitchGitBranch(request.workspaceRoot, request.branch)
     }
   )
+  ipcMain.handle('git:checkpoint:create', async (_, payload: unknown) => {
+    const request = parseIpcPayload('git:checkpoint:create', gitCheckpointCreatePayloadSchema, payload)
+    return createGitCheckpoint({
+      dataDir: await resolveKunThreadsDataDir(),
+      workspaceRoot: request.workspaceRoot,
+      threadId: request.threadId
+    })
+  })
+  ipcMain.handle('git:checkpoint:restore', async (_, payload: unknown) => {
+    const request = parseIpcPayload('git:checkpoint:restore', gitCheckpointRestorePayloadSchema, payload)
+    return restoreGitCheckpoint({
+      dataDir: await resolveKunThreadsDataDir(),
+      checkpointId: request.checkpointId
+    })
+  })
+  ipcMain.handle(
+    'git:checkout-branch-worktree',
+    async (_, payload: unknown) => {
+      const request = parseIpcPayload('git:checkout-branch-worktree', gitBranchPayloadSchema, payload)
+      return checkoutGitBranchWorktree(request.workspaceRoot, request.branch)
+    }
+  )
+  ipcMain.handle(
+    'git:create-branch-worktree',
+    async (_, payload: unknown) => {
+      const request = parseIpcPayload('git:create-branch-worktree', gitBranchPayloadSchema, payload)
+      return createGitBranchWorktree(request.workspaceRoot, request.branch)
+    }
+  )
+  ipcMain.handle('git:branch-worktrees', async (_, payload: unknown) => {
+    const request = parseIpcPayload('git:branch-worktrees', worktreePoolSchema, payload)
+    return listGitBranchWorktrees(request.projectPath, request.worktreeRoot)
+  })
+  ipcMain.handle('git:remove-branch-worktree', async (_, payload: unknown) => {
+    const request = parseIpcPayload('git:remove-branch-worktree', gitWorktreeRemoveSchema, payload)
+    return removeGitBranchWorktree(request)
+  })
+
+  // Worktree pool management
+  ipcMain.handle('worktree:acquire', async (_, payload: unknown) => {
+    const r = parseIpcPayload('worktree:acquire', worktreeOptionalRootSchema, payload)
+    return acquireWorktree({
+      projectPath: r.projectPath,
+      poolIndex: r.poolIndex,
+      taskId: r.taskId,
+      force: r.force,
+      worktreeRoot: r.worktreeRoot
+    })
+  })
+  ipcMain.handle('worktree:release', async (_, payload: unknown) => {
+    const r = parseIpcPayload('worktree:release', worktreePoolIndexSchema, payload)
+    return releaseWorktree({ projectPath: r.projectPath, poolIndex: r.poolIndex })
+  })
+  ipcMain.handle('worktree:list', async (_, payload: unknown) => {
+    const r = parseIpcPayload('worktree:list', worktreePoolSchema, payload)
+    return listWorktrees({ projectPath: r.projectPath, worktreeRoot: r.worktreeRoot })
+  })
+  ipcMain.handle('worktree:remove', async (_, payload: unknown) => {
+    const r = parseIpcPayload('worktree:remove', worktreePoolIndexSchema, payload)
+    return removeWorktree({
+      projectPath: r.projectPath,
+      poolIndex: r.poolIndex,
+      worktreeRoot: r.worktreeRoot
+    })
+  })
+  ipcMain.handle('worktree:changes', async (_, payload: unknown) => {
+    const r = parseIpcPayload('worktree:changes', worktreePathSchema, payload)
+    return getWorktreeChanges({ worktreePath: r.worktreePath })
+  })
+  ipcMain.handle('worktree:commit', async (_, payload: unknown) => {
+    const r = parseIpcPayload('worktree:commit', worktreeCommitSchema, payload)
+    return commitWorktree({ worktreePath: r.worktreePath, message: r.message })
+  })
+  ipcMain.handle('worktree:merge', async (_, payload: unknown) => {
+    const r = parseIpcPayload('worktree:merge', worktreeMergeSchema, payload)
+    return mergeWorktreeToMain({
+      projectPath: r.projectPath,
+      poolIndex: r.poolIndex,
+      commitMessage: r.commitMessage,
+      worktreeRoot: r.worktreeRoot
+    })
+  })
+  ipcMain.handle('worktree:abort-merge', async (_, payload: unknown) => {
+    const r = parseIpcPayload('worktree:abort-merge', worktreeProjectPathSchema, payload)
+    return abortMerge({ projectPath: r.projectPath })
+  })
+  ipcMain.handle('worktree:continue-merge', async (_, payload: unknown) => {
+    const r = parseIpcPayload('worktree:continue-merge', worktreeContinueMergeSchema, payload)
+    return continueMerge({ projectPath: r.projectPath, message: r.message })
+  })
+  ipcMain.handle('worktree:sync', async (_, payload: unknown) => {
+    const r = parseIpcPayload('worktree:sync', worktreePoolIndexSchema, payload)
+    return syncWorktreeFromMain({
+      projectPath: r.projectPath,
+      poolIndex: r.poolIndex,
+      worktreeRoot: r.worktreeRoot
+    })
+  })
+  ipcMain.handle('worktree:abort-rebase', async (_, payload: unknown) => {
+    const r = parseIpcPayload('worktree:abort-rebase', worktreePathSchema, payload)
+    return abortRebase({ worktreePath: r.worktreePath })
+  })
+  ipcMain.handle('worktree:cleanup', async (_, payload: unknown) => {
+    const r = parseIpcPayload('worktree:cleanup', worktreePoolSchema, payload)
+    return cleanupWorktrees({ projectPath: r.projectPath, worktreeRoot: r.worktreeRoot })
+  })
+  ipcMain.handle('worktree:find-available', async (_, payload: unknown) => {
+    const r = parseIpcPayload('worktree:find-available', worktreePoolSchema, payload)
+    return findAvailablePoolIndex({ projectPath: r.projectPath, worktreeRoot: r.worktreeRoot })
+  })
 
   ipcMain.handle('editor:list', async () => listEditorsResult())
   ipcMain.handle('editor:open-path', async (_, payload: unknown) =>
@@ -604,6 +1067,14 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
     readWorkspaceImage(
       parseIpcPayload('file:read-workspace-image', workspaceFileTargetPayloadSchema, payload)
     )
+  )
+  ipcMain.handle('file:read-workspace-pdf', async (_, payload: unknown) =>
+    readWorkspacePdf(
+      parseIpcPayload('file:read-workspace-pdf', workspaceFileTargetPayloadSchema, payload)
+    )
+  )
+  ipcMain.handle('file:save-as', async (_, payload: unknown) =>
+    saveWorkspaceFileAs(payload, getMainWindow)
   )
   ipcMain.handle('file:write-workspace', async (_, payload: unknown) =>
     writeWorkspaceFile(
@@ -710,6 +1181,41 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
       parseIpcPayload('write:inline-completion', writeInlineCompletionPayloadSchema, payload)
     )
   )
+  ipcMain.handle('write:retrieve-context', async (_, payload: unknown) => {
+    try {
+      const context = await retrieveWriteContext(
+        parseIpcPayload('write:retrieve-context', writeRetrievalPayloadSchema, payload)
+      )
+      return { ok: true as const, context }
+    } catch (error) {
+      return {
+        ok: false as const,
+        message: error instanceof Error ? error.message : String(error)
+      }
+    }
+  })
+  ipcMain.handle('write:generate-infographic', async (_, payload: unknown) =>
+    requestWriteInfographic(
+      await store.load(),
+      parseIpcPayload('write:generate-infographic', writeInfographicPayloadSchema, payload)
+    )
+  )
+  ipcMain.handle('write:authorize-prototype', async (_, payload: unknown) => {
+    const request = parseIpcPayload('write:authorize-prototype', writePrototypeFilePayloadSchema, payload)
+    return authorizePrototypePath(request.path, request.workspaceRoot)
+  })
+  ipcMain.handle('write:open-prototype', async (_, payload: unknown) => {
+    const request = parseIpcPayload('write:open-prototype', writePrototypeFilePayloadSchema, payload)
+    const authorized = await authorizePrototypePath(request.path, request.workspaceRoot)
+    if (!authorized.ok) return authorized
+    return openPathWithShell(authorized.absolutePath)
+  })
+  ipcMain.handle('speech:transcribe', async (_, payload: unknown) =>
+    requestSpeechTranscription(
+      await store.load(),
+      parseIpcPayload('speech:transcribe', speechTranscribePayloadSchema, payload)
+    )
+  )
   ipcMain.handle('write:inline-completion-debug:list', async () => listWriteInlineCompletionDebugEntries())
   ipcMain.handle('write:inline-completion-debug:clear', async () => {
     clearWriteInlineCompletionDebugEntries()
@@ -722,19 +1228,18 @@ export function registerAppIpcHandlers(options: RegisterAppIpcHandlersOptions): 
       getMainWindow
     )
   })
-  ipcMain.handle('windows:titlebar-theme', async (_, theme: unknown) => {
-    if (process.platform === 'darwin') return
-    const mainWindow = getMainWindow()
-    if (!mainWindow || mainWindow.isDestroyed()) return
-    mainWindow.setTitleBarOverlay(
-      desktopTitleBarOverlayForTheme(
-        parseIpcPayload('windows:titlebar-theme', windowsTitleBarThemeSchema, theme)
-      )
-    )
-  })
   ipcMain.handle('shell:open-external', async (_, url: unknown) => {
     const validatedUrl = parseIpcPayload('shell:open-external', shellOpenExternalUrlSchema, url)
     await shell.openExternal(validatedUrl)
+  })
+  ipcMain.handle('computer-use:permissions', async () => getComputerUsePermissions())
+  ipcMain.handle('computer-use:request-permission', async (_, kind: unknown) => {
+    const parsed = parseIpcPayload(
+      'computer-use:request-permission',
+      computerUsePermissionKindSchema,
+      kind
+    )
+    return requestComputerUsePermission(parsed)
   })
   ipcMain.handle('notification:turn-complete', async (_, payload: unknown) =>
     showTurnCompleteNotification(

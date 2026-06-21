@@ -1,9 +1,20 @@
-import type { AppSettingsV1, ScheduleRunMode, ScheduledTaskV1 } from '../shared/app-settings'
+import type {
+  AppSettingsV1,
+  ModelEndpointFormat,
+  ScheduleReasoningEffort,
+  ScheduleRunMode,
+  ScheduledTaskV1
+} from '../shared/app-settings'
 import {
   DEFAULT_SCHEDULE_MODEL,
   DEFAULT_SCHEDULE_REASONING_EFFORT,
-  resolveKunRuntimeSettings
+  isCustomModelEndpointFormat,
+  modelEndpointPath,
+  resolveKunRuntimeSettings,
+  resolveModelEndpointFormat,
+  resolveModelProviderProxyUrl
 } from '../shared/app-settings'
+import { fetchWithOptionalProxy } from './proxy-fetch'
 
 const SCHEDULED_TASK_CANDIDATE_RE =
   /(?:提醒|定时|闹钟|通知|叫我|叫醒|稍后|之后|到点|分钟后|小时后|秒后|天后|明天|后天|今晚|later|remind|reminder|alarm|timer|schedule|scheduled|tomorrow|tonight|in\s+\d+\s+(?:seconds?|minutes?|hours?|days?|weeks?))/iu
@@ -16,6 +27,13 @@ type DetectionPayload = {
   scheduleAt?: string
   reminderBody?: string
   taskName?: string
+}
+
+type DetectionRequestPayload = {
+  url: string
+  headers: Record<string, string>
+  body: Record<string, unknown>
+  endpointFormat: ModelEndpointFormat
 }
 
 export type ParsedClawScheduledTaskRequest = {
@@ -133,15 +151,23 @@ function normalizeDetectedRequest(
   }
 }
 
-function buildChatCompletionsUrl(baseUrl: string): string {
+function buildModelEndpointUrl(baseUrl: string, endpointFormat: ModelEndpointFormat): string {
+  if (isCustomModelEndpointFormat(endpointFormat)) return exactModelEndpointUrl(baseUrl)
+  const path = modelEndpointPath(endpointFormat)
   const normalized = baseUrl.replace(/\/+$/, '')
-  if (!normalized) return '/v1/chat/completions'
-  if (normalized.endsWith('/chat/completions')) return normalized
-  if (normalized.endsWith('/v1')) return `${normalized}/chat/completions`
+  if (!normalized) return `/v1/${path}`
+  if (normalized.endsWith('/v1')) return `${normalized}/${path}`
   if (normalized.endsWith('/beta')) {
-    return `${normalized.slice(0, -5)}/v1/chat/completions`
+    return `${normalized.slice(0, -5)}/v1/${path}`
   }
-  return `${normalized}/v1/chat/completions`
+  return `${normalized}/v1/${path}`
+}
+
+function exactModelEndpointUrl(baseUrl: string): string {
+  const trimmed = baseUrl.trim()
+  const query = trimmed.search(/[?#]/)
+  if (query < 0) return trimmed.replace(/\/+$/, '')
+  return `${trimmed.slice(0, query).replace(/\/+$/, '')}${trimmed.slice(query)}`
 }
 
 function buildDetectionPrompt(now: Date): string {
@@ -165,6 +191,101 @@ function detectionModel(model: string): string {
   return trimmed && trimmed !== DEFAULT_SCHEDULE_MODEL ? trimmed : 'deepseek-v4-flash'
 }
 
+function buildDetectionRequest(input: {
+  baseUrl: string
+  apiKey: string
+  endpointFormat: ModelEndpointFormat
+  model: string
+  systemPrompt: string
+  sourceText: string
+}): DetectionRequestPayload | null {
+  const endpointFormat = resolveModelEndpointFormat(input.endpointFormat, input.baseUrl)
+  if (!endpointFormat) return null
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${input.apiKey}`
+  }
+  if (endpointFormat === 'messages') {
+    headers['x-api-key'] = input.apiKey
+    headers['anthropic-version'] = '2023-06-01'
+  }
+  if (endpointFormat === 'responses') {
+    return {
+      url: buildModelEndpointUrl(input.baseUrl, input.endpointFormat),
+      headers,
+      endpointFormat,
+      body: {
+        model: input.model,
+        instructions: input.systemPrompt,
+        input: input.sourceText,
+        max_output_tokens: 300,
+        text: { format: { type: 'json_object' } }
+      }
+    }
+  }
+  if (endpointFormat === 'messages') {
+    return {
+      url: buildModelEndpointUrl(input.baseUrl, input.endpointFormat),
+      headers,
+      endpointFormat,
+      body: {
+        model: input.model,
+        system: input.systemPrompt,
+        messages: [{ role: 'user', content: input.sourceText }],
+        max_tokens: 300
+      }
+    }
+  }
+  return {
+    url: buildModelEndpointUrl(input.baseUrl, input.endpointFormat),
+    headers,
+    endpointFormat,
+    body: {
+      model: input.model,
+      messages: [
+        { role: 'system', content: input.systemPrompt },
+        { role: 'user', content: input.sourceText }
+      ],
+      max_tokens: 300,
+      response_format: { type: 'json_object' }
+    }
+  }
+}
+
+function extractDetectionContent(rawJson: string, endpointFormat: ModelEndpointFormat): string {
+  const parsed = JSON.parse(rawJson) as Record<string, unknown>
+  if (endpointFormat === 'responses') {
+    if (typeof parsed.output_text === 'string') return parsed.output_text.trim()
+    const output = parsed.output
+    if (!Array.isArray(output)) return ''
+    return output.map((item) => {
+      if (!item || typeof item !== 'object') return ''
+      const content = (item as { content?: unknown }).content
+      if (!Array.isArray(content)) return ''
+      return content.map((block) =>
+        block && typeof block === 'object' && typeof (block as { text?: unknown }).text === 'string'
+          ? (block as { text: string }).text
+          : ''
+      ).join('')
+    }).join('').trim()
+  }
+  if (endpointFormat === 'messages') {
+    const content = parsed.content
+    if (!Array.isArray(content)) return ''
+    return content.map((block) =>
+      block && typeof block === 'object' && typeof (block as { text?: unknown }).text === 'string'
+        ? (block as { text: string }).text
+        : ''
+    ).join('').trim()
+  }
+  const choices = parsed.choices
+  if (!Array.isArray(choices)) return ''
+  const first = choices[0]
+  return first && typeof first === 'object'
+    ? String((first as { message?: { content?: unknown } }).message?.content ?? '').trim()
+    : ''
+}
+
 export function looksLikeClawScheduledTaskCandidate(text: string): boolean {
   return SCHEDULED_TASK_CANDIDATE_RE.test(text.trim())
 }
@@ -179,28 +300,26 @@ export async function detectClawScheduledTaskRequest(
   const runtime = resolveKunRuntimeSettings(settings)
   const apiKey = runtime.apiKey.trim()
   if (!apiKey) return null
-  const response = await fetch(buildChatCompletionsUrl(runtime.baseUrl), {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`
-    },
-    body: JSON.stringify({
-      model: detectionModel(modelHint),
-      messages: [
-        { role: 'system', content: buildDetectionPrompt(now) },
-        { role: 'user', content: sourceText }
-      ],
-      max_tokens: 300
-    }),
-    signal: AbortSignal.timeout(DETECTOR_TIMEOUT_MS)
+  const detectionRequest = buildDetectionRequest({
+    baseUrl: runtime.baseUrl,
+    apiKey,
+    endpointFormat: runtime.endpointFormat,
+    model: detectionModel(modelHint),
+    systemPrompt: buildDetectionPrompt(now),
+    sourceText
   })
+  if (!detectionRequest) return null
+  const response = await fetchWithOptionalProxy(detectionRequest.url, {
+    method: 'POST',
+    headers: detectionRequest.headers,
+    body: JSON.stringify(detectionRequest.body),
+    signal: AbortSignal.timeout(DETECTOR_TIMEOUT_MS)
+  }, resolveModelProviderProxyUrl(settings))
   const text = await response.text()
   if (!response.ok) return null
   let content = ''
   try {
-    const parsed = JSON.parse(text) as { choices?: Array<{ message?: { content?: string } }> }
-    content = parsed.choices?.[0]?.message?.content?.trim() ?? ''
+    content = extractDetectionContent(text, detectionRequest.endpointFormat)
   } catch {
     return null
   }
@@ -210,7 +329,9 @@ export async function detectClawScheduledTaskRequest(
 export function buildScheduledTaskFromDetectedRequest(options: {
   request: ParsedClawScheduledTaskRequest
   workspaceRoot: string
+  providerId?: string
   model: string
+  reasoningEffort?: ScheduleReasoningEffort
   mode: ScheduleRunMode
   id: string
   now?: string
@@ -222,8 +343,10 @@ export function buildScheduledTaskFromDetectedRequest(options: {
     enabled: true,
     prompt: options.request.taskPrompt,
     workspaceRoot: options.workspaceRoot.trim(),
+    clawChannelId: '',
+    providerId: options.providerId?.trim() ?? '',
     model: options.model.trim() || DEFAULT_SCHEDULE_MODEL,
-    reasoningEffort: DEFAULT_SCHEDULE_REASONING_EFFORT,
+    reasoningEffort: options.reasoningEffort ?? DEFAULT_SCHEDULE_REASONING_EFFORT,
     mode: options.mode,
     schedule: {
       kind: 'at',

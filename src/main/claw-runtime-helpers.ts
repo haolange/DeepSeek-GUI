@@ -8,10 +8,12 @@ import type {
   ClawImProvider,
   ClawImRemoteSessionV1,
   ClawRunMode,
+  ScheduleReasoningEffort,
   ScheduleTaskFromTextResult
 } from '../shared/app-settings'
 import { CLAW_FEISHU_INBOUND_MESSAGE_HEADING } from '../shared/app-settings'
 import type { JsonSettingsStore } from './settings-store'
+import type { TelegramRuntime } from './telegram-runtime'
 
 export type RuntimeRequestResult = { ok: boolean; status: number; body: string }
 
@@ -31,9 +33,20 @@ export type ClawRuntimeDeps = {
     to: string
     text: string
   }) => Promise<{ ok: true; messageId: string } | { ok: false; message: string }>
+  /** WeChat owner (`ilink_user_id`) for a bridge account; '' when unknown. */
+  resolveWeixinAccountUserId?: (accountId: string) => Promise<string>
+  /** Telegram long-polling runtime. Absent when no Telegram channel is configured. */
+  telegramRuntime?: TelegramRuntime
   createScheduledTaskFromText?: (
     text: string,
-    options?: { workspaceRoot?: string | null; modelHint?: string | null; mode?: ClawRunMode | null }
+    options?: {
+      workspaceRoot?: string | null
+      clawChannelId?: string | null
+      providerId?: string | null
+      modelHint?: string | null
+      reasoningEffort?: ScheduleReasoningEffort | null
+      mode?: ClawRunMode | null
+    }
   ) => Promise<ScheduleTaskFromTextResult>
 }
 
@@ -45,12 +58,14 @@ export type ThreadRecordJson = {
 export type TurnRecordJson = {
   id: string
   status?: string
+  error?: string | null
   items?: TurnItemJson[]
 }
 
 export type TurnItemJson = {
   kind: string
   turnId?: string
+  toolName?: string
   toolKind?: string
   output?: unknown
   isError?: boolean | null
@@ -77,6 +92,7 @@ export type RunPromptOptions = {
   waitForResult: boolean
   responseTimeoutMs: number
   source: 'task' | 'im'
+  providerId?: string
   threadId?: string
   channel?: ClawImChannelV1
   onTurnStarted?: (payload: { threadId: string; turnId: string }) => Promise<void> | void
@@ -94,7 +110,9 @@ export function sanitizePathSegment(raw: string, fallback: string): string {
 }
 
 export function feishuSenderLabel(message: NormalizedMessage): string {
-  return message.senderName?.trim() || message.senderId.trim() || 'feishu-user'
+  const senderName = typeof message.senderName === 'string' ? message.senderName.trim() : ''
+  const senderId = typeof message.senderId === 'string' ? message.senderId.trim() : ''
+  return senderName || senderId || 'feishu-user'
 }
 
 export function buildFeishuPrompt(message: NormalizedMessage): string {
@@ -124,7 +142,7 @@ export function formatFeishuMirrorText(text: string, direction: 'user' | 'assist
   const trimmed = text.trim()
   if (direction === 'user') {
     return {
-      markdown: `**From DeepSeek GUI**\n\n> ${trimmed.replace(/\n/g, '\n> ')}`
+      markdown: `**From Kun**\n\n> ${trimmed.replace(/\n/g, '\n> ')}`
     }
   }
   return { markdown: trimmed || '(empty reply)' }
@@ -164,14 +182,14 @@ export function isRunningStatus(status: string | undefined): boolean {
   return status === 'queued' || status === 'in_progress' || status === 'started' || status === 'running'
 }
 
-export function latestAssistantText(detail: ThreadDetailJson): string {
-  const turnItems = Array.isArray(detail.turns)
-    ? detail.turns.flatMap((turn) => Array.isArray(turn.items) ? turn.items : [])
-    : []
-  const items = [
-    ...(Array.isArray(detail.items) ? detail.items : []),
-    ...turnItems
-  ]
+export function latestAssistantText(
+  detail: ThreadDetailJson,
+  options: { turnId?: string } = {}
+): string {
+  const turnId = options.turnId?.trim()
+  const items = turnId
+    ? threadItems(detail).filter((item) => item.turnId === turnId)
+    : threadItems(detail)
   for (let index = items.length - 1; index >= 0; index -= 1) {
     const item = items[index]
     if (item.kind !== 'assistant_text' && item.kind !== 'agent_message') continue
@@ -181,40 +199,131 @@ export function latestAssistantText(detail: ThreadDetailJson): string {
   return ''
 }
 
+/** Reply sent when a turn finished but produced no concluding text. */
+export const IM_COMPLETED_NO_TEXT_REPLY = '✅ 任务已完成。'
+
+/**
+ * Ack sent when a turn outruns the IM response timeout. The turn keeps
+ * running and the real result is pushed back when it finishes.
+ */
+export const IM_PROCESSING_ACK = '⏳ 收到，正在处理，完成后会把结果发给你。'
+
+const TOOL_ITEM_KINDS = new Set<string>(['tool_call', 'tool_result'])
+
+/**
+ * The turn's *concluding* assistant message — the last `assistant_text`
+ * that appears after the final tool activity.
+ *
+ * Mid-turn narration is intentionally skipped: a model often writes an
+ * upfront plan as text ("先做 X，再做 Y") and then performs the work
+ * through tool calls, frequently ending without any further text (the
+ * wrap-up stays in `reasoning_content`, or it just stops after the last
+ * tool succeeds). `latestAssistantText` would return that stale plan,
+ * so the phone received the plan instead of the result. Scanning only
+ * the post-tool tail fixes that.
+ *
+ * Pure chat turns (no tool calls) fall back to the last assistant
+ * message. Returns '' when the turn ended without concluding text;
+ * callers then substitute {@link IM_COMPLETED_NO_TEXT_REPLY}.
+ */
+export function finalAssistantReplyText(
+  detail: ThreadDetailJson,
+  options: { turnId?: string } = {}
+): string {
+  const turnId = options.turnId?.trim()
+  const items = turnId
+    ? threadItems(detail).filter((item) => item.turnId === turnId)
+    : threadItems(detail)
+  let lastToolIndex = -1
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    if (TOOL_ITEM_KINDS.has(items[index].kind)) {
+      lastToolIndex = index
+      break
+    }
+  }
+  for (let index = items.length - 1; index > lastToolIndex; index -= 1) {
+    const item = items[index]
+    if (item.kind !== 'assistant_text' && item.kind !== 'agent_message') continue
+    const text = (item.text ?? item.detail ?? item.summary ?? '').trim()
+    if (text) return text
+  }
+  return ''
+}
+
+/**
+ * Reply used by the asynchronous result push when the finished turn has
+ * no concluding text. Files generated during a long run cannot be media
+ * pushed out-of-band, so their names are surfaced for retrieval instead.
+ */
+export function imCompletionReplyForPush(files: readonly ClawGeneratedFileV1[]): string {
+  if (files.length > 0) {
+    const names = files.map((file) => file.fileName).join('、')
+    return `${IM_COMPLETED_NO_TEXT_REPLY}（生成的文件：${names}，回复"发给我"获取）`
+  }
+  return IM_COMPLETED_NO_TEXT_REPLY
+}
+
 function outputRecord(output: unknown): Record<string, unknown> | null {
   return typeof output === 'object' && output !== null && !Array.isArray(output)
     ? output as Record<string, unknown>
     : null
 }
 
-function generatedFileFromToolResult(
-  item: TurnItemJson,
+function generatedFileFromRecord(
+  record: Record<string, unknown>,
   workspaceRoot: string
 ): ClawGeneratedFileV1 | null {
-  if (item.kind !== 'tool_result' || item.toolKind !== 'file_change' || item.isError === true) return null
-  const output = outputRecord(item.output)
-  if (!output) return null
-  const path = asString(output.path) || asString(output.absolute_path)
-  const relativePath = asString(output.relative_path)
+  const path = asString(record.path) || asString(record.absolutePath) || asString(record.absolute_path)
+  const relativePath = asString(record.relativePath) || asString(record.relative_path)
   const resolvedPath = path || (workspaceRoot && relativePath ? join(workspaceRoot, relativePath) : '')
   if (!resolvedPath) return null
   return {
     path: resolvedPath,
     ...(relativePath ? { relativePath } : {}),
-    fileName: basename(relativePath || resolvedPath)
+    fileName: asString(record.fileName) || asString(record.name) || basename(relativePath || resolvedPath)
   }
 }
 
+function generatedFilesFromToolResult(
+  item: TurnItemJson,
+  workspaceRoot: string
+): ClawGeneratedFileV1[] {
+  if (item.kind !== 'tool_result' || item.isError === true) return []
+  const output = outputRecord(item.output)
+  if (!output) return []
+  if (item.toolKind === 'file_change') {
+    const file = generatedFileFromRecord(output, workspaceRoot)
+    return file ? [file] : []
+  }
+  if (
+    (item.toolName === 'generate_image' ||
+      item.toolName === 'generate_speech' ||
+      item.toolName === 'generate_music' ||
+      item.toolName === 'generate_video') &&
+    Array.isArray(output.files)
+  ) {
+    return output.files
+      .map((entry) => outputRecord(entry))
+      .filter((entry): entry is Record<string, unknown> => entry != null)
+      .map((entry) => generatedFileFromRecord(entry, workspaceRoot))
+      .filter((file): file is ClawGeneratedFileV1 => file != null)
+  }
+  return []
+}
+
 function threadItems(detail: ThreadDetailJson): TurnItemJson[] {
-  const turnItems = Array.isArray(detail.turns)
-    ? detail.turns.flatMap((turn) =>
-        Array.isArray(turn.items)
-          ? turn.items.map((item) => ({ ...item, turnId: item.turnId || turn.id }))
-          : []
-      )
+  const turns = Array.isArray(detail.turns) ? detail.turns : []
+  const singleTurnId = turns.length === 1 ? turns[0].id : ''
+  const topLevelItems = Array.isArray(detail.items)
+    ? detail.items.map((item) => ({ ...item, turnId: item.turnId || singleTurnId || undefined }))
     : []
+  const turnItems = turns.flatMap((turn) =>
+    Array.isArray(turn.items)
+      ? turn.items.map((item) => ({ ...item, turnId: item.turnId || turn.id }))
+      : []
+  )
   return [
-    ...(Array.isArray(detail.items) ? detail.items : []),
+    ...topLevelItems,
     ...turnItems
   ]
 }
@@ -233,10 +342,11 @@ function extractGeneratedFiles(
 ): ClawGeneratedFileV1[] {
   const files: ClawGeneratedFileV1[] = []
   for (let index = items.length - 1; index >= 0; index -= 1) {
-    const file = generatedFileFromToolResult(items[index], workspaceRoot)
-    if (!file) continue
-    if (files.some((existing) => isPathLikeDuplicate(existing, file))) continue
-    files.push(file)
+    for (const file of generatedFilesFromToolResult(items[index], workspaceRoot).reverse()) {
+      if (files.some((existing) => isPathLikeDuplicate(existing, file))) continue
+      files.push(file)
+      if (files.length >= maxFiles) break
+    }
     if (files.length >= maxFiles) break
   }
   return files.reverse()
@@ -251,12 +361,11 @@ export function latestGeneratedFiles(
   const items = threadItems(detail)
   const turnId = options.turnId?.trim()
   if (turnId) {
-    const currentTurnFiles = extractGeneratedFiles(
+    return extractGeneratedFiles(
       items.filter((item) => item.turnId === turnId),
       workspaceRoot,
       maxFiles
     )
-    if (currentTurnFiles.length > 0) return currentTurnFiles
   }
   return extractGeneratedFiles(items, workspaceRoot, maxFiles)
 }
@@ -266,7 +375,10 @@ export function shouldSendGeneratedFilesForPrompt(prompt: string): boolean {
   if (!text) return false
   return /发给我|发送给我|发一下|发来|发过来|传给我|传过来|上传|附件|以附件|发文件|文件发|文档发/i.test(text) ||
     /\b(send|attach|attachment|upload)\b/i.test(text) ||
-    /给我(?:一个|一份)?.{0,24}(文档|文件|\.(?:md|txt|pdf|docx|xlsx|csv|pptx))/i.test(text)
+    /给我(?:一个|一份)?.{0,24}(文档|文件|\.(?:md|txt|pdf|docx|xlsx|csv|pptx))/i.test(text) ||
+    /(生成|画|绘制|做|制作|创建|出).{0,24}(图|图片|图像|照片|海报|插画|表情包|logo)/i.test(text) ||
+    /(生成|做|制作|创建|配|出).{0,24}(语音|音频|朗读|旁白|配音|音乐|歌曲|视频|短片|影片)/i.test(text) ||
+    /\b(generate|create|draw|make)\b.{0,40}\b(image|picture|photo|poster|illustration|meme|logo|speech|voice|audio|music|song|video)\b/i.test(text)
 }
 
 export function shouldDirectSendExistingGeneratedFilesForPrompt(prompt: string): boolean {
@@ -473,4 +585,89 @@ export async function readRequestBody(req: IncomingMessage): Promise<string> {
     chunks.push(buffer)
   }
   return Buffer.concat(chunks).toString('utf8')
+}
+
+export type SseSubscriber = (signal: AbortSignal) => { close: () => void }
+
+export type RuntimeSseEvent = { kind: string; turnId?: string; item?: { text?: unknown }; seq?: number; [key: string]: unknown }
+
+/**
+ * Subscribe to `/v1/threads/{threadId}/events` and dispatch each
+ * `RuntimeSseEvent` to `onEvent`. Reconnects with exponential backoff
+ * (750ms → 5s) on network failure; does NOT reconnect on 4xx with a 4xx
+ * status (those are returned to the caller via the close path).
+ *
+ * The returned `close()` aborts the in-flight fetch and prevents further
+ * reconnects.
+ */
+export async function subscribeRuntimeThreadEvents(input: {
+  baseUrl: string
+  threadId: string
+  headers: Record<string, string>
+  onEvent: (event: RuntimeSseEvent) => void
+  signal: AbortSignal
+  logError?: (category: string, message: string, detail?: unknown) => void
+}): Promise<{ close: () => void }> {
+  const { baseUrl, threadId, headers, onEvent, signal, logError } = input
+  const ac = new AbortController()
+  const onAbort = (): void => ac.abort()
+  signal.addEventListener('abort', onAbort, { once: true })
+  let nextSinceSeq = 0
+  let closed = false
+  let reconnectDelayMs = 750
+  const close = (): void => {
+    if (closed) return
+    closed = true
+    ac.abort()
+    signal.removeEventListener('abort', onAbort)
+  }
+  void (async () => {
+    while (!closed && !ac.signal.aborted) {
+      const url = new URL(`${baseUrl.replace(/\/+$/, '')}/v1/threads/${encodeURIComponent(threadId)}/events`)
+      url.searchParams.set('since_seq', String(nextSinceSeq))
+      try {
+        const res = await fetch(url, { signal: ac.signal, headers: { ...headers, Accept: 'text/event-stream' } })
+        if (!res.ok || !res.body) {
+          if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) {
+            logError?.('sse', `SSE connection refused (${res.status}) for thread ${threadId}`, { status: res.status })
+            return
+          }
+          await new Promise<void>((r) => setTimeout(r, reconnectDelayMs))
+          reconnectDelayMs = Math.min(reconnectDelayMs * 2, 5_000)
+          continue
+        }
+        reconnectDelayMs = 750
+        const reader = res.body.getReader()
+        const dec = new TextDecoder()
+        let buffer = ''
+        while (!closed && !ac.signal.aborted) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buffer += dec.decode(value, { stream: true })
+          let split: number
+          while ((split = buffer.indexOf('\n\n')) !== -1) {
+            const block = buffer.slice(0, split)
+            buffer = buffer.slice(split + 2)
+            const dataLine = block.split('\n').find((l) => l.startsWith('data:'))
+            if (!dataLine) continue
+            const json = dataLine.slice(5).trimStart()
+            try {
+              const parsed = JSON.parse(json) as { seq?: number } & RuntimeSseEvent
+              if (typeof parsed.seq === 'number') nextSinceSeq = Math.max(nextSinceSeq, parsed.seq)
+              onEvent(parsed)
+            } catch {
+              /* malformed SSE data line — ignore */
+            }
+          }
+        }
+      } catch (error) {
+        if (closed || ac.signal.aborted) return
+        const message = error instanceof Error ? error.message : String(error)
+        logError?.('sse', `SSE stream error for thread ${threadId}`, { message })
+        await new Promise<void>((r) => setTimeout(r, reconnectDelayMs))
+        reconnectDelayMs = Math.min(reconnectDelayMs * 2, 5_000)
+      }
+    }
+  })()
+  return { close }
 }

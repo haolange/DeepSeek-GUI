@@ -19,6 +19,31 @@ import {
   readThreadForkRegistry,
   saveThreadForkRegistry
 } from '../lib/thread-fork-registry'
+import {
+  forgetThreadWorktree,
+  readThreadWorktreeRegistry,
+  saveThreadWorktreeRegistry
+} from '../lib/thread-worktree-registry'
+
+/**
+ * Release the worktree pool slot owned by a thread when the task completes
+ * or is interrupted. Fire-and-forget — a failure must not block the UI.
+ */
+function releaseThreadWorktreeIfNeeded(threadId: string | null): void {
+  if (!threadId || typeof window === 'undefined') return
+  if (typeof window.kunGui?.releaseWorktree !== 'function') return
+  const record = readThreadWorktreeRegistry().worktrees[threadId]
+  if (!record) return
+  if (record.poolIndex === undefined) return
+  void window.kunGui
+    .releaseWorktree({
+      projectPath: record.projectPath,
+      poolIndex: record.poolIndex
+    })
+    .catch(() => undefined)
+  saveThreadWorktreeRegistry(forgetThreadWorktree(threadId))
+}
+
 import { workspaceLabelFromPath } from '../lib/workspace-label'
 import { isInternalTemporaryWorkspace, normalizeWorkspaceRoot } from '../lib/workspace-path'
 import { buildClawRuntimePrompt, getActiveAgentApiKey } from '@shared/app-settings'
@@ -40,8 +65,8 @@ import {
   collectAssistantTextForTurn,
   findLatestUserBlockId,
   findReusableEmptyThreadId,
-  hasPendingRuntimeWork,
   reconcileOptimisticUserBlock,
+  settlePendingRuntimeWorkAfterInterrupt,
   threadSnapshotLooksRunning,
   threadBelongsToWorkspace
 } from './chat-store-runtime-helpers'
@@ -132,9 +157,79 @@ function applyTodosSnapshot(
   }))
 }
 
+function settleInterruptedTurn(set: ChatStoreSet, get: ChatStoreGet): void {
+  resetBusyRecoveryAttempts()
+  clearBusyWatchdog()
+  const threadId = get().activeThreadId
+  set((s) => {
+    const out = flushLiveBlocks(s, {
+      ...finalizeTurnTiming(s),
+      busy: false,
+      currentTurnId: null,
+      currentTurnUserId: null,
+      error: null
+    })
+    const blocks = settlePendingRuntimeWorkAfterInterrupt(out.blocks ?? s.blocks)
+    return { ...out, blocks }
+  })
+  // Release worktree slot when user manually stops the agent (unless queued
+  // follow-ups will restart the turn in the same thread).
+  if (threadId && get().queuedMessages.length === 0) {
+    releaseThreadWorktreeIfNeeded(threadId)
+  }
+}
+
 export function createMaintenanceActions(
   { set, get, sseAbortRef }: StoreActionContext
-): Pick<ChatState, 'renameActiveThread' | 'renameThread' | 'archiveThread' | 'compactActiveThread' | 'forkActiveThread' | 'setActiveThreadGoal' | 'setActiveThreadGoalStatus' | 'clearActiveThreadGoal' | 'setActiveThreadTodoStatus' | 'clearActiveThreadTodos' | 'syncPlanTodosFromMarkdown' | 'resumeSessionIntoThread' | 'deleteThread' | 'rewindAndResend' | 'resolveApproval' | 'resolveUserInput' | 'interrupt'> {
+): Pick<ChatState, 'renameActiveThread' | 'renameThread' | 'archiveThread' | 'compactActiveThread' | 'forkActiveThread' | 'forkThreadFromTurn' | 'setActiveThreadGoal' | 'setActiveThreadGoalStatus' | 'clearActiveThreadGoal' | 'setActiveThreadTodoStatus' | 'clearActiveThreadTodos' | 'syncPlanTodosFromMarkdown' | 'resumeSessionIntoThread' | 'deleteThread' | 'rewindAndResend' | 'resolveApproval' | 'resolveUserInput' | 'interrupt'> {
+  const forkActiveThreadWithOptions = async (options: { turnId?: string } = {}): Promise<void> => {
+    const { activeThreadId, busy, blocks } = get()
+    if (!activeThreadId) return
+    if (busy) {
+      set({ error: i18n.t('common:threadActionBusy') })
+      return
+    }
+    if (get().runtimeConnection !== 'ready') {
+      set({ error: i18n.t('common:runtimeActionNeedsConnection') })
+      return
+    }
+    const p = getProvider()
+    if (typeof p.forkThread !== 'function') {
+      set({ error: i18n.t('common:runtimeFeatureUnsupported') })
+      return
+    }
+    const turnId = options.turnId?.trim()
+    try {
+      const parentThread =
+        get().threads.find((thread) => thread.id === activeThreadId) ?? {
+          id: activeThreadId,
+          title: activeThreadId.slice(0, 8)
+        }
+      const forked = await p.forkThread(activeThreadId, turnId ? { turnId } : undefined)
+      saveThreadForkRegistry(
+        markThreadFork(
+          forked.id,
+          parentThread,
+          {
+            createdAt: forked.forkedAt ?? new Date().toISOString(),
+            forkedFromMessageCount: forked.forkedFromMessageCount ?? forkedMessageCount(blocks),
+            forkedFromTurnCount: forked.forkedFromTurnCount ?? forkedTurnCount(blocks)
+          },
+          readThreadForkRegistry()
+        )
+      )
+      await get().refreshThreads()
+      await get().selectThread(forked.id)
+    } catch (e) {
+      set({
+        error: formatRuntimeError(e),
+        ...(shouldOpenSettingsForError(e)
+          ? { route: 'settings' as const, settingsSection: 'agents' as const }
+          : {})
+      })
+    }
+  }
+
   return {
   renameActiveThread: async (title) => {
     const { activeThreadId } = get()
@@ -239,9 +334,31 @@ export function createMaintenanceActions(
       return
     }
     try {
-      await p.compactThread(activeThreadId, reason)
+      const result = await p.compactThread(activeThreadId, reason)
       await get().refreshThreads()
       await get().selectThread(activeThreadId)
+      // Manual compaction may use a model request for the summary, but the
+      // chat context gauge is still based on the main turn's measured prompt.
+      // Drop the last turn's total by the folded amount so the UI reflects the
+      // compacted model-visible history immediately. The next real turn
+      // replaces this with a precise provider count.
+      const replacedTokens = result && typeof result.replacedTokens === 'number' ? result.replacedTokens : 0
+      if (replacedTokens > 0) {
+        set((s) => {
+          const prev = s.lastTurnUsage
+          if (!prev || prev.threadId !== activeThreadId) return {}
+          const inputTokens = Math.max(0, prev.snapshot.inputTokens - replacedTokens)
+          return {
+            usageRefreshKey: s.usageRefreshKey + 1,
+            lastTurnUsage: { threadId: prev.threadId, snapshot: { ...prev.snapshot, inputTokens } }
+          }
+        })
+      } else {
+        // Nothing was folded (e.g. a near-empty thread). The compaction emits no
+        // timeline row in that case, so surface a transient notice instead of
+        // leaving the command silently doing nothing.
+        set({ error: i18n.t('common:compactionNothingToCompact') })
+      }
     } catch (e) {
       set({
         error: formatRuntimeError(e),
@@ -253,50 +370,13 @@ export function createMaintenanceActions(
   },
 
   forkActiveThread: async () => {
-    const { activeThreadId, busy, blocks } = get()
-    if (!activeThreadId) return
-    if (busy) {
-      set({ error: i18n.t('common:threadActionBusy') })
-      return
-    }
-    if (get().runtimeConnection !== 'ready') {
-      set({ error: i18n.t('common:runtimeActionNeedsConnection') })
-      return
-    }
-    const p = getProvider()
-    if (typeof p.forkThread !== 'function') {
-      set({ error: i18n.t('common:runtimeFeatureUnsupported') })
-      return
-    }
-    try {
-      const parentThread =
-        get().threads.find((thread) => thread.id === activeThreadId) ?? {
-          id: activeThreadId,
-          title: activeThreadId.slice(0, 8)
-        }
-      const forked = await p.forkThread(activeThreadId)
-      saveThreadForkRegistry(
-        markThreadFork(
-          forked.id,
-          parentThread,
-          {
-            createdAt: forked.forkedAt ?? new Date().toISOString(),
-            forkedFromMessageCount: forked.forkedFromMessageCount ?? forkedMessageCount(blocks),
-            forkedFromTurnCount: forked.forkedFromTurnCount ?? forkedTurnCount(blocks)
-          },
-          readThreadForkRegistry()
-        )
-      )
-      await get().refreshThreads()
-      await get().selectThread(forked.id)
-    } catch (e) {
-      set({
-        error: formatRuntimeError(e),
-        ...(shouldOpenSettingsForError(e)
-          ? { route: 'settings' as const, settingsSection: 'agents' as const }
-          : {})
-      })
-    }
+    await forkActiveThreadWithOptions()
+  },
+
+  forkThreadFromTurn: async (turnId) => {
+    const targetTurnId = turnId.trim()
+    if (!targetTurnId) return
+    await forkActiveThreadWithOptions({ turnId: targetTurnId })
   },
 
   setActiveThreadGoal: async (objective) => {
@@ -536,10 +616,24 @@ export function createMaintenanceActions(
     const { activeThreadId } = get()
     const p = getProvider()
     const deletingActive = activeThreadId === targetId
+    // Release the worktree pool slot if this thread owned one. Best-effort:
+    // a failure to release must not block thread deletion.
+    const wtRecord = readThreadWorktreeRegistry().worktrees[targetId]
+    if (wtRecord?.poolIndex !== undefined) {
+      try {
+        await window.kunGui.releaseWorktree({
+          projectPath: wtRecord.projectPath,
+          poolIndex: wtRecord.poolIndex
+        })
+      } catch {
+        /* best-effort; the slot can be reclaimed later via Settings */
+      }
+    }
     try {
       await p.deleteThread(targetId)
       saveWriteThreadRegistry(forgetWriteThread(targetId))
       saveThreadForkRegistry(forgetThreadFork(targetId))
+      if (wtRecord) saveThreadWorktreeRegistry(forgetThreadWorktree(targetId))
       if (deletingActive) {
         sseAbortRef.current?.abort()
         sseAbortRef.current = null
@@ -580,11 +674,31 @@ export function createMaintenanceActions(
     }
     const idx = state.blocks.findIndex((b) => b.id === userBlockId && b.kind === 'user')
     if (idx < 0) return
+    const targetBlock = state.blocks[idx]
+    if (targetBlock?.kind !== 'user') return
+    const turnId = targetBlock.meta?.turnId
+    if (!state.activeThreadId || !turnId) {
+      set({ error: i18n.t('common:runtimeFeatureUnsupported') })
+      return
+    }
+    const p = getProvider()
+    if (typeof p.rewindThread !== 'function') {
+      set({ error: i18n.t('common:runtimeFeatureUnsupported') })
+      return
+    }
+    const checkpointId = targetBlock.meta?.workspaceCheckpointId
+    if (checkpointId) {
+      const restored = await window.kunGui.restoreGitCheckpoint({ checkpointId }).catch((error) => ({
+        ok: false as const,
+        reason: 'error' as const,
+        message: error instanceof Error ? error.message : String(error)
+      }))
+      if (!restored.ok) {
+        set({ error: restored.message })
+        return
+      }
+    }
 
-    // Drop the target user block and everything after it. The runtime keeps
-    // the old items on disk; this only truncates what the UI shows. A future
-    // reload of this thread will surface the old items again — acceptable
-    // tradeoff while no rewind endpoint is exposed by the runtime.
     const trimmedBlocks = state.blocks.slice(0, idx)
 
     const droppedUserIds = state.blocks
@@ -606,21 +720,25 @@ export function createMaintenanceActions(
     sseAbortRef.current = null
     clearBusyWatchdog()
 
-    set({
-      blocks: trimmedBlocks,
-      liveReasoning: '',
-      liveAssistant: '',
-      currentTurnId: null,
-      currentTurnUserId: null,
-      turnStartedAtByUserId,
-      turnDurationByUserId,
-      turnReasoningFirstAtByUserId,
-      turnReasoningLastAtByUserId,
-      queuedMessages: [],
-      error: null
-    })
-
-    await get().sendMessage(trimmed)
+    try {
+      await p.rewindThread(state.activeThreadId, turnId)
+      set({
+        blocks: trimmedBlocks,
+        liveReasoning: '',
+        liveAssistant: '',
+        currentTurnId: null,
+        currentTurnUserId: null,
+        turnStartedAtByUserId,
+        turnDurationByUserId,
+        turnReasoningFirstAtByUserId,
+        turnReasoningLastAtByUserId,
+        queuedMessages: [],
+        error: null
+      })
+      await get().sendMessage(trimmed)
+    } catch (e) {
+      set({ error: formatRuntimeError(e) })
+    }
   },
 
   resolveApproval: async (blockId, decision) => {
@@ -647,7 +765,7 @@ export function createMaintenanceActions(
       }))
     } catch (e) {
       const msg = formatRuntimeError(e)
-      void window.dsGui.logError('approval', 'Failed to submit approval decision', {
+      void window.kunGui.logError('approval', 'Failed to submit approval decision', {
         message: msg,
         blockId
       }).catch(() => undefined)
@@ -703,7 +821,9 @@ export function createMaintenanceActions(
               )
             }))
             await p.interruptTurn(activeThreadId, currentTurnId)
-            if (state.busy) armBusyWatchdog(set, get)
+            settleInterruptedTurn(set, get)
+            void get().refreshThreads()
+            void get().drainQueuedMessages()
             return
           }
           throw fallbackErr
@@ -732,7 +852,7 @@ export function createMaintenanceActions(
       }))
     } catch (e) {
       const msg = formatRuntimeError(e)
-      void window.dsGui.logError('user-input', 'Failed to resolve user input', {
+      void window.kunGui.logError('user-input', 'Failed to resolve user input', {
         message: msg,
         blockId
       }).catch(() => undefined)
@@ -754,25 +874,32 @@ export function createMaintenanceActions(
     const { activeThreadId, currentTurnId } = get()
     if (!activeThreadId || !currentTurnId) return
     const p = getProvider()
+    // Settle the UI before notifying the runtime: a slow or hung
+    // interruptTurn must not keep the stop button unresponsive. The event
+    // stream is aborted first because onDeltas/onTool flip `busy` back on
+    // while the backend turn is still streaming.
+    sseAbortRef.current?.abort()
+    sseAbortRef.current = null
+    settleInterruptedTurn(set, get)
     try {
       await p.interruptTurn(activeThreadId, currentTurnId, { discard: options?.discard === true })
-      clearBusyWatchdog()
-      set((s) =>
-        flushLiveBlocks(s, {
-          ...finalizeTurnTiming(s),
-          busy: false,
-          currentTurnId: null
-        })
-      )
     } catch (e) {
       const msg = formatRuntimeError(e)
-      void window.dsGui.logError('interrupt', 'Failed to interrupt turn', { message: msg }).catch(() => undefined)
+      void window.kunGui.logError('interrupt', 'Failed to interrupt turn', { message: msg }).catch(() => undefined)
       set({
         error: msg,
         ...(shouldOpenSettingsForError(e)
           ? { route: 'settings' as const, settingsSection: 'agents' as const }
           : {})
       })
+    }
+    void get().refreshThreads()
+    // Re-sync from the runtime snapshot and re-subscribe the event stream
+    // aborted above; recoverActiveTurn also drains queued messages once the
+    // thread is idle. Skip when the user already moved on to another thread
+    // or a newer stream owns the subscription.
+    if (get().activeThreadId === activeThreadId && sseAbortRef.current === null) {
+      await get().recoverActiveTurn()
     }
   }
   }

@@ -1,6 +1,8 @@
 import { lazy, Suspense, useEffect } from 'react'
 import { useChatStore } from './store/chat-store'
 import { supportsDesktopTitleBar, WindowsTitleBar } from './components/WindowsTitleBar'
+import { RuntimeStatusBanner } from './components/RuntimeStatusBanner'
+import i18n from './i18n'
 
 const Workbench = lazy(() =>
   import('./components/Workbench').then((module) => ({ default: module.Workbench }))
@@ -15,14 +17,25 @@ const InitialSetupDialog = lazy(() =>
 )
 
 function RouteFallback(): React.ReactElement {
-  return <div className="h-full bg-ds-main" />
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      className="flex h-full min-h-0 items-center justify-center bg-ds-main text-ds-muted"
+    >
+      <div className="flex items-center gap-2 rounded-full border border-ds-border-muted bg-ds-card px-4 py-2 text-[13px] shadow-sm">
+        <span className="h-2 w-2 animate-pulse rounded-full bg-accent" aria-hidden />
+        <span>{i18n.t('loading')}</span>
+      </div>
+    </div>
+  )
 }
 
 export default function AppShell(): React.ReactElement {
   const route = useChatStore((s) => s.route)
   const boot = useChatStore((s) => s.boot)
   const initialSetupOpen = useChatStore((s) => s.initialSetupOpen)
-  const platform = typeof window !== 'undefined' ? window.dsGui?.platform ?? 'unknown' : 'unknown'
+  const platform = typeof window !== 'undefined' ? window.kunGui?.platform ?? 'unknown' : 'unknown'
   const hasDesktopTitleBar = supportsDesktopTitleBar(platform)
 
   useEffect(() => {
@@ -42,6 +55,7 @@ export default function AppShell(): React.ReactElement {
     <div className={hasDesktopTitleBar ? 'ds-windows-app-frame flex h-full min-h-0 flex-col bg-ds-main' : 'flex h-full min-h-0 flex-col bg-transparent'}>
       {hasDesktopTitleBar ? <WindowsTitleBar platform={platform} /> : null}
       <div className="flex min-h-0 flex-1 flex-col">
+        <RuntimeStatusBanner />
         <Suspense fallback={<RouteFallback />}>
           {route === 'settings' ? <SettingsView /> : <Workbench />}
         </Suspense>

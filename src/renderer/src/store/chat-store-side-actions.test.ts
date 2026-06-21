@@ -193,6 +193,7 @@ function buildHarness(overrides: Partial<ChatState> = {}): Harness {
     archiveThread: async () => undefined,
     compactActiveThread: async () => undefined,
     forkActiveThread: async () => undefined,
+    forkThreadFromTurn: async () => undefined,
     spawnSideConversation: async () => null,
     openSideConversationDraft: () => undefined,
     sendSideMessage: async () => false,
@@ -234,7 +235,7 @@ function buildHarness(overrides: Partial<ChatState> = {}): Harness {
 describe('chat-store-side-actions', () => {
   beforeEach(() => {
     ;(globalThis as { window?: unknown }).window = {
-      dsGui: {
+      kunGui: {
         runtimeRequest: vi.fn(async () => ({ ok: true, status: 200, body: '{}' }))
       }
     }
@@ -303,7 +304,7 @@ describe('chat-store-side-actions', () => {
       'use less reasoning',
       expect.objectContaining({
         model: 'deepseek-chat',
-        reasoningEffort: 'off'
+        reasoningEffort: 'low'
       })
     )
   })
@@ -351,7 +352,7 @@ describe('chat-store-side-actions', () => {
   it('promoteSideConversation clears the relation by PATCH /v1/threads/{id} and refreshes the thread list', async () => {
     const { actions, state } = buildHarness()
     const id = (await actions.spawnSideConversation())!
-    const runtimeRequest = globalThis.window.dsGui.runtimeRequest as ReturnType<typeof vi.fn>
+    const runtimeRequest = globalThis.window.kunGui.runtimeRequest as ReturnType<typeof vi.fn>
     runtimeRequest.mockClear()
 
     await actions.promoteSideConversation(id)

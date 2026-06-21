@@ -1,7 +1,7 @@
 import type { ReactElement } from 'react'
 import type { ReviewTarget } from '../../agent/types'
 
-export type BuiltinSlashCommandId = 'plan' | 'goal' | 'review' | 'compact' | 'fork' | 'archive' | 'restore' | 'btw'
+export type BuiltinSlashCommandId = 'new' | 'plan' | 'goal' | 'research' | 'review' | 'compact' | 'fork' | 'archive' | 'restore' | 'btw'
 export type SkillSlashCommandId = `skill:${string}`
 export type SlashCommandId = BuiltinSlashCommandId | SkillSlashCommandId
 
@@ -38,12 +38,27 @@ export const COMPACT_COMMAND_ALIASES = [
   '总结'
 ]
 
+export const NEW_COMMAND_ALIASES = [
+  'new',
+  'new-chat',
+  'new-thread',
+  '新会话',
+  '新建会话'
+]
+
 export const REVIEW_COMMAND_ALIASES = [
   'review',
   'code-review',
   'codereview',
   '审查',
   '代码审查'
+]
+
+export const RESEARCH_COMMAND_ALIASES = [
+  'research',
+  'deepresearch',
+  'deep-research',
+  'deep_research'
 ]
 
 export function getSlashQuery(input: string): string | null {
@@ -71,6 +86,14 @@ export function parseCompactCommand(input: string): CompactCommand | null {
     return reason ? { reason } : {}
   }
   return null
+}
+
+export function parseNewCommand(input: string): boolean {
+  const trimmed = input.trim()
+  if (!trimmed.startsWith('/')) return false
+  const body = trimmed.slice(1).trimStart()
+  const lowerBody = body.toLowerCase()
+  return NEW_COMMAND_ALIASES.some((alias) => lowerBody === alias.toLowerCase())
 }
 
 export function parseGoalCommand(input: string): GoalCommand | false {
@@ -118,6 +141,27 @@ export function parseReviewCommand(input: string): ReviewTarget | false {
     default:
       return { kind: 'custom', instructions: rest }
   }
+}
+
+export function parseResearchCommand(input: string): string | null | false {
+  const trimmed = input.trim()
+  if (!trimmed.startsWith('/')) return false
+  const body = trimmed.slice(1).trimStart()
+  const lowerBody = body.toLowerCase()
+  for (const alias of RESEARCH_COMMAND_ALIASES) {
+    const lowerAlias = alias.toLowerCase()
+    if (lowerBody === lowerAlias) return null
+    if (isSlashAliasMatch(lowerBody, lowerAlias)) {
+      const topic = body.slice(alias.length).trim()
+      return topic || null
+    }
+  }
+  return false
+}
+
+export function buildResearchPrompt(template: string, topic: string | null): string {
+  const normalizedTopic = topic?.trim()
+  return normalizedTopic ? template.replace('{{topic}}', normalizedTopic) : template
 }
 
 function isSlashAliasMatch(body: string, alias: string): boolean {

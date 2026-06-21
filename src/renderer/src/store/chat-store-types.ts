@@ -8,8 +8,11 @@ import type {
   ThreadGoalStatus,
   ThreadTodoList,
   ThreadTodoStatus,
+  ThreadUsageSnapshot,
+  UserFileReference,
   UserInputAnswer
 } from '../agent/types'
+import type { KunRuntimeStatusPayload } from '@shared/kun-gui-api'
 import type {
   ClawImAgentProfileV1,
   ClawImChannelV1,
@@ -18,7 +21,7 @@ import type {
   ClawImSettingsV1,
   ClawModel
 } from '@shared/app-settings'
-import type { ModelProviderModelGroup } from '@shared/ds-gui-api'
+import type { ModelProviderModelGroup } from '@shared/kun-gui-api'
 
 export type QueuedUserMessage = {
   id: string
@@ -26,10 +29,12 @@ export type QueuedUserMessage = {
   displayText?: string
   mode?: string
   model?: string
+  providerId?: string
   modelLabel?: string
   reasoningEffort?: string
   attachmentIds?: string[]
   attachments?: AttachmentReference[]
+  fileReferences?: UserFileReference[]
   /**
    * Optional GUI plan context forwarded to Kun. The renderer
    * attaches it for plan/refine turns so the runtime can advertise
@@ -63,17 +68,34 @@ export type GuiPlanMessageContext = {
 export type SendMessageOverrides = {
   queued?: QueuedUserMessage
   model?: string
+  providerId?: string
   modelLabel?: string
   reasoningEffort?: string
   displayText?: string
   guiPlan?: GuiPlanMessageContext
   attachmentIds?: string[]
   attachments?: AttachmentReference[]
+  fileReferences?: UserFileReference[]
 }
 
 export type InitialSetupMode = 'required' | 'preview'
-export type SettingsRouteSection = 'general' | 'write' | 'agents' | 'skill' | 'mcp' | 'claw'
-export type AppRoute = 'chat' | 'write' | 'settings' | 'plugins' | 'claw' | 'schedule'
+export type SettingsRouteSection =
+  | 'general'
+  | 'providers'
+  | 'write'
+  | 'imageGeneration'
+  | 'mediaGeneration'
+  | 'speechToText'
+  | 'agents'
+  | 'archives'
+  | 'permissions'
+  | 'skill'
+  | 'mcp'
+  | 'shortcuts'
+  | 'easterEgg'
+  | 'claw'
+  | 'updates'
+export type AppRoute = 'chat' | 'write' | 'settings' | 'plugins' | 'claw' | 'schedule' | 'workflow'
 export type PluginHostRoute = 'chat' | 'claw'
 
 /**
@@ -120,6 +142,7 @@ export type ChatState = {
   workspaceRoot: string
   workspaceLabel: string
   runtimeConnection: RuntimeConnectionStatus
+  runtimeStatus: KunRuntimeStatusPayload | null
   codeWorkspaceRoots: string[]
   threads: NormalizedThread[]
   threadSearch: string
@@ -132,6 +155,12 @@ export type ChatState = {
   liveAssistant: string
   lastSeq: number
   usageRefreshKey: number
+  /**
+   * Latest turn's usage snapshot, tagged with the thread it belongs to. Used by
+   * the context-capacity gauge: the last turn's prompt tokens ≈ what currently
+   * occupies the window. Null until a live turn reports usage.
+   */
+  lastTurnUsage: { threadId: string; snapshot: ThreadUsageSnapshot } | null
   busy: boolean
   error: string | null
   runtimeErrorDetail: string | null
@@ -143,8 +172,10 @@ export type ChatState = {
   turnReasoningLastAtByUserId: Record<string, number>
   inspectorSelectedId: string | null
   composerModel: string
+  composerProviderId: string
   composerPickList: string[]
   composerModelGroups: ModelProviderModelGroup[]
+  disabledSkillIds: string[]
   queuedMessages: QueuedUserMessage[]
   watchTurnCompletion: Record<string, boolean>
   unreadThreadIds: Record<string, boolean>
@@ -158,7 +189,7 @@ export type ChatState = {
   activeClawChannelId: string
   appendLocalClawTurn: (userText: string, replyText: string) => void
   setError: (message: string | null) => void
-  setComposerModel: (modelId: string) => void
+  setComposerModel: (modelId: string, providerId?: string) => void
   loadComposerModels: () => Promise<void>
   setRoute: (r: AppRoute) => void
   openWrite: () => Promise<void>
@@ -170,6 +201,7 @@ export type ChatState = {
   openPlugins: (host?: PluginHostRoute) => void
   openClaw: () => void
   openSchedule: () => void
+  openWorkflow: () => void
   refreshClawChannels: () => Promise<void>
   addClawChannel: (
     provider: ClawImProvider,
@@ -192,15 +224,29 @@ export type ChatState = {
   openInitialSetup: (mode?: InitialSetupMode) => void
   closeInitialSetup: () => void
   boot: () => Promise<void>
-  probeRuntime: (mode?: 'user' | 'background') => Promise<void>
+  probeRuntime: (mode?: 'user' | 'background', options?: { restart?: boolean }) => Promise<void>
   chooseWorkspace: (options?: { createThreadAfter?: boolean; selectThreadAfter?: boolean }) => Promise<string | null>
+  selectWorkspaceRoot: (workspaceRoot: string) => Promise<string | null>
   clearWorkspace: () => Promise<void>
   deleteWorkspace: (workspacePath: string) => Promise<void>
   refreshThreads: () => Promise<void>
   setThreadSearch: (query: string) => void
   setShowArchivedThreads: (show: boolean) => void
-  createThread: (options?: { workspaceRoot?: string; forceNew?: boolean }) => Promise<void>
+  createThread: (options?: {
+    workspaceRoot?: string
+    forceNew?: boolean
+    /** When true, checkout the selected branch into an isolated worktree. */
+    useWorktreePool?: boolean
+    worktreeBranch?: string
+  }) => Promise<void>
   selectThread: (id: string) => Promise<void>
+  /**
+   * 打开 SSE 订阅一条 thread(不预先拉 getThreadDetail)。
+   * 用于:onClawChannelActivity 自动切到 bot thread,让流式 deltas 立即可见。
+   * 与 selectThread 的区别:selectThread 先做 HTTP getThreadDetail 拉元数据,
+   * subscribeThreadEventsLive 直接开 SSE (sinceSeq=0),跳过 HTTP 抢在 SSE 之前。
+   */
+  subscribeThreadEventsLive: (threadId: string) => Promise<void>
   recoverActiveTurn: () => Promise<boolean>
   sendMessage: (text: string, mode?: string, overrides?: SendMessageOverrides) => Promise<boolean>
   reviewActiveThread: (target: ReviewTarget) => Promise<boolean>
@@ -213,6 +259,7 @@ export type ChatState = {
   archiveThread: (threadId: string, archived: boolean) => Promise<void>
   compactActiveThread: (reason?: string) => Promise<void>
   forkActiveThread: () => Promise<void>
+  forkThreadFromTurn: (turnId: string) => Promise<void>
   setActiveThreadGoal: (objective: string) => Promise<boolean>
   setActiveThreadGoalStatus: (status: ThreadGoalStatus) => Promise<boolean>
   clearActiveThreadGoal: () => Promise<boolean>

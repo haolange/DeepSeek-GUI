@@ -1,6 +1,6 @@
 # Kun
 
-Kun is the local HTTP/SSE agent runtime for DeepSeek-GUI. It exposes a
+Kun is the local HTTP/SSE agent runtime for the Kun desktop app. It exposes a
 TypeScript-typed agent loop with a stable, GUI-friendly contract:
 
 - `kun serve` starts a local HTTP server with `/v1/*` routes.
@@ -11,7 +11,7 @@ TypeScript-typed agent loop with a stable, GUI-friendly contract:
 
 The name Kun is inspired by the great fish in Zhuangzi's line,
 "In the northern sea there is a fish; its name is Kun." In
-DeepSeek-GUI, it means a deeper local runtime rather than a thin model
+this project, it means a deeper local runtime rather than a thin model
 UI: one agent loop that can carry project context, call tools
 reliably, resume sessions, and serve desktop chat, writing, phone
 connections, and scheduled tasks.
@@ -153,8 +153,8 @@ Shape:
     "insecure": false
   },
   "contextCompaction": {
-    "defaultSoftThreshold": 16000,
-    "defaultHardThreshold": 24000,
+    "defaultSoftThreshold": 96000,
+    "defaultHardThreshold": 108800,
     "summaryMode": "heuristic",
     "summaryTimeoutMs": 15000,
     "summaryMaxTokens": 1200,
@@ -262,6 +262,7 @@ Feature flags are intentionally explicit:
 - `serve.tokenEconomy` / `tokenEconomyMode` compresses tool descriptions, tool results, and history context while preserving code, paths, commands, URLs, errors, and other high-value signals.
 - `contextCompaction` controls fallback long-thread compaction thresholds and summary behavior. Per-model thresholds live in `models.profiles`. Compaction preserves goals, constraints, decisions, touched files, tool outcomes, and unresolved next steps.
 - `serve.runtimeTuning.toolStorm` suppresses repeated identical tool calls within a turn so useless tool loops do not keep spending tokens.
+- `runtime.streamIdleTimeoutMs` (top-level in `config.json`) caps the idle gap between streaming chunks before a turn fails with `stream_idle_timeout` (default `45000`). Raise it for local model servers that stay silent while prefilling a very large prompt; set `0` to disable the guard.
 - `capabilities.web` exposes `web_fetch` and/or `web_search`. The built-in provider can fetch HTTP(S) pages; search requires a provider implementation and may report unavailable.
 - `capabilities.skills` scans configured roots for `skill.json` manifests and, when `legacySkillMd` is true, older `SKILL.md` directories.
 - `capabilities.attachments` stores image bytes outside thread logs and allows turns to reference `attachmentIds`. Vision-capable models receive image parts; text-only models receive a bounded compressed base64 text fallback.
@@ -271,6 +272,69 @@ Feature flags are intentionally explicit:
 Use `GET /v1/runtime/info` for the runtime capability manifest and
 `GET /v1/runtime/tools` for redacted provider diagnostics. The GUI
 Settings page reads both routes.
+
+## Hooks
+
+Hooks let external commands observe and intervene in the agent
+lifecycle without rebuilding Kun. They are configured under the
+top-level `hooks` key in `config.json` (so the GUI's
+`~/.deepseekgui/kun/config.json` works out of the box) and run inside
+the serve runtime — main loop, subagents, and CLI alike.
+
+```json
+{
+  "hooks": [
+    {
+      "phase": "PreToolUse",
+      "matcher": "bash|write_file|mcp__*",
+      "command": "node ~/.kun-hooks/guard.js",
+      "timeoutMs": 10000
+    },
+    { "phase": "UserPromptSubmit", "command": "~/.kun-hooks/prompt-context.sh" },
+    { "phase": "TurnEnd", "command": "~/.kun-hooks/notify.sh" }
+  ]
+}
+```
+
+Phases:
+
+- `PreToolUse` — before every tool call. May rewrite `arguments`, deny
+  the call, or auto-approve it (skip the approval prompt).
+- `PostToolUse` — after every tool call. May replace `output` or mark
+  the result as an error.
+- `UserPromptSubmit` — before the first model step of a turn. May deny
+  the turn or inject `additionalContext`, which is persisted as an
+  extra `<hook-context>` user message.
+- `TurnStart`, `TurnEnd`, `PreCompact` — observe-only notifications.
+  Failures surface as `hook_warning` runtime events and never break
+  the turn.
+
+Matching: `matcher` is a glob over the tool name (`*` wildcard, `|`
+alternation); `toolNames` is an exact-name list. Either match runs the
+hook; omit both to run on every tool. Lifecycle phases ignore matchers.
+
+Command protocol: the hook receives the invocation as JSON on stdin
+(`phase` plus phase-specific fields such as `call`, `result`, `prompt`,
+`status`, `reason`). Exit `0` parses stdout as a JSON result
+(`{"decision":"deny"}`, `{"arguments":{...}}`, `{"output":...}`,
+`{"additionalContext":"..."}`); plain-text stdout becomes
+`additionalContext` for `UserPromptSubmit` and a message elsewhere.
+Exit `2` blocks the action with stderr as the reason. Any other exit
+code is a non-blocking `hook_warning`. The default timeout is 60s
+(`timeoutMs` overrides); a timed-out hook fails the tool call closed
+but never blocks observe-only phases.
+
+Hooks chain in declaration order: each hook sees the call or result as
+rewritten by the hooks before it. Embedders that assemble the runtime
+programmatically can also pass in-process function hooks via the
+`hooks` option of `LocalToolHost` and `AgentLoop` (exported from
+`kun/hooks`).
+
+Command hooks execute arbitrary shell commands with the runtime's
+privileges — treat `config.json` as trusted input.
+
+See `../docs/kun-hooks.en.md` for the full reference: per-phase stdin
+payloads, result fields, failure semantics, and example hook scripts.
 
 ## Data directory layout
 
@@ -413,7 +477,7 @@ stay local to one thread, leave it as a pinned constraint.
 
 ## GUI integration
 
-After the legacy provider retirement, the DeepSeek-GUI main process
+After the legacy provider retirement, the desktop app main process
 starts Kun through `kun-process.ts` and routes all
 `runtimeRequest` calls to the active base URL with a bearer token.
 The renderer uses the same `AgentProvider` interface as the legacy

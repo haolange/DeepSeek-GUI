@@ -19,10 +19,35 @@ import {
 
 export type CompactionMode = 'normal' | 'aggressive' | 'force'
 
+/**
+ * Provider `prompt_tokens` is trusted only while it stays within this multiple
+ * of our local estimate of the sent request. Beyond it the count is treated as
+ * a provider accounting artifact (e.g. MiniMax-M3 summing cumulative cache
+ * reads into prompt_tokens) and ignored in favour of the estimate. The factor
+ * is wide enough to absorb legitimate under-counting (image tool results,
+ * formatting/role tokens) while still catching the order-of-magnitude inflation
+ * that strands a thread at "100%".
+ */
+export const PROMPT_TOKEN_TRUST_FACTOR = 6
+
 export type CompactionPlan = {
   mode: CompactionMode
   keepRecent: number
   reason: string
+}
+
+export type CompactionTriggerOptions = {
+  model?: string
+  /** Provider-reported prompt token count for the last request, when known. */
+  promptTokens?: number
+  frozenMessageCount?: number
+  /**
+   * Estimated per-request overhead (system prompt + tool schemas + few-shot
+   * prefix) that is not part of the stored items. Added to the item estimate
+   * as a safety floor for the no-usage path. Ignored when a larger
+   * `promptTokens` is available.
+   */
+  overheadTokens?: number
 }
 
 /**
@@ -64,16 +89,32 @@ export class ContextCompactor {
     return this.estimator.estimateItems(items)
   }
 
-  shouldCompact(items: TurnItem[], options?: { model?: string; promptTokens?: number; frozenMessageCount?: number }): boolean {
+  shouldCompact(items: TurnItem[], options?: CompactionTriggerOptions): boolean {
     return this.planCompaction(items, options) !== null
   }
 
-  planCompaction(items: TurnItem[], options?: { model?: string; promptTokens?: number; frozenMessageCount?: number }): CompactionPlan | null {
+  planCompaction(items: TurnItem[], options?: CompactionTriggerOptions): CompactionPlan | null {
     const thresholds = this.thresholds(options?.model)
     const frozenMessageCount = normalizeFrozenMessageCount(options?.frozenMessageCount, items.length)
     const compactableItems = frozenMessageCount > 0 ? items.slice(frozenMessageCount) : items
-    const estimatedTokens = this.estimate(compactableItems)
-    const promptTokens = typeof options?.promptTokens === 'number' ? options.promptTokens : undefined
+    // `overheadTokens` accounts for the system prompt and tool schemas that
+    // are sent every turn but live outside the stored items. Without it the
+    // estimate-only path (used when no provider usage count is available,
+    // e.g. the first turn after a restart) systematically under-counts and
+    // skips compaction. It is a floor on the estimate; the real
+    // `promptTokens` still wins via the Math.max below when present.
+    const overheadTokens = Math.max(0, Math.floor(options?.overheadTokens ?? 0))
+    const estimatedTokens = this.estimate(compactableItems) + overheadTokens
+    const reportedPromptTokens = typeof options?.promptTokens === 'number' ? options.promptTokens : undefined
+    // Some providers over-report prompt_tokens by folding cumulative cache
+    // reads into the per-request count. MiniMax-M3 was observed reporting up to
+    // ~25x the real prompt size (prompt_cache_hit_tokens alone exceeded the
+    // entire stored conversation, which is physically impossible). Trusting that
+    // number pins the gauge at 100% and makes compaction fire pointlessly on a
+    // context that is actually tiny. A request cannot really exceed our own
+    // estimate of what we sent by a wide margin, so when the reported count
+    // blows past it we distrust the provider and fall back to the estimate.
+    const promptTokens = trustworthyPromptTokens(reportedPromptTokens, estimatedTokens, options?.model)
     const tokens = Math.max(estimatedTokens, promptTokens ?? 0)
     if (tokens < thresholds.softThreshold) return null
     const aggressiveThreshold = aggressiveCompactionThreshold(thresholds)
@@ -108,7 +149,10 @@ export class ContextCompactor {
     mode?: CompactionMode
     reason?: string
     summaryOverride?: string
+    summaryItemId?: string
     frozenMessageCount?: number
+    /** `false` marks a user-requested (`/compact`) compaction; omit for auto. */
+    auto?: boolean
   }): {
     next: TurnItem[]
     summaryItem: TurnItem
@@ -132,13 +176,17 @@ export class ContextCompactor {
           threadId: input.threadId,
           summary: 'no compaction needed',
           replacedTokens: 0,
-          pinnedConstraints: input.prefix.pinnedConstraints
+          pinnedConstraints: input.prefix.pinnedConstraints,
+          auto: input.auto
         }),
         replacedTokens: 0
       }
     }
-    const head = keepRecent === 0 ? history : history.slice(0, history.length - keepRecent)
-    const tail = keepRecent === 0 ? [] : history.slice(-keepRecent)
+    const tailStart = keepRecent === 0
+      ? history.length
+      : repairTailStartForToolResults(history, history.length - keepRecent)
+    const head = history.slice(0, tailStart)
+    const tail = history.slice(tailStart)
     const replacedTokens = this.estimator.estimateItems(head)
     const sourceDigest = computeShortHash(compactedItemsDigestSource(head))
     const digestMarker = createToolDigestMarker(sourceDigest)
@@ -153,12 +201,13 @@ export class ContextCompactor {
     })
     const summary = appendDigestMarker(summaryBase, digestMarker)
     const summaryItem = makeCompactionItem({
-      id: `compaction_${input.turnId}_${Date.now()}`,
+      id: input.summaryItemId ?? `compaction_${input.turnId}_${Date.now()}`,
       turnId: input.turnId,
       threadId: input.threadId,
       summary,
       replacedTokens,
       pinnedConstraints: input.prefix.pinnedConstraints,
+      auto: input.auto,
       sourceDigest,
       digestMarker,
       sourceItemIds: head.map((item) => item.id)
@@ -189,9 +238,61 @@ export function trimTrailingToolCalls(history: TurnItem[]): TurnItem[] {
   return end === history.length ? history : history.slice(0, end)
 }
 
+function repairTailStartForToolResults(history: TurnItem[], start: number): number {
+  const tailStart = Math.max(0, Math.min(history.length, start))
+  const tail = history.slice(tailStart)
+  if (!hasOrphanToolResult(tail)) return tailStart
+  for (let index = tailStart - 1; index >= 0; index -= 1) {
+    if (history[index].kind === 'user_message') return index > 0 ? index : tailStart
+  }
+  return tailStart
+}
+
+function hasOrphanToolResult(items: TurnItem[]): boolean {
+  const callIds = new Set<string>()
+  for (const item of items) {
+    if (item.kind === 'tool_call') callIds.add(item.callId)
+  }
+  return items.some((item) => item.kind === 'tool_result' && !callIds.has(item.callId))
+}
+
 function aggressiveCompactionThreshold(thresholds: ModelContextThresholds): number {
   const span = Math.max(0, thresholds.hardThreshold - thresholds.softThreshold)
   return thresholds.softThreshold + Math.floor(span * 0.6)
+}
+
+const inflationWarnedAt = new Map<string, number>()
+const INFLATION_WARN_INTERVAL_MS = 60_000
+
+/**
+ * Returns the provider `prompt_tokens` when it is consistent with our local
+ * estimate, or `undefined` when it exceeds it by more than
+ * `PROMPT_TOKEN_TRUST_FACTOR` (treated as a provider accounting artifact and
+ * dropped so the estimate drives the decision instead).
+ */
+function trustworthyPromptTokens(
+  reported: number | undefined,
+  estimate: number,
+  model?: string
+): number | undefined {
+  if (reported === undefined) return undefined
+  if (estimate > 0 && reported > estimate * PROMPT_TOKEN_TRUST_FACTOR) {
+    warnInflatedPromptTokens(reported, estimate, model)
+    return undefined
+  }
+  return reported
+}
+
+function warnInflatedPromptTokens(reported: number, estimate: number, model?: string): void {
+  const key = model || 'unknown'
+  const now = Date.now()
+  if (now - (inflationWarnedAt.get(key) ?? 0) < INFLATION_WARN_INTERVAL_MS) return
+  inflationWarnedAt.set(key, now)
+  console.warn(
+    `[kun] ignoring inflated prompt_tokens for model "${key}": reported ${reported} vs local estimate ${estimate} ` +
+      `(>${PROMPT_TOKEN_TRUST_FACTOR}x). Falling back to the estimate for context/compaction; the provider is likely ` +
+      `summing cumulative cache reads into prompt_tokens.`
+  )
 }
 
 function normalizeFrozenMessageCount(value: number | undefined, historyLength: number): number {

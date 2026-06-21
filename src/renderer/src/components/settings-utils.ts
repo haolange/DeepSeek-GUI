@@ -1,18 +1,24 @@
 import {
+  DEFAULT_LOG_RETENTION_DAYS,
   DEFAULT_GUI_UPDATE_CHANNEL,
   defaultKunRuntimeSettings,
   applyKunRuntimePatch,
   getKunRuntimeSettings,
   kunSettingsEnvelope,
   mergeKunRuntimeSettings,
+  mergeAppBehaviorSettings,
   mergeClawSettings,
   mergeModelProviderSettings,
   mergeScheduleSettings,
+  mergeWorkflowSettings,
   mergeWriteSettings,
+  normalizeAppBehaviorSettings,
   normalizeClawSettings,
   normalizeGuiUpdateChannel,
+  normalizeKeyboardShortcuts,
   normalizeModelProviderSettings,
   normalizeScheduleSettings,
+  normalizeWorkflowSettings,
   normalizeWriteSettings,
   type AppSettingsPatch,
   type AppSettingsV1
@@ -22,7 +28,7 @@ import type { GuiUpdateInfo } from '@shared/gui-update'
 type RendererSettingsShape = AppSettingsPatch
 type SettingsPatch = AppSettingsPatch
 
-export const DEFAULT_WORKSPACE_ROOT = '~/.deepseekgui/default_workspace'
+export const DEFAULT_WORKSPACE_ROOT = '~/.kun/default_workspace'
 
 export function splitSettingsList(raw: string): string[] {
   return raw
@@ -55,9 +61,17 @@ export function mergeSettings(current: AppSettingsV1, patch: SettingsPatch): App
       ...safeCurrent.notifications,
       ...(patch.notifications ?? {})
     },
+    appBehavior: mergeAppBehaviorSettings(safeCurrent.appBehavior, patch.appBehavior),
+    keyboardShortcuts: normalizeKeyboardShortcuts({
+      bindings: {
+        ...safeCurrent.keyboardShortcuts.bindings,
+        ...(patch.keyboardShortcuts?.bindings ?? {})
+      }
+    }),
     write: mergeWriteSettings(safeCurrent.write, patch.write),
     claw: mergeClawSettings(safeCurrent.claw, patch.claw),
     schedule: mergeScheduleSettings(safeCurrent.schedule, patch.schedule),
+    workflow: mergeWorkflowSettings(safeCurrent.workflow, patch.workflow),
     guiUpdate: {
       ...safeCurrent.guiUpdate,
       ...(patch.guiUpdate ?? {})
@@ -80,23 +94,39 @@ export function coerceRendererSettings(settings: AppSettingsV1): AppSettingsV1 {
     locale: raw.locale === 'zh' ? 'zh' : 'en',
     theme,
     uiFontScale,
+    cursorSpotlight: raw.cursorSpotlight !== false,
     provider: normalizeModelProviderSettings(raw.provider),
     agents: kunSettingsEnvelope(mergeKunRuntimeSettings(defaultKunRuntimeSettings(), getKunRuntimeSettings(settings))),
     workspaceRoot: typeof raw.workspaceRoot === 'string' ? raw.workspaceRoot : DEFAULT_WORKSPACE_ROOT,
     log: {
       enabled: raw.log?.enabled !== false,
-      retentionDays: typeof raw.log?.retentionDays === 'number' ? raw.log.retentionDays : 2
+      retentionDays: typeof raw.log?.retentionDays === 'number'
+        ? raw.log.retentionDays
+        : DEFAULT_LOG_RETENTION_DAYS
     },
     notifications: {
       turnComplete: raw.notifications?.turnComplete !== false
     },
+    appBehavior: normalizeAppBehaviorSettings(raw.appBehavior),
+    keyboardShortcuts: normalizeKeyboardShortcuts(raw.keyboardShortcuts),
     write: normalizeWriteSettings(raw.write),
     claw: normalizeClawSettings(raw.claw),
     schedule: normalizeScheduleSettings(raw.schedule),
+    workflow: normalizeWorkflowSettings(raw.workflow),
     guiUpdate: {
       channel: normalizeGuiUpdateChannel(raw.guiUpdate?.channel ?? DEFAULT_GUI_UPDATE_CHANNEL)
-    }
+    },
+    codePromptPrefix: typeof raw.codePromptPrefix === 'string' ? raw.codePromptPrefix : '',
+    disabledSkillIds: normalizeDisabledSkillIds(raw.disabledSkillIds)
   }
+}
+
+function normalizeDisabledSkillIds(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return [...new Set(value
+    .filter((id): id is string => typeof id === 'string')
+    .map((id) => id.trim().replace(/^\/?skill:/i, '').trim())
+    .filter(Boolean))]
 }
 
 export function guiUpdateFailureMessage(

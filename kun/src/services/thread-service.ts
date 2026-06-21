@@ -25,6 +25,7 @@ import { createThreadRecord, toThreadSummary, touchThread } from '../domain/thre
 import type { AgentSession } from '../domain/session.js'
 import { repairModelHistoryItems } from '../domain/model-history-repair.js'
 import type { RuntimeEventRecorder } from './runtime-event-recorder.js'
+import { withFileMutationQueue } from '../adapters/tool/file-mutation-queue.js'
 import { DEFAULT_KUN_MODEL } from '../config/kun-config.js'
 import { isGuiPlanRelativePath } from '../shared/gui-plan.js'
 import {
@@ -49,6 +50,7 @@ export type ListThreadsOptions = ThreadStoreListOptions
 export type ForkThreadOptions = {
   relation?: ThreadRelation
   title?: string
+  turnId?: string
 }
 
 export type ResumeSessionOptions = {
@@ -119,6 +121,7 @@ export class ThreadService {
       title: options.title ?? (request.title?.trim() || 'New chat'),
       workspace: request.workspace,
       model: request.model,
+      ...(request.providerId?.trim() ? { providerId: request.providerId.trim() } : {}),
       mode: request.mode,
       approvalPolicy: request.approvalPolicy,
       sandboxMode: request.sandboxMode,
@@ -136,6 +139,7 @@ export class ThreadService {
 
   async update(threadId: string, patch: {
     title?: string
+    workspace?: string
     status?: ThreadStatus
     approvalPolicy?: ApprovalPolicy
     sandboxMode?: SandboxMode
@@ -336,18 +340,20 @@ export class ThreadService {
 
     for (const [relativePath, items] of byRelativePath) {
       const absolutePath = resolveWorkspaceRelativePath(current.workspace, relativePath)
-      let markdown = await readFile(absolutePath, 'utf-8')
-      let changed = false
-      for (const item of items) {
-        const patched = patchPlanTodoStatus(markdown, {
-          content: item.content,
-          status: item.status,
-          source: item.source
-        })
-        markdown = patched.markdown
-        changed ||= patched.changed
-      }
-      if (changed) await writeFile(absolutePath, markdown, 'utf-8')
+      await withFileMutationQueue(absolutePath, async () => {
+        let markdown = await readFile(absolutePath, 'utf-8')
+        let changed = false
+        for (const item of items) {
+          const patched = patchPlanTodoStatus(markdown, {
+            content: item.content,
+            status: item.status,
+            source: item.source
+          })
+          markdown = patched.markdown
+          changed ||= patched.changed
+        }
+        if (changed) await writeFile(absolutePath, markdown, 'utf-8')
+      })
     }
   }
 
@@ -363,13 +369,24 @@ export class ThreadService {
     const now = this.nowIso()
     const forkId = this.ids.next('thr')
     const relation: ThreadRelation = options.relation ?? 'fork'
+    const targetTurnId = options.turnId?.trim()
+    const targetTurnIndex = targetTurnId
+      ? current.turns.findIndex((turn) => turn.id === targetTurnId)
+      : -1
+    if (targetTurnId && targetTurnIndex < 0) {
+      throw new Error(`turn not found: ${targetTurnId}`)
+    }
+    const sourceTurns = targetTurnId
+      ? current.turns.slice(0, targetTurnIndex + 1)
+      : current.turns
     // Snapshot semantics: clone each turn as it stands now. The parent
     // loop keeps mutating its own record; we copy, never borrow.
-    const clonedTurns = current.turns.map((turn) =>
+    const clonedTurns = sourceTurns.map((turn) =>
       cloneTurnForFork(turn, forkId, now, { relation })
     )
     const clonedItems = clonedTurns.flatMap((turn) => turn.items)
     const defaultTitle = relation === 'side' ? `${current.title} · side` : `${current.title} fork`
+    const forkIncludesLatestTurn = !targetTurnId || clonedTurns.length === current.turns.length
     const fork = createThreadRecord({
       id: forkId,
       title: options.title?.trim() || defaultTitle,
@@ -386,7 +403,7 @@ export class ThreadService {
       forkedAt: now,
       forkedFromMessageCount: clonedItems.filter((item) => item.kind === 'user_message').length,
       forkedFromTurnCount: clonedTurns.length,
-      ...(current.todos ? { todos: cloneTodoListForThread(current.todos, forkId, now) } : {}),
+      ...(forkIncludesLatestTurn && current.todos ? { todos: cloneTodoListForThread(current.todos, forkId, now) } : {}),
       createdAt: now
     })
     const record: ThreadRecord = {

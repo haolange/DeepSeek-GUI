@@ -1,22 +1,29 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
+import { atomicWriteFile } from '../../kun/src/adapters/file/atomic-write.js'
 import {
   applyKunRuntimePatch,
   kunSettingsEnvelope,
   DEFAULT_GUI_UPDATE_CHANNEL,
+  DEFAULT_LOG_RETENTION_DAYS,
   DEFAULT_WRITE_WORKSPACE_ROOT,
   defaultClawSettings,
   defaultKunRuntimeSettings,
   defaultModelProviderSettings,
   defaultScheduleSettings,
+  defaultWorkflowSettings,
   getKunRuntimeSettings,
   mergeKunRuntimeSettings,
   mergeModelProviderSettings,
   defaultWriteSettings,
   mergeClawSettings,
+  mergeAppBehaviorSettings,
   mergeScheduleSettings,
+  mergeWorkflowSettings,
   mergeWriteSettings,
+  normalizeAppBehaviorSettings,
+  normalizeKeyboardShortcuts,
   migrateLegacyAppSettings,
   normalizeAppSettings,
   type AppSettingsPatch,
@@ -27,9 +34,21 @@ import {
 
 export type { AppSettingsV1 }
 
-const DEFAULT_WORKSPACE_ROOT = join(homedir(), '.deepseekgui', 'default_workspace')
-const DEFAULT_CLAW_CHANNELS_ROOT = join(homedir(), '.deepseekgui', 'claw')
+// 数据默认根目录从 ~/.deepseekgui 升级为 ~/.kun。老安装的既有目录由
+// legacy-data-migration.ts 在启动期搬迁并留兼容链接;settings 里存的旧
+// 绝对路径也在那里按迁移结果重写,这里只负责“新值”。
+const DEFAULT_WORKSPACE_ROOT = join(homedir(), '.kun', 'default_workspace')
+const DEFAULT_CLAW_CHANNELS_ROOT = join(homedir(), '.kun', 'claw')
 const DEFAULT_WRITE_WORKSPACE_ROOT_ABSOLUTE = expandHomePath(DEFAULT_WRITE_WORKSPACE_ROOT)
+const SETTINGS_FILE_NAME = 'kun-settings.json'
+// 旧版设置文件名。userData 整目录迁移后旧文件会原样留在新目录里,
+// 首次加载从它兜底读取,load() 随后把规范化结果另存为新文件名;旧
+// 文件保留不动,用户回滚老版本时还能读到可用配置。
+const LEGACY_SETTINGS_FILE_NAME = 'deepseek-gui-settings.json'
+// 旧版 userData 目录名(更早版本还没有 app.setName 时用过小写包名)。
+// 正常情况下迁移模块已把它们 rename 走,这里是迁移失败/被跳过时的
+// 跨目录兜底。
+const COMPATIBLE_USER_DATA_DIR_NAMES = ['deepseek-gui', 'DeepSeek GUI'] as const
 const WELCOME_MARKDOWN = `# Welcome to Write
 
 This is your default writing workspace.
@@ -119,10 +138,10 @@ function normalizeStoredSettings(settings: AppSettingsV1): AppSettingsV1 {
     ...normalized,
     workspaceRoot: normalizeWorkspaceRoot(normalized.workspaceRoot),
     write: {
+      ...normalized.write,
       defaultWorkspaceRoot: writeDefaultRoot,
       activeWorkspaceRoot: writeWorkspaces.includes(writeActiveRoot) ? writeActiveRoot : writeDefaultRoot,
-      workspaces: writeWorkspaces.length > 0 ? writeWorkspaces : [writeDefaultRoot],
-      inlineCompletion: normalized.write.inlineCompletion
+      workspaces: writeWorkspaces.length > 0 ? writeWorkspaces : [writeDefaultRoot]
     },
     claw: {
       ...normalized.claw,
@@ -180,6 +199,7 @@ const defaultSettings = (): AppSettingsV1 => ({
   locale: 'en',
   theme: 'system',
   uiFontScale: 'small',
+  cursorSpotlight: true,
   provider: defaultModelProviderSettings(),
   agents: {
     kun: defaultKunRuntimeSettings()
@@ -187,17 +207,22 @@ const defaultSettings = (): AppSettingsV1 => ({
   workspaceRoot: DEFAULT_WORKSPACE_ROOT,
   log: {
     enabled: true,
-    retentionDays: 2
+    retentionDays: DEFAULT_LOG_RETENTION_DAYS
   },
   notifications: {
     turnComplete: true
   },
+  appBehavior: normalizeAppBehaviorSettings(),
+  keyboardShortcuts: normalizeKeyboardShortcuts(),
   guiUpdate: {
     channel: DEFAULT_GUI_UPDATE_CHANNEL
   },
+  codePromptPrefix: '',
+  disabledSkillIds: [],
   write: defaultWriteSettings(),
   claw: defaultClawSettings(),
-  schedule: defaultScheduleSettings()
+  schedule: defaultScheduleSettings(),
+  workflow: defaultWorkflowSettings()
 })
 
 function buildMergedSettings(parsed: Partial<AppSettingsV1>): AppSettingsV1 {
@@ -212,15 +237,32 @@ function buildMergedSettings(parsed: Partial<AppSettingsV1>): AppSettingsV1 {
     ),
     log: { ...defaults.log, ...migrated.log },
     notifications: { ...defaults.notifications, ...migrated.notifications },
+    appBehavior: mergeAppBehaviorSettings(defaults.appBehavior, migrated.appBehavior),
+    keyboardShortcuts: normalizeKeyboardShortcuts(migrated.keyboardShortcuts),
     write: mergeWriteSettings(defaults.write, migrated.write),
     claw: mergeClawSettings(defaults.claw, migrated.claw),
     schedule: mergeScheduleSettings(defaults.schedule, migrated.schedule),
-    guiUpdate: { ...defaults.guiUpdate, ...migrated.guiUpdate }
+    workflow: mergeWorkflowSettings(defaults.workflow, migrated.workflow),
+    guiUpdate: { ...defaults.guiUpdate, ...migrated.guiUpdate },
+    codePromptPrefix: typeof migrated.codePromptPrefix === 'string' ? migrated.codePromptPrefix : '',
+    disabledSkillIds: normalizeDisabledSkillIds(migrated.disabledSkillIds)
   }
+}
+
+function normalizeDisabledSkillIds(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return [...new Set(value
+    .filter((id): id is string => typeof id === 'string')
+    .map((id) => id.trim().replace(/^\/?skill:/i, '').trim())
+    .filter(Boolean))]
 }
 
 function isErrnoException(error: unknown): error is NodeJS.ErrnoException {
   return typeof error === 'object' && error !== null
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 async function loadDefaultSettings(): Promise<AppSettingsV1> {
@@ -245,57 +287,118 @@ async function writeInvalidSettingsBackup(path: string, raw: string): Promise<st
   }
 }
 
+async function replaceInvalidSettingsWithDefaults(
+  store: JsonSettingsStore,
+  sourcePath: string,
+  raw: string,
+  reason: string
+): Promise<AppSettingsV1> {
+  const backupPath = await writeInvalidSettingsBackup(sourcePath, raw)
+  const defaults = await loadDefaultSettings()
+  await store.save(defaults)
+  if (backupPath) {
+    console.warn(
+      `[kun-gui] Invalid settings were replaced with defaults (${reason}). Backup: ${backupPath}`
+    )
+  } else {
+    console.warn(
+      `[kun-gui] Invalid settings were replaced with defaults (${reason}). Backup could not be written for ${sourcePath}.`
+    )
+  }
+  return defaults
+}
+
+function compatibleSettingsPaths(currentPath: string): string[] {
+  const currentUserDataDir = dirname(currentPath)
+  const currentDirName = basename(currentUserDataDir)
+  const parentDir = dirname(currentUserDataDir)
+  // 顺序:当前目录里的旧文件名(userData 迁移后的常见形态)优先,
+  // 然后才是旧目录里的新旧文件名。
+  const candidates = [join(currentUserDataDir, LEGACY_SETTINGS_FILE_NAME)]
+  for (const dirName of COMPATIBLE_USER_DATA_DIR_NAMES) {
+    if (dirName === currentDirName) continue
+    candidates.push(join(parentDir, dirName, SETTINGS_FILE_NAME))
+    candidates.push(join(parentDir, dirName, LEGACY_SETTINGS_FILE_NAME))
+  }
+  return candidates
+}
+
+async function readSettingsFileWithCompatibility(
+  currentPath: string
+): Promise<{ raw: string, sourcePath: string } | null> {
+  try {
+    return {
+      raw: await readFile(currentPath, 'utf8'),
+      sourcePath: currentPath
+    }
+  } catch (error) {
+    if (!isErrnoException(error) || error.code !== 'ENOENT') throw error
+  }
+
+  for (const candidatePath of compatibleSettingsPaths(currentPath)) {
+    try {
+      return {
+        raw: await readFile(candidatePath, 'utf8'),
+        sourcePath: candidatePath
+      }
+    } catch (error) {
+      if (isErrnoException(error) && error.code === 'ENOENT') continue
+      throw error
+    }
+  }
+
+  return null
+}
+
 export class JsonSettingsStore {
   private path: string
   private cache: AppSettingsV1 | null = null
 
   constructor(userDataPath: string) {
-    this.path = join(userDataPath, 'deepseek-gui-settings.json')
+    this.path = join(userDataPath, SETTINGS_FILE_NAME)
   }
 
   async load(): Promise<AppSettingsV1> {
     if (this.cache) return this.cache
 
     let raw = ''
+    let sourcePath = this.path
     try {
-      raw = await readFile(this.path, 'utf8')
-    } catch (error) {
-      if (isErrnoException(error) && error.code === 'ENOENT') {
+      const loaded = await readSettingsFileWithCompatibility(this.path)
+      if (!loaded) {
         this.cache = await loadDefaultSettings()
         return this.cache
       }
+      raw = loaded.raw
+      sourcePath = loaded.sourcePath
+    } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      throw new Error(`Failed to read settings file ${this.path}: ${message}`, { cause: error })
+      throw new Error(`Failed to read settings file ${sourcePath}: ${message}`, { cause: error })
     }
 
-    let parsed: Partial<AppSettingsV1>
+    let parsed: unknown
     try {
-      parsed = JSON.parse(raw) as Partial<AppSettingsV1>
+      parsed = JSON.parse(raw)
     } catch (error) {
       if (error instanceof SyntaxError) {
-        const backupPath = await writeInvalidSettingsBackup(this.path, raw)
-        const defaults = await loadDefaultSettings()
-        await this.save(defaults)
-        if (backupPath) {
-          console.warn(
-            `[deepseek-gui] Invalid settings JSON was replaced with defaults. Backup: ${backupPath}`
-          )
-        } else {
-          console.warn(
-            `[deepseek-gui] Invalid settings JSON was replaced with defaults. Backup could not be written for ${this.path}.`
-          )
-        }
-        return defaults
+        return replaceInvalidSettingsWithDefaults(this, sourcePath, raw, 'invalid JSON')
       }
       const message = error instanceof Error ? error.message : String(error)
-      throw new Error(`Failed to parse settings file ${this.path}: ${message}`, { cause: error })
+      throw new Error(`Failed to parse settings file ${sourcePath}: ${message}`, { cause: error })
     }
 
-    const normalized = normalizeStoredSettings(buildMergedSettings(parsed))
+    if (!isRecord(parsed)) {
+      return replaceInvalidSettingsWithDefaults(this, sourcePath, raw, 'top-level value is not an object')
+    }
+
+    const normalized = normalizeStoredSettings(buildMergedSettings(parsed as Partial<AppSettingsV1>))
     await ensureWorkspaceRootExists(normalized.workspaceRoot)
     await ensureWriteWorkspaceRootsExist(normalized)
     await ensureClawChannelWorkspaceRootsExist(normalized)
     this.cache = normalized
+    if (sourcePath !== this.path) {
+      await this.save(normalized)
+    }
     return this.cache
   }
 
@@ -306,7 +409,7 @@ export class JsonSettingsStore {
     await ensureClawChannelWorkspaceRootsExist(normalized)
     this.cache = normalized
     await mkdir(dirname(this.path), { recursive: true })
-    await writeFile(this.path, serializeSettingsForDisk(normalized), 'utf8')
+    await atomicWriteFile(this.path, serializeSettingsForDisk(normalized))
   }
 
   async patch(partial: AppSettingsPatch): Promise<AppSettingsV1> {
@@ -318,9 +421,17 @@ export class JsonSettingsStore {
       provider: mergeModelProviderSettings(cur.provider, providerPatch),
       log: { ...cur.log, ...(partial.log ?? {}) },
       notifications: { ...cur.notifications, ...(partial.notifications ?? {}) },
+      appBehavior: mergeAppBehaviorSettings(cur.appBehavior, partial.appBehavior),
+      keyboardShortcuts: normalizeKeyboardShortcuts({
+        bindings: {
+          ...cur.keyboardShortcuts.bindings,
+          ...(partial.keyboardShortcuts?.bindings ?? {})
+        }
+      }),
       write: mergeWriteSettings(cur.write, partial.write),
       claw: mergeClawSettings(cur.claw, partial.claw),
       schedule: mergeScheduleSettings(cur.schedule, partial.schedule),
+      workflow: mergeWorkflowSettings(cur.workflow, partial.workflow),
       guiUpdate: { ...cur.guiUpdate, ...(partial.guiUpdate ?? {}) }
     })
     await this.save(next)

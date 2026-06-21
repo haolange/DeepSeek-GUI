@@ -24,7 +24,9 @@ import type {
   ClawImProvider,
   ClawRunMode
 } from '@shared/app-settings'
-import type { ClawImInstallQrResult } from '@shared/ds-gui-api'
+import type { ClawImInstallQrResult } from '@shared/kun-gui-api'
+import { confirmDialog } from '../../lib/confirm-dialog'
+import { clawModelSelectOptions, mergeClawModelOptions } from '../../lib/claw-model-options'
 import {
   ClawProviderLogo,
   clawProviderDisplayLabel
@@ -130,6 +132,7 @@ export function ClawAddImDialog({
   const [advancedSettingsOpen, setAdvancedSettingsOpen] = useState(false)
   const [officialInstallTarget, setOfficialInstallTarget] = useState<ClawInstallTarget>('feishu')
   const [channelModel, setChannelModel] = useState<string>('auto')
+  const [configuredModelOptions, setConfiguredModelOptions] = useState<string[]>(['auto'])
   const [channelWorkspaceRoot, setChannelWorkspaceRoot] = useState('')
   const [channelEnabled, setChannelEnabled] = useState(true)
   const [showSecret, setShowSecret] = useState(false)
@@ -222,9 +225,9 @@ export function ClawAddImDialog({
 
   useEffect(() => {
     let cancelled = false
-    if (typeof window.dsGui?.getSettings !== 'function') return
+    if (typeof window.kunGui?.getSettings !== 'function') return
     setLoadingConfig(true)
-    void window.dsGui
+    void window.kunGui
       .getSettings()
       .then((settings) => {
         if (cancelled) return
@@ -238,6 +241,7 @@ export function ClawAddImDialog({
         setSecret(settings.claw.im.secret.trim())
         setResponseTimeoutSec(Math.round(settings.claw.im.responseTimeoutMs / 1000))
         setRunMode(settings.claw.im.mode)
+        setConfiguredModelOptions(clawModelSelectOptions(settings))
       })
       .catch((e: unknown) => {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e))
@@ -269,9 +273,13 @@ export function ClawAddImDialog({
     ),
     [effectiveProvider, existingChannel?.id, officialInstallTarget, resolvedPlatformCredential]
   )
+  const channelModelOptions = useMemo(
+    () => mergeClawModelOptions(configuredModelOptions, channelModel),
+    [channelModel, configuredModelOptions]
+  )
   const bindingPayload = useMemo(() => {
     const payload: Record<string, unknown> = {
-      kind: 'deepseek-gui.claw-im',
+      kind: 'kun.claw-im',
       provider: effectiveProvider,
       endpoint,
       method: 'POST',
@@ -312,7 +320,7 @@ export function ClawAddImDialog({
 
   const startOfficialInstallQr = async (): Promise<void> => {
     if (!officialInstallProvider) return
-    if (typeof window.dsGui?.startClawImInstallQr !== 'function') {
+    if (typeof window.kunGui?.startClawImInstallQr !== 'function') {
       setInstallQr({
         status: 'error',
         url: '',
@@ -331,7 +339,7 @@ export function ClawAddImDialog({
     setInstallQr({ status: 'loading', url: '', deviceCode: '', userCode: '', timeLeft: 0, error: '' })
     let result: ClawImInstallQrResult
     try {
-      result = await window.dsGui.startClawImInstallQr(officialInstallProvider, {
+      result = await window.kunGui.startClawImInstallQr(officialInstallProvider, {
         isLark: officialInstallProvider === 'feishu' && officialInstallTarget === 'lark'
       })
     } catch (e) {
@@ -384,7 +392,7 @@ export function ClawAddImDialog({
     }, 1000)
     const waitForInstall = async (): Promise<void> => {
       try {
-        const poll = await window.dsGui.pollClawImInstall(officialInstallProvider, result.deviceCode)
+        const poll = await window.kunGui.pollClawImInstall(officialInstallProvider, result.deviceCode)
         if (installAttempt !== installAttemptRef.current) return
         if (poll.done) {
           clearInstallTimers()
@@ -536,7 +544,7 @@ export function ClawAddImDialog({
   const handleDeleteChannel = async (channel: ClawImChannelV1): Promise<void> => {
     if (busy || typeof onDeleteChannel !== 'function') return
     const confirmMessage = t('clawDeleteImConfirm', { name: channel.label })
-    if (!window.confirm(confirmMessage)) return
+    if (!(await confirmDialog(confirmMessage))) return
     setBusy(true)
     setError(null)
     try {
@@ -617,7 +625,7 @@ export function ClawAddImDialog({
   }
 
   const dialogViewContext = {
-    activeStep, activeStepConfig, activeStepIndex, advancedSettingsOpen, agentProfile, atLastStep, bindingPayload, busy, channelEnabled, channelModel, channelWorkspaceRoot, copied, copyBindingPayload, credentialStatusText,
+    activeStep, activeStepConfig, activeStepIndex, advancedSettingsOpen, agentProfile, atLastStep, bindingPayload, busy, channelEnabled, channelModel, channelModelOptions, channelWorkspaceRoot, copied, copyBindingPayload, credentialStatusText,
     defaultWorkspacePreview, effectiveProvider, editableChannels, endpoint, enterManageConfigure, error, existingChannel, goToPreviousStep, handleDeleteChannel, handlePrimaryAction,
     imEnabled, imPath, imPort, installQr, isManageSelection, loadingConfig, mode, navigationDisabled, noEditableChannel, officialInstallTarget, onClose, onDeleteChannel,
     primaryActionLabel, providerConfigured, providerListTitle, qrValue, requiresOfficialInstall, resolvedPlatformCredential, responseTimeoutSec, returnToManageSelection, runMode,

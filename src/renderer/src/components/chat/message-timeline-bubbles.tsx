@@ -1,16 +1,19 @@
 import type { ReactElement } from 'react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { useTranslation } from 'react-i18next'
-import { Check, ChevronDown, ChevronRight, Copy, FileEdit, ImageIcon, Loader2, MessageSquareQuote, PencilLine, Terminal, Wrench } from 'lucide-react'
-import type { AttachmentReference, ChatBlock, RuntimeDisclosureMetadata, ToolBlock, UserInputAnswer, UserInputQuestion } from '../../agent/types'
+import { Check, ChevronDown, ChevronRight, Copy, Download, File, FileEdit, GitFork, ImageIcon, Loader2, MessageSquareQuote, PencilLine, Terminal, Video, Wrench } from 'lucide-react'
+import type { AttachmentReference, ChatBlock, GeneratedFileReference, RuntimeDisclosureMetadata, ToolBlock, UserFileReference, UserInputAnswer, UserInputQuestion } from '../../agent/types'
+import { extractUnifiedDiffText } from '../../lib/diff-stats'
 import { useChatStore } from '../../store/chat-store'
 import { getProvider } from '../../agent/registry'
 import { parseWritePromptForDisplay } from '../../write/quoted-selection'
 import { parseClawUserPromptForDisplay, type ClawUserPromptDisplay } from '@shared/app-settings'
+import { openWorkspacePathInEditor } from '../../lib/open-workspace-path'
 import { DiffView } from '../DiffView'
 import { AssistantMarkdown } from './AssistantMarkdown'
+import { ImagePreviewLightbox } from './ImagePreviewLightbox'
 import { ModelMetaTag, WritePromptMetaDisclosure } from './message-timeline-cards'
 import { readNumber, formatDuration, formatToolTitle } from './message-timeline-tools'
 
@@ -50,7 +53,7 @@ function UserMessageBubble({
       ? block.meta.displayText.trim()
       : null
   const displayText = metaDisplayText ?? parsedWritePrompt?.userInput ?? parsedClawPrompt?.text ?? block.text
-  const canEdit = !metaDisplayText
+  const canEdit = route === 'chat' || !metaDisplayText
   const showClawInboundCard = route === 'claw' && parsedClawPrompt?.inbound === true
 
   useEffect(() => {
@@ -158,6 +161,7 @@ function UserMessageBubble({
               onToggle={() => setWriteMetaOpen((value) => !value)}
             />
           ) : null}
+          <UserFileReferenceChips meta={block.meta} />
           <RuntimeMetaChips meta={block.meta} align="right" hideAttachments />
         </div>
       )}
@@ -224,6 +228,7 @@ function ClawInboundMessageCard({
 }
 
 const USER_INPUT_OTHER_LABEL = 'Other'
+const USER_INPUT_FREEFORM_LABEL = 'Answer'
 
 function metaStringArray(meta: Record<string, unknown> | undefined, key: string): string[] {
   const value = meta?.[key]
@@ -247,6 +252,7 @@ function metaAttachmentReferences(meta: RuntimeDisclosureMetadata | undefined): 
       if (!id) return null
       const name = typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim() : undefined
       const mimeType = typeof raw.mimeType === 'string' && raw.mimeType.trim() ? raw.mimeType.trim() : undefined
+      const byteSize = typeof raw.byteSize === 'number' && Number.isFinite(raw.byteSize) ? raw.byteSize : undefined
       const previewUrl = typeof raw.previewUrl === 'string' && raw.previewUrl.trim() ? raw.previewUrl.trim() : undefined
       const width = typeof raw.width === 'number' && Number.isFinite(raw.width) ? raw.width : undefined
       const height = typeof raw.height === 'number' && Number.isFinite(raw.height) ? raw.height : undefined
@@ -254,6 +260,7 @@ function metaAttachmentReferences(meta: RuntimeDisclosureMetadata | undefined): 
         id,
         ...(name ? { name } : {}),
         ...(mimeType ? { mimeType } : {}),
+        ...(byteSize ? { byteSize } : {}),
         ...(width ? { width } : {}),
         ...(height ? { height } : {}),
         ...(previewUrl ? { previewUrl } : {})
@@ -262,13 +269,529 @@ function metaAttachmentReferences(meta: RuntimeDisclosureMetadata | undefined): 
     .filter((entry): entry is AttachmentReference => entry !== null)
 }
 
+function metaUserFileReferences(meta: RuntimeDisclosureMetadata | undefined): UserFileReference[] {
+  const value = meta?.fileReferences
+  if (!Array.isArray(value)) return []
+  return value
+    .map((entry): UserFileReference | null => {
+      if (!entry || typeof entry !== 'object') return null
+      const raw = entry as Record<string, unknown>
+      const path = typeof raw.path === 'string' && raw.path.trim() ? raw.path.trim() : ''
+      const relativePath =
+        typeof raw.relativePath === 'string' && raw.relativePath.trim() ? raw.relativePath.trim() : ''
+      const name = typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim() : ''
+      const kind = raw.kind === 'directory' ? 'directory' : 'file'
+      if (!path || !relativePath || !name) return null
+      return { path, relativePath, name, kind }
+    })
+    .filter((entry): entry is UserFileReference => entry !== null)
+}
+
+function UserFileReferenceChips({
+  meta
+}: {
+  meta?: RuntimeDisclosureMetadata
+}): ReactElement | null {
+  const { t } = useTranslation('common')
+  const references = useMemo(() => metaUserFileReferences(meta), [meta])
+  if (references.length === 0) return null
+
+  return (
+    <div className="mt-3 flex min-w-0 flex-col items-end gap-1.5 border-t border-white/10 pt-2">
+      <div className="text-[11px] font-medium text-ds-faint">
+        {t('messageFileReferences', { count: references.length })}
+      </div>
+      <div className="flex max-w-full flex-wrap justify-end gap-1.5">
+        {references.map((reference) => {
+          const isDirectory = reference.kind === 'directory'
+          const label = isDirectory
+            ? `${reference.relativePath.replace(/\/+$/g, '')}/`
+            : reference.relativePath
+          return (
+            <span
+              key={`${reference.kind ?? 'file'}:${reference.path}`}
+              title={reference.path}
+              className="inline-flex max-w-[260px] items-center gap-1.5 rounded-md border border-white/10 bg-white/8 px-2 py-1 text-[11.5px] font-medium text-ds-muted"
+            >
+              <File className="h-3.5 w-3.5 shrink-0" strokeWidth={1.8} />
+              <span className="truncate">{label}</span>
+            </span>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+type TimelineMediaReference = GeneratedFileReference & {
+  id?: string
+}
+
+function readMediaString(raw: Record<string, unknown>, ...keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = raw[key]
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+  return undefined
+}
+
+function normalizeGeneratedFileReference(entry: unknown): GeneratedFileReference | null {
+  if (!entry || typeof entry !== 'object') return null
+  const raw = entry as Record<string, unknown>
+  const id = readMediaString(raw, 'id', 'attachmentId')
+  const name = readMediaString(raw, 'name', 'fileName', 'filename')
+  const mimeType = readMediaString(raw, 'mimeType', 'type', 'mediaType')
+  const previewUrl = readMediaString(raw, 'previewUrl', 'dataUrl', 'url')
+  const path = readMediaString(raw, 'path', 'file')
+  const relativePath = readMediaString(raw, 'relativePath', 'relative_path')
+  const absolutePath = readMediaString(raw, 'absolutePath', 'absolute_path')
+  const byteSize = typeof raw.byteSize === 'number' && Number.isFinite(raw.byteSize) ? raw.byteSize : undefined
+  const width = typeof raw.width === 'number' && Number.isFinite(raw.width) ? raw.width : undefined
+  const height = typeof raw.height === 'number' && Number.isFinite(raw.height) ? raw.height : undefined
+  const normalized: GeneratedFileReference = {
+    ...(id ? { id } : {}),
+    ...(name ? { name } : {}),
+    ...(mimeType ? { mimeType } : {}),
+    ...(byteSize ? { byteSize } : {}),
+    ...(width ? { width } : {}),
+    ...(height ? { height } : {}),
+    ...(previewUrl ? { previewUrl } : {}),
+    ...(path ? { path } : {}),
+    ...(relativePath ? { relativePath } : {}),
+    ...(absolutePath ? { absolutePath } : {})
+  }
+  return Object.keys(normalized).length > 0 ? normalized : null
+}
+
+function metaGeneratedFileReferences(meta: Record<string, unknown> | undefined): GeneratedFileReference[] {
+  const value = meta?.generatedFiles
+  if (!Array.isArray(value)) return []
+  return value
+    .map((entry) => normalizeGeneratedFileReference(entry))
+    .filter((entry): entry is GeneratedFileReference => entry !== null)
+}
+
+function mediaKey(media: TimelineMediaReference): string {
+  return (
+    media.id ||
+    media.absolutePath ||
+    media.relativePath ||
+    media.path ||
+    media.previewUrl ||
+    media.name ||
+    'media'
+  )
+}
+
+function mediaName(media: TimelineMediaReference): string {
+  const path = media.relativePath || media.path || media.absolutePath || ''
+  const fromPath = path.split(/[\\/]/).filter(Boolean).at(-1)
+  return media.name || fromPath || media.id || 'file'
+}
+
+function mediaPath(media: TimelineMediaReference): string | undefined {
+  return media.relativePath || media.path || media.absolutePath
+}
+
+function mediaMime(media: TimelineMediaReference): string {
+  return media.mimeType?.toLowerCase() ?? ''
+}
+
+function mediaIsImage(media: TimelineMediaReference): boolean {
+  const mimeType = mediaMime(media)
+  if (mimeType.startsWith('image/')) return true
+  return /\.(?:png|jpe?g|webp|gif|bmp|svg)$/i.test(mediaName(media))
+}
+
+function mediaIsVideo(media: TimelineMediaReference): boolean {
+  const mimeType = mediaMime(media)
+  if (mimeType.startsWith('video/')) return true
+  return /\.(?:mp4|webm|mov|m4v|ogg)$/i.test(mediaName(media))
+}
+
+function formatByteSize(byteSize: number | undefined): string {
+  if (typeof byteSize !== 'number' || !Number.isFinite(byteSize) || byteSize <= 0) return ''
+  const units = ['B', 'KB', 'MB', 'GB']
+  let value = byteSize
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024
+    unit += 1
+  }
+  const digits = value >= 10 || unit === 0 ? 0 : 1
+  return `${value.toFixed(digits)} ${units[unit]}`
+}
+
+function dataUrlPayload(dataUrl: string | undefined): { dataBase64: string; mimeType?: string } | null {
+  if (!dataUrl?.startsWith('data:')) return null
+  const match = dataUrl.match(/^data:([^;,]+)?(?:;[^,]*)?;base64,(.*)$/)
+  if (!match?.[2]) return null
+  return {
+    dataBase64: match[2],
+    ...(match[1] ? { mimeType: match[1] } : {})
+  }
+}
+
+function mergeMediaReferences(
+  attachments: AttachmentReference[],
+  generatedFiles: GeneratedFileReference[]
+): TimelineMediaReference[] {
+  const media: TimelineMediaReference[] = []
+  const indexByKey = new Map<string, number>()
+  const indexByName = new Map<string, number>()
+
+  const add = (entry: TimelineMediaReference, allowNameMerge: boolean): void => {
+    const key = mediaKey(entry)
+    const normalizedName = mediaName(entry).toLowerCase()
+    const existingIndex = indexByKey.get(key) ?? (allowNameMerge ? indexByName.get(normalizedName) : undefined)
+    if (existingIndex !== undefined) {
+      media[existingIndex] = { ...media[existingIndex], ...entry }
+      indexByKey.set(mediaKey(media[existingIndex]), existingIndex)
+      indexByName.set(mediaName(media[existingIndex]).toLowerCase(), existingIndex)
+      return
+    }
+    indexByKey.set(key, media.length)
+    indexByName.set(normalizedName, media.length)
+    media.push(entry)
+  }
+
+  for (const file of generatedFiles) add(file, false)
+  for (const attachment of attachments) add(attachment, true)
+  return media
+}
+
+type MediaPreviewRequest =
+  | { key: string; id: string; mode: 'attachment' }
+  | { key: string; path: string; mode: 'workspace-image' }
+
+function isMediaPreviewRequest(entry: MediaPreviewRequest | null): entry is MediaPreviewRequest {
+  return entry !== null
+}
+
+function useMediaPreviewUrls(media: TimelineMediaReference[]): Record<string, string> {
+  const activeThreadId = useChatStore((s) => s.activeThreadId)
+  const workspaceRoot = useChatStore((s) => s.workspaceRoot)
+  const [resolvedPreviewUrls, setResolvedPreviewUrls] = useState<Record<string, string>>({})
+  const [failedPreviewIds, setFailedPreviewIds] = useState<Record<string, true>>({})
+  const previewRequests = useMemo(
+    () =>
+      media
+        .map((item) => {
+          const key = mediaKey(item)
+          if (item.previewUrl || resolvedPreviewUrls[key] || failedPreviewIds[key]) return null
+          if (item.id && (mediaIsImage(item) || mediaIsVideo(item) || !item.mimeType)) {
+            return { key, id: item.id, mode: 'attachment' } satisfies MediaPreviewRequest
+          }
+          const path = mediaIsImage(item) ? mediaPath(item) : undefined
+          if (path) return { key, path, mode: 'workspace-image' } satisfies MediaPreviewRequest
+          return null
+        })
+        .filter(isMediaPreviewRequest),
+    [failedPreviewIds, media, resolvedPreviewUrls]
+  )
+  const missingPreviewKey = previewRequests
+    .map((request) =>
+      request.mode === 'attachment'
+        ? `attachment:${request.id}`
+        : `workspace-image:${request.path}`
+    )
+    .join('\n')
+
+  useEffect(() => {
+    if (!missingPreviewKey) return
+    const provider = getProvider()
+    let cancelled = false
+    void Promise.all(
+      previewRequests.map(async (request) => {
+        try {
+          if (request.mode === 'attachment' && request.id && typeof provider.getAttachmentContent === 'function') {
+            const content = await provider.getAttachmentContent(request.id, {
+              ...(activeThreadId ? { threadId: activeThreadId } : {}),
+              ...(workspaceRoot ? { workspace: workspaceRoot } : {})
+            })
+            return {
+              key: request.key,
+              previewUrl: `data:${content.attachment.mimeType};base64,${content.dataBase64}`
+            }
+          }
+          if (request.mode === 'workspace-image' && request.path && typeof window.kunGui?.readWorkspaceImage === 'function') {
+            const result = await window.kunGui.readWorkspaceImage({
+              path: request.path,
+              ...(workspaceRoot ? { workspaceRoot } : {})
+            })
+            if (result.ok) return { key: request.key, previewUrl: result.dataUrl }
+          }
+          return { key: request.key, failed: true as const }
+        } catch {
+          return { key: request.key, failed: true as const }
+        }
+      })
+    ).then((results) => {
+      if (cancelled) return
+      setResolvedPreviewUrls((current) => {
+        const next = { ...current }
+        for (const result of results) {
+          if ('previewUrl' in result && typeof result.previewUrl === 'string') {
+            next[result.key] = result.previewUrl
+          }
+        }
+        return next
+      })
+      setFailedPreviewIds((current) => {
+        const next = { ...current }
+        for (const result of results) {
+          if ('failed' in result) next[result.key] = true
+        }
+        return next
+      })
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [activeThreadId, missingPreviewKey, previewRequests, workspaceRoot])
+
+  return resolvedPreviewUrls
+}
+
+function MediaPreviewTile({
+  media,
+  previewUrl,
+  variant
+}: {
+  media: TimelineMediaReference
+  previewUrl?: string
+  variant: 'user' | 'tool' | 'conversation'
+}): ReactElement {
+  const { t } = useTranslation('common')
+  const workspaceRoot = useChatStore((s) => s.workspaceRoot)
+  const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
+  const [imagePreviewOpen, setImagePreviewOpen] = useState(false)
+  const title = mediaName(media)
+  const filePath = mediaPath(media)
+  const mimeType = media.mimeType || (mediaIsImage(media) ? 'image' : mediaIsVideo(media) ? 'video' : '')
+  const byteSize = formatByteSize(media.byteSize)
+  const hasRichPreview = !!previewUrl && (mediaIsImage(media) || mediaIsVideo(media))
+  const tileClass =
+    variant === 'conversation'
+      ? hasRichPreview
+        ? 'h-72 w-full overflow-hidden rounded-lg border border-ds-border-muted bg-ds-card shadow-sm sm:h-80'
+        : 'min-h-44 w-full overflow-hidden rounded-lg border border-ds-border-muted bg-ds-card shadow-sm'
+      : variant === 'tool'
+        ? 'block h-32 w-40 overflow-hidden rounded-lg border border-ds-border-muted bg-ds-card shadow-sm'
+        : 'block h-28 w-36 overflow-hidden rounded-lg border border-ds-border-muted bg-ds-card shadow-sm'
+  const revealClass = variant === 'user' ? '' : ' ds-media-printer-reveal'
+  const mediaClass = 'h-full w-full object-contain'
+  const canSave = Boolean(filePath || dataUrlPayload(previewUrl))
+  const saveLabel =
+    saveState === 'saving'
+      ? t('generatedFileSaving')
+      : saveState === 'saved'
+        ? t('generatedFileSaved')
+        : saveState === 'error'
+          ? t('generatedFileSaveFailed')
+          : t('generatedFileDownload')
+  const handleSaveAs = async (): Promise<void> => {
+    if (saveState === 'saving' || typeof window.kunGui?.saveWorkspaceFileAs !== 'function') return
+    const data = dataUrlPayload(previewUrl)
+    if (!filePath && !data) {
+      setSaveState('error')
+      return
+    }
+    setSaveState('saving')
+    try {
+      const result = await window.kunGui.saveWorkspaceFileAs({
+        suggestedName: title,
+        ...(filePath ? { sourcePath: filePath } : {}),
+        ...(workspaceRoot ? { workspaceRoot } : {}),
+        ...(media.mimeType || data?.mimeType ? { mimeType: media.mimeType ?? data?.mimeType } : {}),
+        ...(data && !filePath ? { dataBase64: data.dataBase64 } : {})
+      })
+      if (result.ok) {
+        setSaveState('saved')
+        window.setTimeout(() => setSaveState('idle'), 1600)
+      } else if (result.canceled) {
+        setSaveState('idle')
+      } else {
+        setSaveState('error')
+      }
+    } catch (error) {
+      setSaveState('error')
+      void window.kunGui?.logError?.('file-save-as', 'Failed to save generated file', {
+        message: error instanceof Error ? error.message : String(error),
+        filePath,
+        title
+      }).catch(() => undefined)
+    }
+  }
+  const saveButtonClass =
+    'inline-flex h-7 items-center justify-center rounded-md border border-ds-border-muted bg-ds-card/90 px-2 text-[11.5px] font-medium text-ds-muted shadow-sm transition hover:bg-ds-hover hover:text-ds-ink disabled:cursor-not-allowed disabled:opacity-50'
+  const iconButtonClass =
+    'absolute right-2 top-2 inline-flex h-8 w-8 items-center justify-center rounded-md border border-ds-border-muted bg-ds-card/92 text-ds-muted shadow-sm backdrop-blur transition hover:bg-ds-hover hover:text-ds-ink disabled:cursor-not-allowed disabled:opacity-50'
+  const saveIcon = saveState === 'saving'
+    ? <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={1.9} />
+    : saveState === 'saved'
+      ? <Check className="h-3.5 w-3.5" strokeWidth={2} />
+      : <Download className="h-3.5 w-3.5" strokeWidth={1.9} />
+
+  if (previewUrl && mediaIsImage(media)) {
+    return (
+      <figure className={`${tileClass}${revealClass} relative`} title={title}>
+        <button
+          type="button"
+          onClick={() => setImagePreviewOpen(true)}
+          className="block h-full w-full cursor-zoom-in"
+          title={t('imagePreviewOpen', { name: title })}
+          aria-label={t('imagePreviewOpen', { name: title })}
+        >
+          <img src={previewUrl} alt={title} className={mediaClass} loading="lazy" />
+        </button>
+        <button
+          type="button"
+          onClick={(event) => {
+            event.stopPropagation()
+            void handleSaveAs()
+          }}
+          disabled={!canSave || saveState === 'saving'}
+          title={saveLabel}
+          aria-label={saveLabel}
+          className={iconButtonClass}
+        >
+          {saveIcon}
+        </button>
+        <ImagePreviewLightbox
+          open={imagePreviewOpen}
+          src={previewUrl}
+          alt={title}
+          title={title}
+          downloadDisabled={!canSave || saveState === 'saving'}
+          downloadLabel={saveLabel}
+          onDownload={() => void handleSaveAs()}
+          onClose={() => setImagePreviewOpen(false)}
+        />
+      </figure>
+    )
+  }
+
+  if (previewUrl && mediaIsVideo(media)) {
+    return (
+      <figure className={`${tileClass} relative`} title={title}>
+        <video src={previewUrl} className={mediaClass} controls preload="metadata" />
+        <button
+          type="button"
+          onClick={() => void handleSaveAs()}
+          disabled={!canSave || saveState === 'saving'}
+          title={saveLabel}
+          aria-label={saveLabel}
+          className={iconButtonClass}
+        >
+          {saveIcon}
+        </button>
+      </figure>
+    )
+  }
+
+  const Icon = mediaIsVideo(media) ? Video : mediaIsImage(media) ? ImageIcon : File
+  return (
+    <div className={`${tileClass} flex flex-col justify-between p-3`} title={title}>
+      <div className="flex min-w-0 items-start gap-2">
+        <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-ds-border-muted bg-ds-subtle text-ds-muted">
+          <Icon className="h-4 w-4" strokeWidth={1.8} />
+        </span>
+        <div className="min-w-0">
+          <div className="line-clamp-2 break-words text-[12.5px] font-semibold leading-5 text-ds-ink">
+            {title}
+          </div>
+          <div className="mt-0.5 truncate text-[11px] text-ds-faint">
+            {[mimeType, byteSize].filter(Boolean).join(' · ') || t('generatedFilePreviewUnavailable')}
+          </div>
+        </div>
+      </div>
+      <div className="mt-3 flex flex-wrap gap-2">
+        <button
+          type="button"
+          onClick={() => void handleSaveAs()}
+          disabled={!canSave || saveState === 'saving'}
+          className={saveButtonClass}
+          title={saveLabel}
+        >
+          <span className="mr-1.5">{saveIcon}</span>
+          {t('generatedFileDownload')}
+        </button>
+      {filePath ? (
+        <button
+          type="button"
+          onClick={() => void openWorkspacePathInEditor({ path: filePath }, workspaceRoot)}
+          className={saveButtonClass}
+        >
+          {t('filePreviewOpenEditor')}
+        </button>
+      ) : null}
+      </div>
+    </div>
+  )
+}
+
+function MediaAttachmentGallery({
+  media,
+  variant
+}: {
+  media: TimelineMediaReference[]
+  variant: 'user' | 'tool' | 'conversation'
+}): ReactElement | null {
+  const resolvedPreviewUrls = useMediaPreviewUrls(media)
+  if (media.length === 0) return null
+  const wrapperClass =
+    variant === 'conversation'
+      ? `grid w-full max-w-2xl grid-cols-1 gap-2 ${media.length > 1 ? 'sm:grid-cols-2' : ''}`
+      : variant === 'tool'
+        ? 'flex min-w-0 flex-wrap gap-2 border-t border-ds-border-muted/60 px-4 py-3'
+        : 'flex max-w-[80%] flex-wrap justify-end gap-2'
+
+  return (
+    <div className={wrapperClass}>
+      {media.map((item) => {
+        const key = mediaKey(item)
+        return (
+          <MediaPreviewTile
+            key={key}
+            media={item}
+            previewUrl={item.previewUrl ?? resolvedPreviewUrls[key]}
+            variant={variant}
+          />
+        )
+      })}
+    </div>
+  )
+}
+
+export function GeneratedFilesPanel({ blocks }: { blocks: ToolBlock[] }): ReactElement | null {
+  const { t } = useTranslation('common')
+  const media = useMemo(
+    () =>
+      blocks.flatMap((block) =>
+        mergeMediaReferences(
+          metaAttachmentReferences(block.meta as RuntimeDisclosureMetadata | undefined),
+          metaGeneratedFileReferences(block.meta)
+        )
+      ),
+    [blocks]
+  )
+
+  if (media.length === 0) return null
+
+  return (
+    <div className="flex min-w-0 flex-col gap-2">
+      <div className="text-[12px] font-semibold text-ds-faint">{t('generatedFilesTitle')}</div>
+      <MediaAttachmentGallery media={media} variant="conversation" />
+    </div>
+  )
+}
+
 function UserAttachmentPreviews({
   meta
 }: {
   meta?: RuntimeDisclosureMetadata
 }): ReactElement | null {
-  const activeThreadId = useChatStore((s) => s.activeThreadId)
-  const workspaceRoot = useChatStore((s) => s.workspaceRoot)
   const attachments = useMemo(() => {
     const attachmentIds = metaStringArray(meta, 'attachmentIds')
     const byId = new Map<string, AttachmentReference>()
@@ -280,91 +803,29 @@ function UserAttachmentPreviews({
     }
     return [...byId.values()]
   }, [meta])
-  const [resolvedPreviewUrls, setResolvedPreviewUrls] = useState<Record<string, string>>({})
-  const [failedPreviewIds, setFailedPreviewIds] = useState<Record<string, true>>({})
-  const missingPreviewKey = attachments
-    .filter((attachment) => !attachment.previewUrl && !resolvedPreviewUrls[attachment.id] && !failedPreviewIds[attachment.id])
-    .map((attachment) => attachment.id)
-    .join('\n')
-
-  useEffect(() => {
-    if (!missingPreviewKey) return
-    const provider = getProvider()
-    if (typeof provider.getAttachmentContent !== 'function') return
-    const missingIds = missingPreviewKey.split('\n').filter(Boolean)
-    let cancelled = false
-    void Promise.all(
-      missingIds.map(async (id) => {
-        try {
-          const content = await provider.getAttachmentContent?.(id, {
-            ...(activeThreadId ? { threadId: activeThreadId } : {}),
-            ...(workspaceRoot ? { workspace: workspaceRoot } : {})
-          })
-          if (!content) return { id, failed: true as const }
-          return {
-            id,
-            previewUrl: `data:${content.attachment.mimeType};base64,${content.dataBase64}`
-          }
-        } catch {
-          return { id, failed: true as const }
-        }
-      })
-    ).then((results) => {
-      if (cancelled) return
-      setResolvedPreviewUrls((current) => {
-        const next = { ...current }
-        for (const result of results) {
-          if ('previewUrl' in result && typeof result.previewUrl === 'string') {
-            next[result.id] = result.previewUrl
-          }
-        }
-        return next
-      })
-      setFailedPreviewIds((current) => {
-        const next = { ...current }
-        for (const result of results) {
-          if ('failed' in result) next[result.id] = true
-        }
-        return next
-      })
-    })
-    return () => {
-      cancelled = true
-    }
-  }, [activeThreadId, missingPreviewKey, workspaceRoot])
 
   if (attachments.length === 0) return null
 
   return (
     <div className="mb-2 flex min-w-0 justify-end">
-      <div className="flex max-w-[80%] flex-wrap justify-end gap-2">
-        {attachments.map((attachment) => {
-          const previewUrl = attachment.previewUrl ?? resolvedPreviewUrls[attachment.id]
-          const title = attachment.name || attachment.id
-          return (
-            <span
-              key={attachment.id}
-              className="block h-28 w-36 overflow-hidden rounded-[14px] border border-ds-border-muted bg-ds-card shadow-sm"
-              title={title}
-            >
-              {previewUrl ? (
-                <img
-                  src={previewUrl}
-                  alt={title}
-                  className="h-full w-full object-cover"
-                  loading="lazy"
-                />
-              ) : (
-                <span className="flex h-full w-full items-center justify-center text-ds-faint">
-                  <ImageIcon className="h-7 w-7" strokeWidth={1.6} />
-                </span>
-              )}
-            </span>
-          )
-        })}
-      </div>
+      <MediaAttachmentGallery media={attachments} variant="user" />
     </div>
   )
+}
+
+function ToolAttachmentPreviews({
+  meta
+}: {
+  meta?: Record<string, unknown>
+}): ReactElement | null {
+  const attachments = useMemo(
+    () => metaAttachmentReferences(meta as RuntimeDisclosureMetadata | undefined),
+    [meta]
+  )
+
+  if (attachments.length === 0) return null
+
+  return <MediaAttachmentGallery media={attachments} variant="tool" />
 }
 
 function metaSources(meta: Record<string, unknown> | undefined): Array<{ title?: string; url?: string }> {
@@ -527,9 +988,11 @@ function CopyFeedbackButton({
 }
 
 function UserInputBubble({
-  block
+  block,
+  nested = false
 }: {
   block: Extract<ChatBlock, { kind: 'user_input' }>
+  nested?: boolean
 }): ReactElement {
   const { t } = useTranslation('common')
   const resolveUserInput = useChatStore((s) => s.resolveUserInput)
@@ -553,7 +1016,9 @@ function UserInputBubble({
   const canSubmit = block.questions.every((question) => {
     const answer = answers[question.id]
     if (!answer) return false
-    if (answer.label === USER_INPUT_OTHER_LABEL) return answer.value.trim().length > 0
+    if (question.options.length === 0 || answer.label === USER_INPUT_OTHER_LABEL) {
+      return answer.value.trim().length > 0
+    }
     return true
   })
 
@@ -576,94 +1041,253 @@ function UserInputBubble({
         : block.status === 'error'
           ? t('userInputFailed')
           : t('userInputPending')
+  const tone =
+    block.status === 'error'
+      ? 'error'
+      : block.status === 'submitted'
+        ? 'success'
+        : block.status === 'cancelled'
+          ? 'muted'
+          : 'active'
+  const questionCount = block.questions.length
+  const containerClass = nested
+    ? `overflow-hidden rounded-[14px] border px-3.5 py-3 text-[13px] leading-5 shadow-[0_8px_22px_rgba(20,47,95,0.035)] ${
+        tone === 'error'
+          ? 'border-red-300/65 bg-ds-card/88 dark:border-red-800/55 dark:bg-red-950/20'
+          : tone === 'success'
+            ? 'border-emerald-500/22 bg-ds-card/88 dark:border-emerald-600/30 dark:bg-ds-card/82'
+            : tone === 'muted'
+              ? 'border-ds-border-muted bg-ds-card/78'
+              : 'border-accent/22 bg-ds-card/90'
+      }`
+    : `overflow-hidden rounded-[16px] border px-4 py-4 text-[13px] leading-6 shadow-[0_14px_36px_rgba(20,47,95,0.055)] ${
+        tone === 'error'
+          ? 'border-red-300/70 bg-ds-card/90 dark:border-red-800/60 dark:bg-red-950/20'
+          : tone === 'success'
+            ? 'border-emerald-500/24 bg-ds-card/90 dark:border-emerald-600/32 dark:bg-ds-card/84'
+            : tone === 'muted'
+              ? 'border-ds-border bg-ds-card/82'
+              : 'border-accent/24 bg-ds-card/95 text-ds-ink'
+      }`
+  const iconFrameClass =
+    tone === 'error'
+      ? 'border-red-300/60 bg-red-500/10 text-red-700 dark:border-red-800/45 dark:text-red-300'
+      : tone === 'success'
+        ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+        : tone === 'active'
+          ? 'border-accent/20 bg-accent/10 text-accent'
+          : 'border-ds-border-muted bg-ds-subtle text-ds-muted'
+  const statusClass =
+    tone === 'error'
+      ? 'text-red-700 dark:text-red-300'
+      : tone === 'success'
+        ? 'text-emerald-700 dark:text-emerald-300'
+        : tone === 'active'
+          ? 'text-accent'
+          : 'text-ds-muted'
+  const statusIcon =
+    tone === 'active' ? (
+      <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={2} />
+    ) : tone === 'success' ? (
+      <Check className="h-3.5 w-3.5" strokeWidth={2} />
+    ) : tone === 'error' ? (
+      <span className="flex h-3.5 w-3.5 items-center justify-center rounded-full border border-current text-[10px] font-bold leading-none">
+        !
+      </span>
+    ) : (
+      <span className="h-1.5 w-1.5 rounded-full bg-current opacity-70" />
+    )
 
   return (
-    <div
-      className={`rounded-[22px] border px-4 py-4 text-[13px] leading-6 shadow-[0_12px_30px_rgba(86,103,136,0.04)] ${
-        block.status === 'error'
-          ? 'border-red-300/80 bg-red-500/10 dark:border-red-800/60 dark:bg-red-950/35'
-          : 'border-accent/35 bg-[linear-gradient(180deg,rgba(79,124,255,0.07),rgba(79,124,255,0.11))] text-ds-ink'
-      }`}
-    >
-      <div className="font-semibold text-accent">{t('userInputTitle')}</div>
-      <p className="mt-1 text-[12px] text-ds-muted">{statusLabel}</p>
+    <div className={containerClass}>
+      <div className="flex min-w-0 items-start justify-between gap-3">
+        <div className="flex min-w-0 items-start gap-2.5">
+          <span
+            className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-[10px] border ${iconFrameClass}`}
+          >
+            {statusIcon}
+          </span>
+          <div className="min-w-0 pt-0.5">
+            <div className="font-semibold text-ds-ink">{t('userInputTitle')}</div>
+            <div className={`mt-0.5 text-[12px] font-medium ${statusClass}`}>{statusLabel}</div>
+          </div>
+        </div>
+        {questionCount > 1 ? (
+          <span className="shrink-0 rounded-full border border-ds-border-muted bg-ds-subtle px-2 py-0.5 text-[11.5px] font-medium text-ds-muted">
+            {questionCount}
+          </span>
+        ) : null}
+      </div>
 
-      <div className="mt-3 flex flex-col gap-4">
+      <div className={nested ? 'mt-3 flex flex-col gap-2.5' : 'mt-3.5 flex flex-col gap-3'}>
         {block.questions.map((question, index) => {
           const answer = answers[question.id]
+          const hasOptions = question.options.length > 0
           const otherSelected = answer?.label === USER_INPUT_OTHER_LABEL
+          const submittedAnswer = done ? (answer?.value || answer?.label || '') : ''
+          const showProgress = questionCount > 1
+          const showHeader =
+            typeof question.header === 'string' &&
+            question.header.trim().length > 0 &&
+            !(questionCount === 1 && question.header.trim().toLowerCase() === 'input')
           return (
-            <div key={question.id} className="rounded-xl border border-ds-border bg-ds-card/60 p-3">
-              <div className="flex flex-wrap items-baseline justify-between gap-2">
-                <div className="text-[12px] font-semibold uppercase tracking-[0.12em] text-ds-muted">
-                  {question.header}
+            <div
+              key={question.id}
+              className={`min-w-0 rounded-[12px] border px-3 py-3 ${
+                submittedAnswer
+                  ? 'border-ds-border-muted bg-ds-main/35'
+                  : 'border-ds-border-muted bg-ds-main/45'
+              }`}
+            >
+              {showHeader || showProgress ? (
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="min-w-0">
+                    {showHeader ? (
+                      <div className="min-w-0 text-[12px] font-semibold text-ds-muted">
+                        {question.header}
+                      </div>
+                    ) : null}
+                  </div>
+                  {showProgress ? (
+                    <div className="rounded-full bg-ds-card/70 px-2 py-0.5 text-[11.5px] font-medium text-ds-faint">
+                      {t('userInputQuestionProgress', {
+                        current: index + 1,
+                        total: block.questions.length
+                      })}
+                    </div>
+                  ) : null}
                 </div>
-                <div className="text-[12px] text-ds-faint">
-                  {t('userInputQuestionProgress', {
-                    current: index + 1,
-                    total: block.questions.length
-                  })}
-                </div>
-              </div>
-              <p className="mt-1.5 whitespace-pre-wrap text-[14px] font-medium text-ds-ink">
+              ) : null}
+              <p
+                className={`whitespace-pre-wrap break-words text-[14px] font-semibold leading-6 text-ds-ink [overflow-wrap:anywhere] ${
+                  showHeader || showProgress ? 'mt-2' : ''
+                }`}
+              >
                 {question.question}
               </p>
-              <div className="mt-3 grid gap-2">
-                {question.options.map((option) => {
-                  const selected = answer?.label === option.label && answer.value === option.label
-                  return (
-                    <button
-                      key={option.label}
-                      type="button"
-                      disabled={done}
-                      onClick={() => chooseOption(question, option.label)}
-                      className={`rounded-lg border px-3 py-2 text-left transition disabled:cursor-default ${
-                        selected
-                          ? 'border-accent/60 bg-accent/10 text-ds-ink'
-                          : 'border-ds-border bg-ds-card text-ds-muted hover:bg-ds-hover hover:text-ds-ink'
+
+              {submittedAnswer ? (
+                <div className="mt-3 flex min-w-0 items-start gap-2 rounded-[10px] border border-emerald-500/14 bg-ds-card/78 px-3 py-2.5">
+                  <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-emerald-500/12 text-emerald-700 dark:text-emerald-300">
+                    <Check className="h-3.5 w-3.5" strokeWidth={2.1} />
+                  </span>
+                  <span className="min-w-0 flex-1 break-words text-[13.5px] font-medium leading-5 text-ds-ink [overflow-wrap:anywhere]">
+                    {submittedAnswer}
+                  </span>
+                </div>
+              ) : done ? (
+                <div className="mt-3 rounded-[10px] border border-ds-border-muted bg-ds-card/70 px-3 py-2 text-[12.5px] font-medium text-ds-muted">
+                  {statusLabel}
+                </div>
+              ) : hasOptions ? (
+                <div className="mt-3 grid gap-2">
+                  {question.options.map((option) => {
+                    const selected = answer?.label === option.label && answer.value === option.label
+                    return (
+                      <button
+                        key={option.label}
+                        type="button"
+                        disabled={done}
+                        onClick={() => chooseOption(question, option.label)}
+                        className={`group flex min-w-0 gap-2.5 rounded-[10px] border px-3 py-2.5 text-left transition disabled:cursor-default ${
+                          selected
+                            ? 'border-accent/35 bg-accent/10 text-ds-ink ring-1 ring-accent/10'
+                            : 'border-ds-border-muted bg-ds-card/78 text-ds-muted hover:border-ds-border hover:bg-ds-card hover:text-ds-ink'
+                        }`}
+                      >
+                        <span
+                          className={`mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border transition ${
+                            selected
+                              ? 'border-accent bg-accent/10'
+                              : 'border-ds-border bg-transparent group-hover:border-ds-muted'
+                          }`}
+                        >
+                          {selected ? <span className="h-2 w-2 rounded-full bg-accent" /> : null}
+                        </span>
+                        <span className="min-w-0">
+                          <span className="block break-words text-[13px] font-semibold [overflow-wrap:anywhere]">
+                            {option.label}
+                          </span>
+                          {option.description ? (
+                            <span className="mt-0.5 block break-words text-[12px] leading-5 text-ds-faint [overflow-wrap:anywhere]">
+                              {option.description}
+                            </span>
+                          ) : null}
+                        </span>
+                      </button>
+                    )
+                  })}
+                  <button
+                    type="button"
+                    disabled={done}
+                    onClick={() =>
+                      chooseOption(
+                        question,
+                        USER_INPUT_OTHER_LABEL,
+                        answer?.label === USER_INPUT_OTHER_LABEL ? answer.value : ''
+                      )
+                    }
+                    className={`group flex min-w-0 gap-2.5 rounded-[10px] border px-3 py-2.5 text-left transition disabled:cursor-default ${
+                      otherSelected
+                        ? 'border-accent/35 bg-accent/10 text-ds-ink ring-1 ring-accent/10'
+                        : 'border-ds-border-muted bg-ds-card/78 text-ds-muted hover:border-ds-border hover:bg-ds-card hover:text-ds-ink'
+                    }`}
+                  >
+                    <span
+                      className={`mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border transition ${
+                        otherSelected
+                          ? 'border-accent bg-accent/10'
+                          : 'border-ds-border bg-transparent group-hover:border-ds-muted'
                       }`}
                     >
-                      <span className="block text-[13px] font-semibold">{option.label}</span>
+                      {otherSelected ? <span className="h-2 w-2 rounded-full bg-accent" /> : null}
+                    </span>
+                    <span className="min-w-0">
+                      <span className="block text-[13px] font-semibold">{t('userInputOther')}</span>
                       <span className="mt-0.5 block text-[12px] leading-5 text-ds-faint">
-                        {option.description}
+                        {t('userInputOtherDescription')}
                       </span>
-                    </button>
-                  )
-                })}
-                <button
-                  type="button"
-                  disabled={done}
-                  onClick={() =>
-                    chooseOption(
-                      question,
-                      USER_INPUT_OTHER_LABEL,
-                      answer?.label === USER_INPUT_OTHER_LABEL ? answer.value : ''
-                    )
-                  }
-                  className={`rounded-lg border px-3 py-2 text-left transition disabled:cursor-default ${
-                    otherSelected
-                      ? 'border-accent/60 bg-accent/10 text-ds-ink'
-                      : 'border-ds-border bg-ds-card text-ds-muted hover:bg-ds-hover hover:text-ds-ink'
-                  }`}
-                >
-                  <span className="block text-[13px] font-semibold">{t('userInputOther')}</span>
-                  <span className="mt-0.5 block text-[12px] leading-5 text-ds-faint">
-                    {t('userInputOtherDescription')}
-                  </span>
-                </button>
-                {otherSelected ? (
+                    </span>
+                  </button>
+                  {otherSelected ? (
+                    <textarea
+                      rows={2}
+                      disabled={done}
+                      value={answer?.value ?? ''}
+                      onChange={(e) =>
+                        chooseOption(question, USER_INPUT_OTHER_LABEL, e.target.value)
+                      }
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+                          e.preventDefault()
+                          submit()
+                        }
+                      }}
+                      placeholder={t('userInputCustomPlaceholder')}
+                      className="min-h-20 resize-y rounded-[10px] border border-ds-border-muted bg-ds-card/90 px-3 py-2 text-[13px] leading-5 text-ds-ink outline-none transition placeholder:text-ds-faint focus:border-accent/45 focus:ring-2 focus:ring-accent/10 disabled:cursor-default disabled:opacity-80"
+                    />
+                  ) : null}
+                </div>
+              ) : (
+                <div className="mt-3">
                   <textarea
-                    rows={2}
+                    rows={3}
                     disabled={done}
                     value={answer?.value ?? ''}
                     onChange={(e) =>
-                      chooseOption(question, USER_INPUT_OTHER_LABEL, e.target.value)
+                      chooseOption(question, USER_INPUT_FREEFORM_LABEL, e.target.value)
                     }
-                    placeholder={t('userInputCustomPlaceholder')}
-                    className="min-h-20 resize-y rounded-lg border border-ds-border bg-ds-card px-3 py-2 text-[13px] leading-5 text-ds-ink outline-none transition placeholder:text-ds-faint focus:border-accent/60 disabled:cursor-default disabled:opacity-80"
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+                        e.preventDefault()
+                        submit()
+                      }
+                      }}
+                      placeholder={t('userInputCustomPlaceholder')}
+                    className="min-h-24 w-full resize-y rounded-[10px] border border-ds-border-muted bg-ds-card/90 px-3 py-2.5 text-[13px] leading-5 text-ds-ink outline-none transition placeholder:text-ds-faint focus:border-accent/45 focus:ring-2 focus:ring-accent/10 disabled:cursor-default disabled:opacity-80"
                   />
-                ) : null}
-              </div>
+                </div>
+              )}
             </div>
           )
         })}
@@ -673,30 +1297,20 @@ function UserInputBubble({
         <p className="mt-3 text-[12px] text-red-700 dark:text-red-300">{block.errorMessage}</p>
       ) : null}
 
-      {block.answers && block.answers.length > 0 && block.status === 'submitted' ? (
-        <div className="mt-3 rounded-lg bg-ds-card px-3 py-2 text-[12px] text-ds-muted">
-          {block.answers.map((answer) => (
-            <div key={answer.id} className="flex gap-2">
-              <span className="font-mono text-ds-faint">{answer.id}</span>
-              <span className="min-w-0 flex-1 break-words">{answer.value || answer.label}</span>
-            </div>
-          ))}
-        </div>
-      ) : null}
-
       {pending ? (
-        <div className="mt-3 flex flex-wrap gap-2">
+        <div className="mt-3 flex flex-wrap gap-2 border-t border-ds-border-muted pt-3">
           <button
             type="button"
             disabled={!canSubmit}
-            className="rounded-lg bg-accent px-3 py-1.5 text-[13px] font-medium text-white hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
+            className="inline-flex min-h-8 items-center gap-1.5 rounded-[9px] bg-ds-ink px-3 py-1.5 text-[13px] font-semibold text-white shadow-sm transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-45 dark:text-black"
             onClick={submit}
           >
+            <Check className="h-3.5 w-3.5" strokeWidth={2} />
             {t('userInputSubmit')}
           </button>
           <button
             type="button"
-            className="rounded-lg border border-ds-border bg-ds-card px-3 py-1.5 text-[13px] font-medium text-ds-ink hover:bg-ds-hover"
+            className="min-h-8 rounded-[9px] border border-ds-border-muted bg-ds-card/80 px-3 py-1.5 text-[13px] font-medium text-ds-muted transition hover:bg-ds-hover hover:text-ds-ink"
             onClick={cancel}
           >
             {t('userInputCancel')}
@@ -731,7 +1345,25 @@ function formatMessageDateTime(input: string, locale: string): string {
   }).format(date)
 }
 
-export function MessageBubble({ block, nested = false }: { block: ChatBlock; nested?: boolean }): ReactElement {
+/**
+ * Memoized so settled bubbles skip re-render while streaming deltas
+ * re-render only the live bubble; block references stay stable in the
+ * store for unchanged blocks.
+ */
+export const MessageBubble = memo(MessageBubbleImpl)
+
+function MessageBubbleImpl({
+  block,
+  nested = false,
+  forkAction
+}: {
+  block: ChatBlock
+  nested?: boolean
+  forkAction?: {
+    busy: boolean
+    onFork: () => void
+  }
+}): ReactElement {
   const { t, i18n } = useTranslation('common')
   const resolveApproval = useChatStore((s) => s.resolveApproval)
   if (block.kind === 'user') {
@@ -750,7 +1382,22 @@ export function MessageBubble({ block, nested = false }: { block: ChatBlock; nes
         {!streaming ? (
           <div className="mt-1 flex min-h-5 min-w-0 items-center justify-between gap-3 text-[11.5px] text-ds-faint opacity-0 transition duration-150 group-hover/message:opacity-100">
             <span className="min-w-0 truncate">{createdAtLabel ?? ''}</span>
-            <CopyFeedbackButton text={block.text} />
+            <div className="flex shrink-0 items-center gap-1.5">
+              {forkAction ? (
+                <button
+                  type="button"
+                  onClick={() => forkAction.onFork()}
+                  disabled={forkAction.busy}
+                  className="flex shrink-0 items-center gap-1 rounded-md px-1.5 py-0.5 transition hover:bg-ds-hover hover:text-ds-muted disabled:cursor-not-allowed disabled:opacity-60"
+                  title={t('forkFromAssistantResponse')}
+                  aria-label={t('forkFromAssistantResponse')}
+                >
+                  <GitFork className="h-3.5 w-3.5" strokeWidth={1.8} />
+                  <span>{forkAction.busy ? t('forkingThread') : t('forkResponse')}</span>
+                </button>
+              ) : null}
+              <CopyFeedbackButton text={block.text} />
+            </div>
           </div>
         ) : null}
       </div>
@@ -769,7 +1416,7 @@ export function MessageBubble({ block, nested = false }: { block: ChatBlock; nes
     return <ToolEntry block={block} nested={nested} />
   }
   if (block.kind === 'user_input') {
-    return <UserInputBubble block={block} />
+    return <UserInputBubble block={block} nested={nested} />
   }
   if (block.kind === 'approval') {
     const done = block.status !== 'pending'
@@ -836,11 +1483,27 @@ export function MessageBubble({ block, nested = false }: { block: ChatBlock; nes
       </div>
     )
   }
-  return (
-    <div className="ds-card-soft rounded-[18px] px-3 py-2 text-[13.5px] text-ds-muted">
-      {block.text}
-    </div>
-  )
+  if (block.kind === 'system') {
+    const errorTone = block.severity === 'error'
+    const warningTone = block.severity === 'warning'
+    return (
+      <div
+        className={`rounded-[18px] border px-3 py-2 text-[13.5px] leading-6 ${
+          errorTone
+            ? 'border-red-300/80 bg-red-500/10 text-red-800 dark:border-red-800/60 dark:bg-red-950/35 dark:text-red-200'
+            : warningTone
+              ? 'border-amber-300/80 bg-amber-500/10 text-amber-900 dark:border-amber-800/60 dark:bg-amber-950/35 dark:text-amber-100'
+              : 'border-ds-border bg-ds-subtle text-ds-muted'
+        }`}
+      >
+        <p className="whitespace-pre-wrap break-words">{block.text}</p>
+        {block.code ? (
+          <p className="mt-1 font-mono text-[11px] opacity-70">{block.code}</p>
+        ) : null}
+      </div>
+    )
+  }
+  return <></>
 }
 
 function ToolEntry({ block, nested = false }: { block: ToolBlock; nested?: boolean }): ReactElement {
@@ -876,7 +1539,7 @@ function ToolEntry({ block, nested = false }: { block: ToolBlock; nested?: boole
   const sessionStatus = metaString(block.meta, 'status')
 
   const hasDetail = !!(block.detail && block.detail.trim().length > 0)
-  const isPatch = block.toolKind === 'file_change' && hasDetail
+  const patchText = block.toolKind === 'file_change' ? extractUnifiedDiffText(block.detail) : undefined
   const canExpand = hasDetail || block.status === 'running'
 
   return (
@@ -940,10 +1603,11 @@ function ToolEntry({ block, nested = false }: { block: ToolBlock; nested?: boole
           )
         ) : null}
       </button>
+      <ToolAttachmentPreviews meta={block.meta} />
       {effectiveOpen && hasDetail ? (
         <div className="ds-panel-strip min-w-0 border-t border-ds-border-muted/60 px-4 py-3">
-          {isPatch ? (
-            <DiffView patch={block.detail!} filePath={block.filePath} />
+          {patchText !== undefined ? (
+            <DiffView patch={patchText} filePath={block.filePath} />
           ) : (
             <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words font-mono text-[12px] leading-6 text-ds-ink">
               {block.detail}

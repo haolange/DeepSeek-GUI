@@ -1,5 +1,5 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { createRequire } from 'node:module'
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { builtinModules, createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 const require = createRequire(import.meta.url)
 const builderConfig = require('../../electron-builder.config.cjs')
 const afterPack = require('../../scripts/after-pack.cjs')
+const macNotarize = require('../../scripts/mac-notarize.cjs')
 
 const tempRoots: string[] = []
 
@@ -21,6 +22,56 @@ function touch(path: string): void {
   writeFileSync(path, '{}\n', 'utf8')
 }
 
+function preloadSourceFiles(dir = join(process.cwd(), 'src/preload')): string[] {
+  return readdirSync(dir).flatMap((entry) => {
+    const path = join(dir, entry)
+    const stat = statSync(path)
+    if (stat.isDirectory()) return preloadSourceFiles(path)
+    return path.endsWith('.ts') && !path.endsWith('.d.ts') ? [path] : []
+  })
+}
+
+function forbiddenPreloadImports(source: string): string[] {
+  const builtins = new Set(builtinModules.map((moduleName) => moduleName.replace(/^node:/, '')))
+  const imports = source.matchAll(/(?:from\s+|import\s*\(|require\s*\()\s*['"]([^'"]+)['"]/g)
+  return [...imports]
+    .map((match) => match[1])
+    .filter((specifier) => {
+      const moduleName = specifier.replace(/^node:/, '')
+      return specifier.startsWith('node:') ||
+        builtins.has(moduleName) ||
+        builtins.has(moduleName.split('/')[0] ?? moduleName)
+    })
+}
+
+function loadBuilderConfigWithEnv(env: Record<string, string | undefined>): typeof builderConfig {
+  const configPath = require.resolve('../../electron-builder.config.cjs')
+  const previous = new Map<string, string | undefined>()
+  for (const [key, value] of Object.entries(env)) {
+    previous.set(key, process.env[key])
+    if (value === undefined) {
+      delete process.env[key]
+    } else {
+      process.env[key] = value
+    }
+  }
+
+  delete require.cache[configPath]
+  try {
+    return require(configPath)
+  } finally {
+    delete require.cache[configPath]
+    for (const [key, value] of previous) {
+      if (value === undefined) {
+        delete process.env[key]
+      } else {
+        process.env[key] = value
+      }
+    }
+    require(configPath)
+  }
+}
+
 function createMacPackContext(root: string): {
   appOutDir: string
   electronPlatformName: string
@@ -31,7 +82,7 @@ function createMacPackContext(root: string): {
     electronPlatformName: 'darwin',
     packager: {
       appInfo: {
-        productFilename: 'DeepSeek GUI'
+        productFilename: 'Kun'
       }
     }
   }
@@ -64,7 +115,10 @@ describe('electron-builder Kun packaging', () => {
       '**/node_modules/openclaw/**/*',
       '**/node_modules/@tencent-weixin/openclaw-weixin/**/*'
     ]))
-    expect(builderConfig.files).toEqual(expect.arrayContaining([
+    // The openclaw shim (vendor/openclaw-shim) must ship: the WeChat bridge
+    // imports the bundled plugin's dist at runtime to send media, and that
+    // import chain resolves openclaw/plugin-sdk/*.
+    expect(builderConfig.files).not.toEqual(expect.arrayContaining([
       '!**/node_modules/openclaw/**/*'
     ]))
   })
@@ -97,5 +151,56 @@ describe('electron-builder Kun packaging', () => {
       command: 'npm',
       args: ['prune']
     })
+  })
+
+  it('uses the rounded Kun icon for Windows installers and shortcuts', () => {
+    // Windows ships a multi-size .ico (16/24/32/48/64/72/96/128/256) generated
+    // from the rounded kun_mac.png so Explorer/desktop render crisp small icons
+    // instead of downscaling a single 1024px PNG (#222). The .ico still carries
+    // the rounded Kun artwork — it is derived from kun_mac.png.
+    expect(builderConfig.win.icon).toBe('./build/icon.ico')
+  })
+
+  it('keeps sandboxed preload free of Node builtin imports', () => {
+    for (const sourcePath of preloadSourceFiles()) {
+      expect(forbiddenPreloadImports(readFileSync(sourcePath, 'utf8'))).toEqual([])
+    }
+  })
+
+  it('requires Apple secure timestamps when Developer ID signing is enabled', () => {
+    const signedConfig = loadBuilderConfigWithEnv({
+      MAC_SIGN: '1'
+    })
+
+    expect(signedConfig.mac.identity).toBeUndefined()
+    expect(signedConfig.mac.hardenedRuntime).toBe(true)
+    expect(signedConfig.mac.forceCodeSigning).toBe(true)
+    expect(signedConfig.mac.timestamp).toBe('http://timestamp.apple.com/ts01')
+  })
+
+  it('checks timestamp candidates across nested macOS signed code', () => {
+    const root = tempRoot()
+    const appBundle = join(root, 'Kun.app')
+    const mainExecutable = join(appBundle, 'Contents/MacOS/Kun')
+    const framework = join(appBundle, 'Contents/Frameworks/Electron Framework.framework')
+    const nativeAddon = join(
+      appBundle,
+      'Contents/Resources/app.asar.unpacked/node_modules/better-sqlite3/build/Release/better_sqlite3.node'
+    )
+    const resourceScript = join(appBundle, 'Contents/Resources/postinstall.sh')
+
+    touch(mainExecutable)
+    touch(join(framework, 'Versions/A/Electron Framework'))
+    touch(nativeAddon)
+    touch(resourceScript)
+    chmodSync(mainExecutable, 0o755)
+    chmodSync(resourceScript, 0o755)
+
+    expect(macNotarize._internals.collectSignedCodeCandidates(appBundle)).toEqual([
+      appBundle,
+      framework,
+      mainExecutable,
+      nativeAddon
+    ])
   })
 })

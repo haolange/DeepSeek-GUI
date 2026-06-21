@@ -6,7 +6,12 @@ import type {
   ThreadRelation,
   ThreadStatus
 } from '../contracts/threads.js'
-import { DEFAULT_APPROVAL_POLICY, type ApprovalPolicy, type SandboxMode } from '../contracts/policy.js'
+import {
+  DEFAULT_APPROVAL_POLICY,
+  DEFAULT_SANDBOX_MODE,
+  type ApprovalPolicy,
+  type SandboxMode
+} from '../contracts/policy.js'
 
 /**
  * Domain helper for thread records. The contract type is the source of
@@ -20,6 +25,7 @@ export function createThreadRecord(input: {
   title: string
   workspace: string
   model: string
+  providerId?: string
   mode?: ThreadMode
   status?: ThreadStatus
   approvalPolicy?: ApprovalPolicy
@@ -43,10 +49,11 @@ export function createThreadRecord(input: {
     title: input.title,
     workspace: input.workspace,
     model: input.model,
+    ...(input.providerId ? { providerId: input.providerId } : {}),
     mode: input.mode ?? 'agent',
     status: input.status ?? 'idle',
     approvalPolicy: input.approvalPolicy ?? DEFAULT_APPROVAL_POLICY,
-    sandboxMode: input.sandboxMode ?? 'workspace-write',
+    sandboxMode: input.sandboxMode ?? DEFAULT_SANDBOX_MODE,
     ...(input.costBudgetUsd !== undefined ? { costBudgetUsd: input.costBudgetUsd } : {}),
     ...(input.costBudgetWarningSent !== undefined ? { costBudgetWarningSent: input.costBudgetWarningSent } : {}),
     relation: input.relation ?? 'primary',
@@ -72,7 +79,7 @@ export function toThreadSummary(
   thread: ThreadEntity
 ): Pick<
   ThreadEntity,
-  'id' | 'title' | 'workspace' | 'model' | 'mode' | 'status' | 'createdAt' | 'updatedAt'
+  'id' | 'title' | 'workspace' | 'model' | 'providerId' | 'mode' | 'status' | 'approvalPolicy' | 'sandboxMode' | 'createdAt' | 'updatedAt'
   | 'costBudgetUsd' | 'costBudgetWarningSent'
   | 'relation' | 'parentThreadId'
   | 'forkedFromThreadId' | 'forkedFromTitle' | 'forkedAt' | 'forkedFromMessageCount' | 'forkedFromTurnCount'
@@ -83,8 +90,11 @@ export function toThreadSummary(
     title: thread.title,
     workspace: thread.workspace,
     model: thread.model,
+    ...(thread.providerId ? { providerId: thread.providerId } : {}),
     mode: thread.mode,
     status: thread.status,
+    approvalPolicy: thread.approvalPolicy,
+    sandboxMode: thread.sandboxMode,
     ...(thread.costBudgetUsd !== undefined ? { costBudgetUsd: thread.costBudgetUsd } : {}),
     ...(thread.costBudgetWarningSent !== undefined ? { costBudgetWarningSent: thread.costBudgetWarningSent } : {}),
     relation: thread.relation ?? 'primary',

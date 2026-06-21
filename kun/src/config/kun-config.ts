@@ -12,8 +12,15 @@ import {
   DEFAULT_KUN_CAPABILITIES_CONFIG,
   KunCapabilitiesConfig,
   ModelInputModality,
-  ModelMessagePartSupport
+  ModelMessagePartSupport,
+  ModelReasoningCapabilityMetadata
 } from '../contracts/capabilities.js'
+import {
+  DEFAULT_MODEL_ENDPOINT_FORMAT,
+  MODEL_ENDPOINT_FORMATS,
+  normalizeModelEndpointFormat
+} from '../contracts/model-endpoint-format.js'
+import { HooksConfigSchema } from '../hooks/hook-config.js'
 
 export const KUN_CONFIG_FILENAME = 'config.json'
 export const DEFAULT_KUN_MODEL = 'deepseek-v4-pro'
@@ -54,7 +61,14 @@ export const ModelContextProfileConfigSchema = z
     inputModalities: z.array(ModelInputModality).optional(),
     outputModalities: z.array(ModelInputModality).optional(),
     supportsToolCalling: z.boolean().optional(),
-    messageParts: z.array(ModelMessagePartSupport).optional()
+    messageParts: z.array(ModelMessagePartSupport).optional(),
+    reasoning: ModelReasoningCapabilityMetadata.optional(),
+    // Per-model wire-format override. Omitted means "inherit the
+    // provider/runtime endpointFormat" — no default coercion here, otherwise
+    // every model would be pinned to chat_completions.
+    endpointFormat: z
+      .preprocess(normalizeModelEndpointFormat, z.enum(MODEL_ENDPOINT_FORMATS))
+      .optional()
   })
   .strict()
   .superRefine((profile, ctx) => {
@@ -111,6 +125,10 @@ export const ContextCompactionConfigSchema = z
 
 export const RuntimeTuningConfigSchema = z
   .object({
+    // Max idle gap (ms) between streaming chunks before a turn fails with
+    // `stream_idle_timeout`. Local LLM servers prefilling a huge prompt can
+    // stay silent well past the 45s default; `0` disables the guard entirely.
+    streamIdleTimeoutMs: z.number().int().min(0).optional(),
     toolStorm: z
       .object({
         enabled: z.boolean().optional(),
@@ -125,6 +143,27 @@ export const RuntimeTuningConfigSchema = z
       })
       .strict()
       .optional()
+  })
+  .strict()
+
+/** Detection aggressiveness for the design-quality linter. */
+export const DESIGN_QUALITY_STRICTNESS = ['relaxed', 'standard', 'strict'] as const
+
+/**
+ * First-party design-quality linter. When enabled, a builtin PostToolUse
+ * hook scans frontend files the agent writes/edits and folds findings back
+ * into the tool result so the model self-corrects on the next turn.
+ */
+export const QualityConfigSchema = z
+  .object({
+    enabled: z.boolean().default(true),
+    strictness: z.enum(DESIGN_QUALITY_STRICTNESS).default('standard'),
+    /** Rule ids to suppress (see the quality detector registry). */
+    ignoreRules: z.array(z.string().min(1)).default([]),
+    /** Glob patterns (relative paths) to skip, e.g. `**\/vendor/**`. */
+    ignoreFiles: z.array(z.string().min(1)).default([]),
+    /** Hard cap on findings folded into a single tool result. */
+    maxFindings: z.number().int().positive().max(100).default(12)
   })
   .strict()
 
@@ -160,6 +199,25 @@ export const DEFAULT_STORAGE_CONFIG: StorageConfig = {
   backend: 'hybrid'
 }
 
+/**
+ * Per-`providerId` HTTP credentials. Lets the runtime route a thread's turns
+ * to a non-default provider without restart — the workflow / scheduled task
+ * UI picks a provider per request, the loop puts the id on `ModelRequest`,
+ * and `MultiProviderModelClient` resolves it against this map.
+ */
+export const ServeProviderConfigSchema = z
+  .object({
+    apiKey: z.string().default(''),
+    baseUrl: z.string().min(1),
+    endpointFormat: z
+      .preprocess(normalizeModelEndpointFormat, z.enum(MODEL_ENDPOINT_FORMATS))
+      .default(DEFAULT_MODEL_ENDPOINT_FORMAT)
+      .optional(),
+    modelProxyUrl: z.string().optional()
+  })
+  .strict()
+export type ServeProviderConfig = z.infer<typeof ServeProviderConfigSchema>
+
 export const KunServeConfigSchema = z
   .object({
     host: z.string().optional(),
@@ -168,13 +226,25 @@ export const KunServeConfigSchema = z
     runtimeToken: z.string().optional(),
     apiKey: z.string().optional(),
     baseUrl: z.string().optional(),
+    modelProxyUrl: z.string().optional(),
+    endpointFormat: z.preprocess(
+      normalizeModelEndpointFormat,
+      z.enum(MODEL_ENDPOINT_FORMATS)
+    ).default(DEFAULT_MODEL_ENDPOINT_FORMAT).optional(),
     model: z.string().min(1).optional(),
     approvalPolicy: ApprovalPolicySchema.default(DEFAULT_APPROVAL_POLICY).optional(),
     sandboxMode: SandboxModeSchema.default(DEFAULT_SANDBOX_MODE).optional(),
     tokenEconomyMode: z.boolean().optional(),
     tokenEconomy: TokenEconomyConfigSchema.optional(),
     insecure: z.boolean().optional(),
-    storage: StorageConfigSchema.optional()
+    storage: StorageConfigSchema.optional(),
+    /**
+     * Extra providers the runtime can route to per request. Keys are
+     * provider ids (matched against `ModelRequest.providerId`); values
+     * hold the same HTTP credentials shape as the runtime defaults. When
+     * empty/absent, the runtime stays single-provider.
+     */
+    providers: z.record(z.string().min(1), ServeProviderConfigSchema).optional()
   })
   .strict()
 
@@ -184,11 +254,15 @@ export const KunConfigSchema = z
     models: ModelConfigSchema.optional(),
     contextCompaction: ContextCompactionConfigSchema.optional(),
     runtime: RuntimeTuningConfigSchema.optional(),
-    capabilities: KunCapabilitiesConfig.default(DEFAULT_KUN_CAPABILITIES_CONFIG)
+    capabilities: KunCapabilitiesConfig.default(DEFAULT_KUN_CAPABILITIES_CONFIG),
+    hooks: HooksConfigSchema.optional(),
+    quality: QualityConfigSchema.optional()
   })
   .strict()
 
 export type KunConfig = z.infer<typeof KunConfigSchema>
+export type QualityConfig = z.infer<typeof QualityConfigSchema>
+export const DEFAULT_QUALITY_CONFIG: QualityConfig = QualityConfigSchema.parse({})
 export type KunServeConfig = z.infer<typeof KunServeConfigSchema>
 export type ModelConfig = z.infer<typeof ModelConfigSchema>
 export type ContextCompactionConfig = z.infer<typeof ContextCompactionConfigSchema>

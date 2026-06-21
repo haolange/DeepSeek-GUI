@@ -2,21 +2,45 @@ import type {
   CoreAttachmentContentResponseJson,
   CoreAttachmentMetadataJson,
   CoreAttachmentTextFallbackJson,
+  CoreMemoryDiagnosticsJson,
   CoreMemoryRecordJson,
   CoreRuntimeInfoJson,
   CoreRuntimeSkillJson,
   CoreRuntimeToolDiagnosticsJson
 } from './kun-contract'
+import type { ApprovalPolicy, SandboxMode } from '@shared/app-settings'
 
 export type ToolItemKind = 'tool_call' | 'command_execution' | 'file_change'
+export type RuntimeErrorSeverity = 'info' | 'warning' | 'error'
 
 export type AttachmentReference = {
   id: string
   name?: string
   mimeType?: string
+  byteSize?: number
   width?: number
   height?: number
   previewUrl?: string
+}
+
+export type GeneratedFileReference = {
+  id?: string
+  name?: string
+  mimeType?: string
+  byteSize?: number
+  width?: number
+  height?: number
+  previewUrl?: string
+  path?: string
+  relativePath?: string
+  absolutePath?: string
+}
+
+export type UserFileReference = {
+  path: string
+  relativePath: string
+  name: string
+  kind?: 'file' | 'directory'
 }
 
 export type RuntimeChildMetadata = {
@@ -37,8 +61,12 @@ export type WebCitationSource = {
 
 export type RuntimeDisclosureMetadata = {
   displayText?: string
+  turnId?: string
+  workspaceCheckpointId?: string
   attachmentIds?: string[]
   attachments?: AttachmentReference[]
+  fileReferences?: UserFileReference[]
+  generatedFiles?: GeneratedFileReference[]
   activeSkillIds?: string[]
   injectedMemoryIds?: string[]
   skillInjectionBytes?: number
@@ -72,6 +100,8 @@ export type NormalizedThread = {
   mode: string
   workspace?: string
   status?: string
+  approvalPolicy?: ApprovalPolicy
+  sandboxMode?: SandboxMode
   archived?: boolean
   preview?: string
   latestTurnId?: string
@@ -207,18 +237,27 @@ export type ChatBlock =
   | {
       kind: 'user'
       id: string
+      turnId?: string
       createdAt?: string
       text: string
       modelLabel?: string
       managedBy?: 'claw'
       meta?: RuntimeDisclosureMetadata
     }
-  | { kind: 'assistant'; id: string; createdAt?: string; text: string }
+  | { kind: 'assistant'; id: string; turnId?: string; createdAt?: string; text: string }
   | { kind: 'reasoning'; id: string; createdAt?: string; text: string }
   | ToolBlock
   | CompactionBlock
   | ReviewBlock
-  | { kind: 'system'; id: string; createdAt?: string; text: string }
+  | {
+      kind: 'system'
+      id: string
+      createdAt?: string
+      text: string
+      code?: string
+      detail?: string
+      severity?: RuntimeErrorSeverity
+    }
   | {
       kind: 'approval'
       id: string
@@ -274,6 +313,15 @@ export type RuntimeStatusEventPayload = {
   callId?: string
 }
 
+export type RuntimeErrorEventPayload = {
+  itemId: string
+  createdAt?: string
+  message: string
+  code?: string
+  details?: unknown
+  severity?: RuntimeErrorSeverity
+}
+
 export type CompactionEventPayload = {
   itemId: string
   summary: string
@@ -324,6 +372,10 @@ export type ThreadDeltaEvent = {
   seq?: number
 }
 
+export type ThreadErrorOptions = {
+  terminal?: boolean
+}
+
 /** Cumulative usage/cost for a Kun thread. */
 export type ThreadUsageSnapshot = {
   inputTokens: number
@@ -335,11 +387,7 @@ export type ThreadUsageSnapshot = {
   totalTokens: number
   costUsd: number
   costCny: number | null
-  cacheSavingsUsd: number
-  cacheSavingsCny: number | null
   tokenEconomySavingsTokens: number
-  tokenEconomySavingsUsd: number
-  tokenEconomySavingsCny: number | null
   turns: number
 }
 
@@ -354,10 +402,11 @@ export type ThreadEventSink = {
   onUserInput(req: UserInputRequestPayload): void
   onUserInputStatus(ev: UserInputStatusPayload): void
   onRuntimeStatus?(ev: RuntimeStatusEventPayload): void
+  onRuntimeError?(ev: RuntimeErrorEventPayload): void
   onGoal(ev: { threadId: string; goal: ThreadGoal | null; cleared?: boolean; createdAt?: string }): void
   onTodos?(ev: { threadId: string; todos: ThreadTodoList | null; cleared?: boolean; createdAt?: string }): void
   onTurnComplete(): void
-  onError(err: Error): void
+  onError(err: Error, options?: ThreadErrorOptions): void
   /** Optional: cumulative usage update for the thread. */
   onUsage?(usage: ThreadUsageSnapshot): void
 }
@@ -403,8 +452,11 @@ export interface AgentProvider {
         title?: string
       }
       attachmentIds?: string[]
+      workspaceCheckpointId?: string
+      fileReferences?: UserFileReference[]
     }
   ): Promise<{ turnId: string; threadId: string; userMessageItemId?: string }>
+  rewindThread?(threadId: string, turnId: string): Promise<void>
   reviewThread?(
     threadId: string,
     target: ReviewTarget,
@@ -417,6 +469,7 @@ export interface AgentProvider {
     name: string
     mimeType?: string
     dataBase64: string
+    localFilePath?: string
     textFallback?: CoreAttachmentTextFallbackJson
     threadId?: string
     workspace?: string
@@ -426,17 +479,28 @@ export interface AgentProvider {
     options?: { threadId?: string; workspace?: string }
   ): Promise<CoreAttachmentContentResponseJson>
   listMemories?(options?: { workspace?: string; includeDeleted?: boolean }): Promise<CoreMemoryRecordJson[]>
+  createMemory?(input: {
+    content: string
+    scope?: 'user' | 'workspace' | 'project'
+    workspace?: string
+    project?: string
+    tags?: string[]
+    confidence?: number
+  }): Promise<CoreMemoryRecordJson>
   updateMemory?(
     memoryId: string,
-    patch: { content?: string; tags?: string[]; confidence?: number; disabled?: boolean }
+    patch: { content?: string; tags?: string[]; confidence?: number; disabled?: boolean },
+    options?: { workspace?: string }
   ): Promise<CoreMemoryRecordJson>
-  deleteMemory?(memoryId: string): Promise<CoreMemoryRecordJson>
+  deleteMemory?(memoryId: string, options?: { workspace?: string }): Promise<CoreMemoryRecordJson>
+  getMemoryDiagnostics?(): Promise<CoreMemoryDiagnosticsJson>
   steerUserMessage?(threadId: string, turnId: string, text: string): Promise<void>
   interruptTurn(threadId: string, turnId: string, options?: { discard?: boolean }): Promise<void>
   renameThread(threadId: string, title: string): Promise<void>
+  updateThreadWorkspace?(threadId: string, workspace: string): Promise<void>
   archiveThread?(threadId: string, archived: boolean): Promise<void>
   deleteThread(threadId: string): Promise<void>
-  compactThread?(threadId: string, reason?: string): Promise<void>
+  compactThread?(threadId: string, reason?: string): Promise<{ replacedTokens: number } | void>
   getThreadGoal?(threadId: string): Promise<ThreadGoal | null>
   setThreadGoal?(
     threadId: string,
@@ -456,7 +520,7 @@ export interface AgentProvider {
   clearThreadTodos?(threadId: string): Promise<boolean>
   forkThread?(
     threadId: string,
-    options?: { relation?: 'primary' | 'fork' | 'side'; title?: string }
+    options?: { relation?: 'primary' | 'fork' | 'side'; title?: string; turnId?: string }
   ): Promise<NormalizedThread>
   resumeSession?(
     sessionId: string,

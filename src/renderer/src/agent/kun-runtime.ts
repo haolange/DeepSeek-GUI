@@ -23,6 +23,7 @@ import {
   kunThreadForkPath,
   kunThreadGoalPath,
   kunThreadReviewPath,
+  kunThreadRewindPath,
   kunThreadTodosPath,
   kunThreadInterruptPath,
   kunThreadPath,
@@ -63,7 +64,7 @@ import type {
 import {
   buildQuery,
   chatBlockFromItem,
-  dispatchKunRuntimeEvent,
+  dispatchKunRuntimeEvents,
   goalFromCore,
   mergeChatBlocks,
   todosFromCore,
@@ -77,6 +78,19 @@ function createSseStreamId(): string {
 
 function readRuntimeError(body: string, fallback: string): RuntimeError {
   return parseRuntimeErrorBody(body, fallback)
+}
+
+function normalizeApprovalPolicy(value: string | undefined): NormalizedThread['approvalPolicy'] {
+  switch (value) {
+    case 'auto':
+    case 'on-request':
+    case 'untrusted':
+    case 'suggest':
+    case 'never':
+      return value
+    default:
+      return undefined
+  }
 }
 
 function readRuntimeJson<T>(body: string, fallback: string): T {
@@ -191,7 +205,8 @@ export class KunRuntimeProvider implements AgentProvider {
         attachmentIds: turn.attachmentIds,
         activeSkillIds: turn.activeSkillIds,
         injectedMemoryIds: turn.injectedMemoryIds,
-        skillInjectionBytes: turn.skillInjectionBytes
+        skillInjectionBytes: turn.skillInjectionBytes,
+        workspaceCheckpointId: item.workspaceCheckpointId ?? turn.workspaceCheckpointId
       }))
     )
     const blocks = mergeChatBlocks(items.flatMap((item) => {
@@ -228,9 +243,18 @@ export class KunRuntimeProvider implements AgentProvider {
         title?: string
       }
       attachmentIds?: string[]
+      workspaceCheckpointId?: string
+      fileReferences?: Array<{ path: string; relativePath: string; name: string; kind?: 'file' | 'directory' }>
     }
   ): Promise<{ turnId: string; threadId: string; userMessageItemId?: string }> {
-    const body: Record<string, unknown> = { prompt: text, model: options?.model }
+    const settings = await rendererRuntimeClient.getSettings()
+    const runtime = getKunRuntimeSettings(settings)
+    const body: Record<string, unknown> = {
+      prompt: text,
+      model: options?.model,
+      approvalPolicy: runtime.approvalPolicy,
+      sandboxMode: runtime.sandboxMode
+    }
     if (options?.reasoningEffort?.trim()) {
       body.reasoningEffort = options.reasoningEffort.trim()
     }
@@ -254,6 +278,12 @@ export class KunRuntimeProvider implements AgentProvider {
     if (options?.attachmentIds?.length) {
       body.attachmentIds = options.attachmentIds
     }
+    if (options?.workspaceCheckpointId?.trim()) {
+      body.workspaceCheckpointId = options.workspaceCheckpointId.trim()
+    }
+    if (options?.fileReferences?.length) {
+      body.fileReferences = options.fileReferences
+    }
     const response = await rendererRuntimeClient.runtimeRequest(
       kunThreadTurnsPath(threadId),
       'POST',
@@ -270,6 +300,17 @@ export class KunRuntimeProvider implements AgentProvider {
       threadId: parsed.threadId,
       turnId: parsed.turnId,
       userMessageItemId: parsed.userMessageItemId
+    }
+  }
+
+  async rewindThread(threadId: string, turnId: string): Promise<void> {
+    const response = await rendererRuntimeClient.runtimeRequest(
+      kunThreadRewindPath(threadId),
+      'POST',
+      JSON.stringify({ turnId })
+    )
+    if (!response.ok) {
+      throw runtimeErrorToError(readRuntimeError(response.body, 'failed to rewind thread'))
     }
   }
 
@@ -335,8 +376,19 @@ export class KunRuntimeProvider implements AgentProvider {
     }
   }
 
+  async updateThreadWorkspace(threadId: string, workspace: string): Promise<void> {
+    const response = await rendererRuntimeClient.runtimeRequest(
+      kunThreadPath(threadId),
+      'PATCH',
+      JSON.stringify({ workspace })
+    )
+    if (!response.ok) {
+      throw runtimeErrorToError(readRuntimeError(response.body, 'update thread workspace failed'))
+    }
+  }
+
   async archiveThread(threadId: string, archived: boolean): Promise<void> {
-    const response = await window.dsGui.runtimeRequest(
+    const response = await window.kunGui.runtimeRequest(
       kunThreadPath(threadId),
       'PATCH',
       JSON.stringify({ status: archived ? 'archived' : 'idle' })
@@ -353,7 +405,7 @@ export class KunRuntimeProvider implements AgentProvider {
     }
   }
 
-  async compactThread(threadId: string, reason?: string): Promise<void> {
+  async compactThread(threadId: string, reason?: string): Promise<{ replacedTokens: number }> {
     const response = await rendererRuntimeClient.runtimeRequest(
       kunThreadCompactPath(threadId),
       'POST',
@@ -361,6 +413,19 @@ export class KunRuntimeProvider implements AgentProvider {
     )
     if (!response.ok) {
       throw runtimeErrorToError(readRuntimeError(response.body, 'compact thread failed'))
+    }
+    // Surface the folded token count so the UI can drop the context gauge
+    // immediately. Heuristic compaction has no usage event, and model-summary
+    // usage can arrive separately from the compact response. Best-effort: a
+    // parse hiccup must not turn a successful compaction into a thrown error.
+    try {
+      const body = readRuntimeJson<{ replacedTokens?: number }>(
+        response.body,
+        'runtime returned an invalid compact response'
+      )
+      return { replacedTokens: Math.max(0, Math.floor(body.replacedTokens ?? 0)) }
+    } catch {
+      return { replacedTokens: 0 }
     }
   }
 
@@ -549,6 +614,7 @@ export class KunRuntimeProvider implements AgentProvider {
     name: string
     mimeType?: string
     dataBase64: string
+    localFilePath?: string
     textFallback?: CoreAttachmentTextFallbackJson
     threadId?: string
     workspace?: string
@@ -614,12 +680,36 @@ export class KunRuntimeProvider implements AgentProvider {
     ).memories ?? []
   }
 
+  async createMemory(input: {
+    content: string
+    scope?: 'user' | 'workspace' | 'project'
+    workspace?: string
+    project?: string
+    tags?: string[]
+    confidence?: number
+  }): Promise<CoreMemoryRecordJson> {
+    const response = await rendererRuntimeClient.runtimeRequest(
+      KUN_MEMORY_PATH,
+      'POST',
+      JSON.stringify(input)
+    )
+    if (!response.ok) {
+      throw runtimeErrorToError(readRuntimeError(response.body, 'failed to create memory'))
+    }
+    return readRuntimeJson<{ memory: CoreMemoryRecordJson }>(
+      response.body,
+      'runtime returned an invalid memory response'
+    ).memory
+  }
+
   async updateMemory(
     memoryId: string,
-    patch: { content?: string; tags?: string[]; confidence?: number; disabled?: boolean }
+    patch: { content?: string; tags?: string[]; confidence?: number; disabled?: boolean },
+    options: { workspace?: string } = {}
   ): Promise<CoreMemoryRecordJson> {
+    const query = buildQuery({ workspace: options.workspace })
     const response = await rendererRuntimeClient.runtimeRequest(
-      kunMemoryRecordPath(memoryId),
+      `${kunMemoryRecordPath(memoryId)}${query}`,
       'PATCH',
       JSON.stringify(patch)
     )
@@ -632,8 +722,9 @@ export class KunRuntimeProvider implements AgentProvider {
     ).memory
   }
 
-  async deleteMemory(memoryId: string): Promise<CoreMemoryRecordJson> {
-    const response = await rendererRuntimeClient.runtimeRequest(kunMemoryRecordPath(memoryId), 'DELETE')
+  async deleteMemory(memoryId: string, options: { workspace?: string } = {}): Promise<CoreMemoryRecordJson> {
+    const query = buildQuery({ workspace: options.workspace })
+    const response = await rendererRuntimeClient.runtimeRequest(`${kunMemoryRecordPath(memoryId)}${query}`, 'DELETE')
     if (!response.ok) {
       throw runtimeErrorToError(readRuntimeError(response.body, 'failed to delete memory'))
     }
@@ -656,11 +747,12 @@ export class KunRuntimeProvider implements AgentProvider {
 
   async forkThread(
     threadId: string,
-    options?: { relation?: 'primary' | 'fork' | 'side'; title?: string }
+    options?: { relation?: 'primary' | 'fork' | 'side'; title?: string; turnId?: string }
   ): Promise<NormalizedThread> {
     const body: Record<string, unknown> = {}
     if (options?.relation) body.relation = options.relation
     if (options?.title) body.title = options.title
+    if (options?.turnId) body.turnId = options.turnId
     const url = kunThreadForkPath(threadId)
     const response =
       Object.keys(body).length > 0
@@ -726,13 +818,32 @@ export class KunRuntimeProvider implements AgentProvider {
         signal.removeEventListener('abort', onAbort)
         void Promise.allSettled([...pendingDispatches]).then(() => resolve())
       }
-      const offData = rendererRuntimeClient.onSseEvent(({ streamId: sid, data }) => {
-        if (sid !== streamId) return
-        const event = data && typeof data === 'object' ? (data as CoreRuntimeEventJson) : {}
-        if (typeof event.seq === 'number') {
-          sink.onSeq(event.seq)
+      const offData = rendererRuntimeClient.onSseEvent((payload) => {
+        if (payload.streamId !== streamId) return
+        // Older main processes (pre-batching) deliver a single event under
+        // `data`; accept both shapes so a stale main/renderer pair during a
+        // dev reload or partial update degrades gracefully instead of
+        // silently dropping the stream.
+        const legacySingle = (payload as { data?: unknown }).data
+        const rawEvents = Array.isArray(payload.events)
+          ? payload.events
+          : legacySingle !== undefined
+            ? [legacySingle]
+            : []
+        const batch = rawEvents.map((entry): CoreRuntimeEventJson =>
+          entry && typeof entry === 'object' ? (entry as CoreRuntimeEventJson) : {}
+        )
+        if (batch.length === 0) return
+        let maxSeq: number | null = null
+        for (const event of batch) {
+          if (typeof event.seq === 'number') {
+            maxSeq = maxSeq === null ? event.seq : Math.max(maxSeq, event.seq)
+          }
         }
-        const task = dispatchKunRuntimeEvent(event, sink, (runtimeEvent, eventSink) =>
+        if (maxSeq !== null) {
+          sink.onSeq(maxSeq)
+        }
+        const task = dispatchKunRuntimeEvents(batch, sink, (runtimeEvent, eventSink) =>
           this.handleApprovalRequest(runtimeEvent, eventSink)
         ).finally(() => {
           pendingDispatches.delete(task)
@@ -771,8 +882,8 @@ export class KunRuntimeProvider implements AgentProvider {
     const approvalId = event.approvalId ?? event.itemId ?? ''
     if (!approvalId) return
     try {
-      const settings = await rendererRuntimeClient.getSettings()
-      const policy = getKunRuntimeSettings(settings).approvalPolicy
+      const eventPolicy = normalizeApprovalPolicy(event.approvalPolicy)
+      const policy = eventPolicy ?? getKunRuntimeSettings(await rendererRuntimeClient.getSettings()).approvalPolicy
       switch (policy) {
         case 'auto':
           await this.submitApprovalDecision(approvalId, 'allow')

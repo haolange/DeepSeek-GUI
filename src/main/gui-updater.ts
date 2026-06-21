@@ -1,4 +1,5 @@
-import { app, autoUpdater as nativeAutoUpdater, BrowserWindow } from 'electron'
+import { app, autoUpdater as nativeAutoUpdater, BrowserWindow, dialog, shell } from 'electron'
+import type { MessageBoxOptions } from 'electron'
 import { existsSync, readFileSync } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
@@ -15,9 +16,19 @@ import type {
 import { nextGuiUpdateCheckDelay } from '../shared/gui-update-schedule'
 import { DEFAULT_GUI_UPDATE_CHANNEL, normalizeGuiUpdateChannel } from '../shared/gui-update'
 
-const DEFAULT_R2_PUBLIC_BASE_URL = 'https://deepseek-gui.com/api/r2'
+// R2 prefix 保持旧值:线上还在运行的 DeepSeek GUI 老版本轮询的
+// 就是 `deepseek-gui/channels/<channel>/latest/`,prefix 一改老客户端
+// 就再也收不到 Kun 的升级包。域名优先使用 kun-agent,旧域名仅作兜底。
+const PRIMARY_R2_PUBLIC_BASE_URL = 'https://www.kun-agent.com/api/r2'
+const SECONDARY_R2_PUBLIC_BASE_URL = 'https://kun-agent.com/api/r2'
+const LEGACY_R2_PUBLIC_BASE_URL = 'https://deepseek-gui.com/api/r2'
 const DEFAULT_R2_RELEASE_PREFIX = 'deepseek-gui'
+const UPDATE_FEED_PROBE_TIMEOUT_MS = 5_000
 const { autoUpdater } = electronUpdater
+
+function envWithLegacyFallback(kunName: string, legacyName: string): string {
+  return process.env[kunName]?.trim() || process.env[legacyName]?.trim() || ''
+}
 
 let initialized = false
 let getMainWindow: (() => BrowserWindow | null) | null = null
@@ -26,16 +37,28 @@ let lastState: GuiUpdateState = { status: 'idle' }
 let downloaded = false
 let downloadPromise: Promise<string[]> | null = null
 let configuredChannel: GuiUpdateChannel = normalizeGuiUpdateChannel(
-  process.env.DEEPSEEK_GUI_UPDATE_CHANNEL?.trim()
+  envWithLegacyFallback('KUN_UPDATE_CHANNEL', 'DEEPSEEK_GUI_UPDATE_CHANNEL') || undefined
 )
 let configuredFeedUrl = ''
 let getSelectedChannel: (() => GuiUpdateChannel | Promise<GuiUpdateChannel>) | null = null
+let getSelectedLocale: (() => 'en' | 'zh' | Promise<'en' | 'zh'>) | null = null
 let beforeInstallUpdate: (() => void | Promise<void>) | null = null
 let beforeInstallUpdatePromise: Promise<void> | null = null
+let pendingVersionStateWrite: Promise<void> | null = null
 let backgroundCheckTimer: NodeJS.Timeout | null = null
 let backgroundCheckPromise: Promise<void> | null = null
 
 const GUI_UPDATE_SCHEDULE_FILE = 'gui-update-schedule.json'
+const GUI_VERSION_STATE_FILE = 'gui-version-state.json'
+const DEFAULT_CHANGELOG_URL = 'https://deepseek-gui.com/changelog'
+
+type GuiVersionState = {
+  lastSeenVersion?: string
+  pendingUpdate?: {
+    version: string
+    releaseNotes?: string
+  }
+}
 
 function trimSlashes(value: string): string {
   return value.replace(/^\/+|\/+$/g, '')
@@ -52,22 +75,129 @@ function joinUrl(base: string, ...parts: string[]): string {
 }
 
 function envUpdateUrl(channel: GuiUpdateChannel): string {
-  const channelSpecific = process.env[`DEEPSEEK_GUI_UPDATE_URL_${channel.toUpperCase()}`]?.trim()
-  const direct = channelSpecific || process.env.DEEPSEEK_GUI_UPDATE_URL?.trim() || ''
+  const channelSpecific = envWithLegacyFallback(
+    `KUN_UPDATE_URL_${channel.toUpperCase()}`,
+    `DEEPSEEK_GUI_UPDATE_URL_${channel.toUpperCase()}`
+  )
+  const direct = channelSpecific || envWithLegacyFallback('KUN_UPDATE_URL', 'DEEPSEEK_GUI_UPDATE_URL')
   return direct ? direct.replace(/\{channel\}/g, channel).replace(/\/?$/, '/') : ''
 }
 
-function updateFeedUrl(channel: GuiUpdateChannel): string {
-  const direct = envUpdateUrl(channel)
-  if (direct) return direct
+function uniqueStrings(values: string[]): string[] {
+  return Array.from(new Set(values.filter(Boolean)))
+}
 
-  const base = process.env.R2_PUBLIC_BASE_URL?.trim() || DEFAULT_R2_PUBLIC_BASE_URL
+function defaultR2BaseUrls(): string[] {
+  const configured = process.env.R2_PUBLIC_BASE_URL?.trim()
+  if (configured) return [configured]
+  return [PRIMARY_R2_PUBLIC_BASE_URL, SECONDARY_R2_PUBLIC_BASE_URL, LEGACY_R2_PUBLIC_BASE_URL]
+}
+
+function updateFeedUrlCandidates(channel: GuiUpdateChannel): string[] {
+  const direct = envUpdateUrl(channel)
+  if (direct) return [direct]
+
   const prefix = process.env.R2_RELEASE_PREFIX?.trim() || DEFAULT_R2_RELEASE_PREFIX
-  return `${joinUrl(base, prefix, 'channels', channel, 'latest')}/`
+  return uniqueStrings(
+    defaultR2BaseUrls().map((base) => `${joinUrl(base, prefix, 'channels', channel, 'latest')}/`)
+  )
+}
+
+function updateFeedUrl(channel: GuiUpdateChannel): string {
+  return updateFeedUrlCandidates(channel)[0]
+}
+
+function updateFeedManifestUrl(feedUrl: string): string {
+  return `${feedUrl}${platformManifestName()}`
+}
+
+async function isUpdateFeedAccessible(feedUrl: string): Promise<boolean> {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), UPDATE_FEED_PROBE_TIMEOUT_MS)
+  try {
+    const res = await fetch(updateFeedManifestUrl(feedUrl), {
+      method: 'HEAD',
+      headers: {
+        Accept: 'application/x-yaml,text/yaml,text/plain,*/*',
+        'User-Agent': `kun/${app.getVersion()}`
+      },
+      signal: controller.signal
+    })
+    return res.ok
+  } catch {
+    return false
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+async function resolveUpdateFeedUrl(channel: GuiUpdateChannel): Promise<string> {
+  const candidates = updateFeedUrlCandidates(channel)
+  if (candidates.length <= 1) return candidates[0]
+
+  for (const candidate of candidates) {
+    if (await isUpdateFeedAccessible(candidate)) return candidate
+  }
+  return candidates[candidates.length - 1]
 }
 
 function guiUpdateSchedulePath(): string {
   return join(app.getPath('userData'), GUI_UPDATE_SCHEDULE_FILE)
+}
+
+function guiVersionStatePath(): string {
+  return join(app.getPath('userData'), GUI_VERSION_STATE_FILE)
+}
+
+async function readGuiVersionState(): Promise<GuiVersionState> {
+  try {
+    const raw = await readFile(guiVersionStatePath(), 'utf8')
+    const parsed = JSON.parse(raw) as GuiVersionState
+    return parsed && typeof parsed === 'object' ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+async function writeGuiVersionState(state: GuiVersionState): Promise<void> {
+  const path = guiVersionStatePath()
+  await mkdir(dirname(path), { recursive: true })
+  await writeFile(path, JSON.stringify(state, null, 2), 'utf8')
+}
+
+function changelogUrl(): string {
+  return envWithLegacyFallback('KUN_CHANGELOG_URL', 'DEEPSEEK_GUI_CHANGELOG_URL') || DEFAULT_CHANGELOG_URL
+}
+
+function normalizeReleaseNotes(value: unknown): string | undefined {
+  if (typeof value === 'string') return value.trim() || undefined
+  if (!Array.isArray(value)) return undefined
+  const notes = value
+    .map((entry) => {
+      if (!entry || typeof entry !== 'object' || !('note' in entry)) return ''
+      return typeof entry.note === 'string' ? entry.note.trim() : ''
+    })
+    .filter(Boolean)
+  return notes.length > 0 ? notes.join('\n\n') : undefined
+}
+
+async function recordPendingUpdate(updateInfo: UpdateInfo): Promise<void> {
+  const state = await readGuiVersionState()
+  await writeGuiVersionState({
+    ...state,
+    pendingUpdate: {
+      version: updateInfo.version.trim(),
+      releaseNotes: normalizeReleaseNotes(updateInfo.releaseNotes)
+    }
+  })
+}
+
+async function selectedLocale(): Promise<'en' | 'zh'> {
+  try {
+    return (await getSelectedLocale?.()) === 'zh' ? 'zh' : 'en'
+  } catch {
+    return app.getLocale().toLowerCase().startsWith('zh') ? 'zh' : 'en'
+  }
 }
 
 async function readLastScheduledCheckAt(): Promise<number | null> {
@@ -134,7 +264,7 @@ function resolveGithubReleaseUrl(): string | null {
 }
 
 function downloadPageUrl(): string {
-  const direct = process.env.DEEPSEEK_GUI_DOWNLOAD_URL?.trim()
+  const direct = envWithLegacyFallback('KUN_DOWNLOAD_URL', 'DEEPSEEK_GUI_DOWNLOAD_URL')
   if (direct) return direct
 
   const pkg = readPackageJson()
@@ -307,7 +437,7 @@ async function runScheduledGuiUpdateCheck(): Promise<void> {
       await writeLastScheduledCheckAt(nowMs)
       await checkGuiUpdate()
     } catch (error) {
-      console.warn('[deepseek-gui updater] scheduled GUI update check failed:', error)
+      console.warn('[kun-gui updater] scheduled GUI update check failed:', error)
     } finally {
       backgroundCheckPromise = null
       void scheduleNextBackgroundCheck()
@@ -324,9 +454,8 @@ async function resolveUpdateChannel(requested?: GuiUpdateChannel): Promise<GuiUp
   return DEFAULT_GUI_UPDATE_CHANNEL
 }
 
-function configureUpdaterChannel(channel: GuiUpdateChannel): void {
+function configureUpdaterChannel(channel: GuiUpdateChannel, feedUrl = updateFeedUrl(channel)): void {
   const normalized = normalizeGuiUpdateChannel(channel)
-  const feedUrl = updateFeedUrl(normalized)
   const changed = normalized !== configuredChannel || feedUrl !== configuredFeedUrl
   configuredChannel = normalized
   configuredFeedUrl = feedUrl
@@ -339,6 +468,10 @@ function configureUpdaterChannel(channel: GuiUpdateChannel): void {
   emitGuiUpdateState({ status: 'idle' })
 }
 
+async function configureReachableUpdaterChannel(channel: GuiUpdateChannel): Promise<void> {
+  configureUpdaterChannel(channel, await resolveUpdateFeedUrl(channel))
+}
+
 export function setGuiUpdateChannel(channel: GuiUpdateChannel): void {
   configureUpdaterChannel(channel)
 }
@@ -349,11 +482,14 @@ async function checkManualUpdate(
 ): Promise<GuiUpdateInfo> {
   const currentVersion = app.getVersion()
   try {
-    const url = `${updateFeedUrl(channel)}${platformManifestName()}`
+    const feedUrl = configuredChannel === channel && configuredFeedUrl
+      ? configuredFeedUrl
+      : await resolveUpdateFeedUrl(channel)
+    const url = updateFeedManifestUrl(feedUrl)
     const res = await fetch(url, {
       headers: {
         Accept: 'application/x-yaml,text/yaml,text/plain,*/*',
-        'User-Agent': `deepseek-gui/${currentVersion}`
+        'User-Agent': `kun/${currentVersion}`
       }
     })
     if (!res.ok) {
@@ -407,11 +543,13 @@ async function checkManualUpdate(
 export function initializeGuiUpdater(
   windowGetter: () => BrowserWindow | null,
   channelGetter?: () => GuiUpdateChannel | Promise<GuiUpdateChannel>,
-  beforeInstall?: () => void | Promise<void>
+  beforeInstall?: () => void | Promise<void>,
+  localeGetter?: () => 'en' | 'zh' | Promise<'en' | 'zh'>
 ): void {
   getMainWindow = windowGetter
   getSelectedChannel = channelGetter ?? null
   beforeInstallUpdate = beforeInstall ?? null
+  getSelectedLocale = localeGetter ?? null
   if (initialized) return
   initialized = true
 
@@ -423,9 +561,9 @@ export function initializeGuiUpdater(
   }
 
   autoUpdater.logger = {
-    info: (message?: unknown) => console.info('[deepseek-gui updater]', message),
-    warn: (message?: unknown) => console.warn('[deepseek-gui updater]', message),
-    error: (message?: unknown) => console.error('[deepseek-gui updater]', message)
+    info: (message?: unknown) => console.info('[kun-gui updater]', message),
+    warn: (message?: unknown) => console.warn('[kun-gui updater]', message),
+    error: (message?: unknown) => console.error('[kun-gui updater]', message)
   }
 
   autoUpdater.on('checking-for-update', () => {
@@ -454,6 +592,13 @@ export function initializeGuiUpdater(
     downloaded = true
     const info = toGuiInfo(event, true)
     lastInfo = info
+    pendingVersionStateWrite = recordPendingUpdate(event)
+      .catch((error) => {
+        console.warn('[kun-gui updater] failed to save release notes:', error)
+      })
+      .finally(() => {
+        pendingVersionStateWrite = null
+      })
     emitGuiUpdateState({ status: 'downloaded', info })
   })
 
@@ -464,11 +609,50 @@ export function initializeGuiUpdater(
 
   nativeAutoUpdater?.on?.('before-quit-for-update', () => {
     void runBeforeInstallUpdate().catch((error) => {
-      console.warn('[deepseek-gui updater] failed to stop runtimes before update quit:', error)
+      console.warn('[kun-gui updater] failed to stop runtimes before update quit:', error)
     })
   })
 
   void scheduleNextBackgroundCheck()
+}
+
+export async function showPostUpdateReleaseNotes(): Promise<void> {
+  const currentVersion = app.getVersion().trim()
+  const state = await readGuiVersionState()
+  if (!state.lastSeenVersion) {
+    await writeGuiVersionState({ ...state, lastSeenVersion: currentVersion })
+    return
+  }
+  if (state.lastSeenVersion === currentVersion) return
+
+  const pendingUpdate =
+    state.pendingUpdate?.version === currentVersion ? state.pendingUpdate : undefined
+  await writeGuiVersionState({ lastSeenVersion: currentVersion })
+
+  const locale = await selectedLocale()
+  const isZh = locale === 'zh'
+  const options: MessageBoxOptions = {
+    type: 'info',
+    title: isZh ? 'Kun 已更新' : 'Kun updated',
+    message: isZh ? `已更新到 Kun ${currentVersion}` : `Kun has been updated to ${currentVersion}`,
+    detail:
+      pendingUpdate?.releaseNotes ??
+      (isZh
+        ? '此版本的完整更新内容可在 Kun 更新日志中查看。'
+        : 'See the Kun changelog for the complete release notes.'),
+    buttons: isZh ? ['查看更新日志', '稍后'] : ['View changelog', 'Later'],
+    defaultId: 0,
+    cancelId: 1,
+    noLink: true
+  }
+  const window = getMainWindow?.()
+  const result =
+    window && !window.isDestroyed()
+      ? await dialog.showMessageBox(window, options)
+      : await dialog.showMessageBox(options)
+  if (result.response === 0) {
+    await shell.openExternal(changelogUrl())
+  }
 }
 
 export function getGuiUpdateState(): GuiUpdateState {
@@ -477,7 +661,7 @@ export function getGuiUpdateState(): GuiUpdateState {
 
 export async function checkGuiUpdate(channel?: GuiUpdateChannel): Promise<GuiUpdateInfo> {
   const selectedChannel = await resolveUpdateChannel(channel)
-  configureUpdaterChannel(selectedChannel)
+  await configureReachableUpdaterChannel(selectedChannel)
 
   if (!macAutoUpdateAllowed()) {
     return checkManualUpdate(selectedChannel, 'unsupported')
@@ -510,7 +694,7 @@ export async function checkGuiUpdate(channel?: GuiUpdateChannel): Promise<GuiUpd
 
 export async function downloadGuiUpdate(channel?: GuiUpdateChannel): Promise<GuiUpdateDownloadResult> {
   const selectedChannel = await resolveUpdateChannel(channel)
-  configureUpdaterChannel(selectedChannel)
+  await configureReachableUpdaterChannel(selectedChannel)
 
   if (!macAutoUpdateAllowed()) {
     return {
@@ -567,7 +751,7 @@ export async function installGuiUpdate(): Promise<GuiUpdateInstallResult> {
       }
     }
     emitGuiUpdateState({ status: 'installing', info: lastInfo ?? undefined })
-    await runBeforeInstallUpdate()
+    await Promise.all([pendingVersionStateWrite, runBeforeInstallUpdate()])
     autoUpdater.quitAndInstall(false, true)
     return { ok: true }
   } catch (e) {

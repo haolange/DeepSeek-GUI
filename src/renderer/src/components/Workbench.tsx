@@ -1,17 +1,38 @@
 import type { ReactElement } from 'react'
-import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useShallow } from 'zustand/react/shallow'
+import {
+  modelSupportsImageInput,
+  type ApprovalPolicy,
+  type ModelProviderModelProfileV1,
+  type SandboxMode
+} from '@shared/app-settings'
 import { parseClawCommand } from '@shared/claw-commands'
 import { DEFAULT_COMPOSER_MODEL_IDS } from '@shared/default-composer-models'
 import { buildGuiPlanId, buildPlanRelativePath } from '@shared/gui-plan'
-import type { SkillListItem } from '@shared/ds-gui-api'
-import type { ClipboardImageReadResult } from '@shared/workspace-file'
-import type { AttachmentReference, ChatBlock } from '../agent/types'
+import { sddDraftTraceRelativePath } from '@shared/sdd'
+import { buildSddTraceSnapshot } from '@shared/sdd-trace'
+import {
+  findKeyboardShortcutCommand,
+  keyboardEventToShortcut,
+  resolveKeyboardShortcutBindings,
+  type KeyboardShortcutCommandId
+} from '@shared/keyboard-shortcuts'
+import type { DesktopCommand, ModelProviderModelGroup, SkillListItem } from '@shared/kun-gui-api'
+import type { WriteRetrievalContext } from '@shared/write-retrieval'
+import type { ClipboardImageReadResult, WorkspaceFileTarget } from '@shared/workspace-file'
+import type { AttachmentReference, ChatBlock, NormalizedThread, UserFileReference } from '../agent/types'
 import type { CoreRuntimeInfoJson, CoreRuntimeSkillJson } from '../agent/kun-contract'
 import { getProvider } from '../agent/registry'
+import { rendererRuntimeClient } from '../agent/runtime-client'
 import { useChatStore } from '../store/chat-store'
-import { isClawThread } from '../store/chat-store-helpers'
+import {
+  isClawThread,
+  providerIdForComposerModel,
+  resolveComposerContextWindowTokens
+} from '../store/chat-store-helpers'
+import { threadHasPendingRuntimeWork } from '../store/chat-store-runtime-helpers'
 import {
   extractLatestTurnAutoOpenDevPreviewUrls,
   extractLatestTurnDevPreviewUrls
@@ -19,7 +40,13 @@ import {
 import { Sidebar } from './chat/Sidebar'
 import { WorkbenchTopBar, type RightPanelMode } from './chat/WorkbenchTopBar'
 import { MessageTimeline } from './chat/MessageTimeline'
-import { FloatingComposer, type ComposerFileReference } from './chat/FloatingComposer'
+import { IkunCameoLayer, KunCelebrationLayer } from './chat/AnimatedWorkLogo'
+import {
+  FloatingComposer,
+  type ComposerExecutionSettings,
+  type ComposerFileReference
+} from './chat/FloatingComposer'
+import { ChatFileTreePanel, type ChatFileTreeReference } from './chat/ChatFileTreePanel'
 import {
   composerReasoningEffortRequestValue,
   type ComposerReasoningEffort
@@ -33,33 +60,55 @@ import { SddAssistantPanel } from './sdd/SddAssistantPanel'
 import { SddDraftEditorView } from './sdd/SddDraftEditorView'
 import { SidebarTitlebarToggleButton } from './sidebar/SidebarPrimitives'
 import { composeWritePrompt } from '../write/quoted-selection'
+import { resolveWriteAgentPreset } from '../write/agent-presets'
 import { useWriteWorkspaceStore } from '../write/write-workspace-store'
 import { isWriteThreadId } from '../write/write-thread-registry'
-import { createSddDraft, useSddDraftStore } from '../sdd/sdd-draft-store'
-import type { SddDraft } from '../sdd/sdd-draft-store'
+import { buildSddDraftId, createSddDraft, forgetRememberedSddDraft, useSddDraftStore } from '../sdd/sdd-draft-store'
+import type { SddDraft, SddDraftSaveStatus } from '../sdd/sdd-draft-store'
+import { listSddDraftHistory, titleFromSddDraftContent } from '../sdd/sdd-draft-history'
 import { saveActiveSddDraftToDisk } from '../sdd/sdd-draft-actions'
+import { restoreRememberedSddDraft, restoreSddDraft } from '../sdd/sdd-draft-restore'
 import { composeSddAssistantPrompt } from '../sdd/sdd-assistant-prompt'
+import { frameworkById } from '../sdd/pm-skill-frameworks'
 import { collectSddDraftImages, withAttachmentIds, type SddDraftImageReference } from '../sdd/sdd-draft-images'
+import { PENDING_INFOGRAPHIC_PROTOCOL } from '../write/infographic-pending'
 import { buildSddDraftToPlanPrompt } from '../sdd/sdd-plan-prompt'
 import {
   isSddAssistantThread,
+  isEmptySddAssistantThreadCandidate,
   markSddAssistantThread,
   releaseSddAssistantThread,
   sddAssistantThreadIdForDraft
 } from '../sdd/sdd-thread-registry'
+import {
+  refreshSddChatTranscriptFromProvider,
+  sddDraftRefForThreadId,
+  writeSddChatTranscriptForThread
+} from '../sdd/sdd-chat-transcript'
 import { parseGuiPlanCommand } from '../plan/plan-command'
+import { confirmDialog } from '../lib/confirm-dialog'
 import { DevPreviewLaunchCard } from './DevPreviewLaunchCard'
 import { RuntimeBanner } from './RuntimeBanner'
-import { useWorkbenchLayout } from './workbench-layout'
+import { CODE_PANEL_PREFERRED, useWorkbenchLayout } from './workbench-layout'
 import { useWorkbenchPlanController } from './workbench-plan-controller'
 import { prepareImageAttachmentUpload } from '../lib/image-attachment-upload'
 import { isChatAttachmentUploadEnabled } from '../lib/attachment-upload-availability'
 import { normalizeWorkspaceRoot } from '../lib/workspace-path'
+import { useKeyboardShortcutSettings } from '../lib/keyboard-shortcut-settings'
+import { collectComposerChangeSummary } from '../lib/composer-change-summary'
+import { formatWorkspacePickerError } from '../lib/format-workspace-picker-error'
+import { useUiModeCameosEnabled, useUiPluginStore } from '../store/ui-plugin-store'
+import { readFocusModePreference, writeFocusModePreference } from '../lib/focus-mode'
 import {
   buildComposerFileContextPrompt,
+  isComposerDirectoryReference,
   mergeComposerFileReferences,
+  relativeWorkspacePath,
   type ComposerFileContextEntry
 } from '../lib/composer-file-references'
+import { filesUnderDirectory, loadWorkspaceFileIndex } from '../lib/workspace-file-index'
+import { resolveWriteRuntimeBannerMessage } from '../lib/write-runtime-banner'
+import { shouldSuppressRuntimeErrorBanner } from '../lib/runtime-banner-visibility'
 
 const ChangeInspector = lazy(() =>
   import('./ChangeInspector').then((module) => ({ default: module.ChangeInspector }))
@@ -81,8 +130,17 @@ const PlanPanel = lazy(() =>
 const TodoPanel = lazy(() =>
   import('./todo/TodoPanel').then((module) => ({ default: module.TodoPanel }))
 )
+const TerminalPanel = lazy(() =>
+  import('./terminal/TerminalPanel').then((module) => ({ default: module.TerminalPanel }))
+)
 const ScheduleTasksView = lazy(() =>
   import('./schedule/ScheduleTasksView').then((module) => ({ default: module.ScheduleTasksView }))
+)
+const WorkflowView = lazy(() =>
+  import('./workflow/WorkflowView').then((module) => ({ default: module.WorkflowView }))
+)
+const WorkflowRunPanel = lazy(() =>
+  import('./workflow/WorkflowRunPanel').then((module) => ({ default: module.WorkflowRunPanel }))
 )
 
 type PendingSddPlanTarget = {
@@ -93,6 +151,71 @@ type PendingSddPlanTarget = {
 
 const COMPOSER_FILE_CONTEXT_MAX_CHARS_PER_FILE = 60_000
 const COMPOSER_FILE_CONTEXT_MAX_TOTAL_CHARS = 180_000
+// Upper bound on how many files a single `@directory` mention expands into, so a
+// large folder cannot flood the prompt (the char budget above is the hard cap).
+const COMPOSER_DIRECTORY_CONTEXT_MAX_FILES = 60
+const FILE_TREE_SIDEBAR_WIDTH = 320
+const SDD_ASSISTANT_TITLE_SYNC_DELAY_MS = 900
+
+function workspaceFileTargetKey(target: WorkspaceFileTarget | null | undefined): string {
+  if (!target?.path) return ''
+  return `${target.workspaceRoot ?? ''}\n${target.path}`.replaceAll('\\', '/').toLowerCase()
+}
+const DESKTOP_SHORTCUT_COMMANDS: Partial<Record<KeyboardShortcutCommandId, DesktopCommand>> = {
+  quit: 'quit',
+  undo: 'undo',
+  redo: 'redo',
+  cut: 'cut',
+  copy: 'copy',
+  paste: 'paste',
+  'select-all': 'selectAll',
+  reload: 'reload',
+  'zoom-in': 'zoomIn',
+  'zoom-out': 'zoomOut',
+  'reset-zoom': 'resetZoom',
+  'toggle-devtools': 'toggleDevTools',
+  close: 'close',
+  minimize: 'minimize',
+  'toggle-maximize': 'toggleMaximize'
+}
+
+function normalizeModelCapabilityKey(modelId: string): string {
+  return modelId.trim().toLowerCase()
+}
+
+function modelProfileForGroup(
+  group: ModelProviderModelGroup,
+  modelId: string
+): ModelProviderModelProfileV1 | undefined {
+  const key = normalizeModelCapabilityKey(modelId)
+  if (!key) return undefined
+  const profiles = group.modelProfiles ?? {}
+  const direct = profiles[key] ?? profiles[modelId.trim()]
+  if (direct) return direct
+  return Object.values(profiles).find((profile) =>
+    profile.aliases?.some((alias) => normalizeModelCapabilityKey(alias) === key)
+  )
+}
+
+function modelProfileForSelection(
+  groups: readonly ModelProviderModelGroup[],
+  modelId: string,
+  providerId?: string
+): ModelProviderModelProfileV1 | undefined {
+  const selectedProviderId = providerId?.trim()
+  if (selectedProviderId) {
+    const selectedGroup = groups.find((group) => group.providerId === selectedProviderId)
+    if (selectedGroup) {
+      const profile = modelProfileForGroup(selectedGroup, modelId)
+      if (profile) return profile
+    }
+  }
+  for (const group of groups) {
+    const profile = modelProfileForGroup(group, modelId)
+    if (profile) return profile
+  }
+  return undefined
+}
 
 function fileNameFromPath(path: string): string {
   return path.replaceAll('\\', '/').split('/').filter(Boolean).pop() || 'image'
@@ -112,6 +235,17 @@ function clipComposerFileContext(
   }
 }
 
+function composerReferencesToUserFileReferences(
+  references: ComposerFileReference[]
+): UserFileReference[] {
+  return references.map((reference) => ({
+    path: reference.path,
+    relativePath: reference.relativePath,
+    name: reference.name,
+    kind: isComposerDirectoryReference(reference) ? 'directory' : 'file'
+  }))
+}
+
 function sddDraftPlanRelativePath(draft: SddDraft): string {
   const parts = draft.relativePath.replaceAll('\\', '/').split('/').filter(Boolean)
   const draftFolder = parts.at(-2)?.trim() || draft.id.split(':').pop()?.trim() || `draft-${Date.now()}`
@@ -124,6 +258,10 @@ function sddDraftSourceRequest(markdown: string, fallbackPath: string): string {
     .map((line) => line.replace(/^#+\s*/, '').trim())
     .find(Boolean)
   return (firstMeaningfulLine || fallbackPath).slice(0, 160)
+}
+
+function sddAssistantThreadTitle(markdown: string, fallback: string): string {
+  return titleFromSddDraftContent(markdown, fallback).trim() || fallback
 }
 
 function sddPlanMatchesPendingTarget(
@@ -204,6 +342,8 @@ export function Workbench(): ReactElement {
     liveReasoning,
     liveAssistant,
     error,
+    runtimeErrorDetail,
+    runtimeStatus,
     busy,
     route,
     pluginHostRoute,
@@ -218,6 +358,7 @@ export function Workbench(): ReactElement {
     openPlugins,
     openClaw,
     openSchedule,
+    openWorkflow,
     chooseWorkspace,
     clawChannels,
     activeClawChannelId,
@@ -233,11 +374,12 @@ export function Workbench(): ReactElement {
     interrupt,
     probeRuntime,
     composerModel,
+    composerProviderId,
     composerPickList,
     composerModelGroups,
+    disabledSkillIds,
     setComposerModel,
     setThreadSearch,
-    setShowArchivedThreads,
     renameThread,
     archiveThread,
     deleteThread,
@@ -259,6 +401,8 @@ export function Workbench(): ReactElement {
       liveReasoning: s.liveReasoning,
       liveAssistant: s.liveAssistant,
       error: s.error,
+      runtimeErrorDetail: s.runtimeErrorDetail,
+      runtimeStatus: s.runtimeStatus,
       busy: s.busy,
       route: s.route,
       pluginHostRoute: s.pluginHostRoute,
@@ -273,6 +417,7 @@ export function Workbench(): ReactElement {
       openPlugins: s.openPlugins,
       openClaw: s.openClaw,
       openSchedule: s.openSchedule,
+      openWorkflow: s.openWorkflow,
       chooseWorkspace: s.chooseWorkspace,
       clawChannels: s.clawChannels,
       activeClawChannelId: s.activeClawChannelId,
@@ -288,11 +433,12 @@ export function Workbench(): ReactElement {
       interrupt: s.interrupt,
       probeRuntime: s.probeRuntime,
       composerModel: s.composerModel,
+      composerProviderId: s.composerProviderId,
       composerPickList: s.composerPickList,
       composerModelGroups: s.composerModelGroups,
+      disabledSkillIds: s.disabledSkillIds,
       setComposerModel: s.setComposerModel,
       setThreadSearch: s.setThreadSearch,
-      setShowArchivedThreads: s.setShowArchivedThreads,
       renameThread: s.renameThread,
       archiveThread: s.archiveThread,
       deleteThread: s.deleteThread,
@@ -306,43 +452,84 @@ export function Workbench(): ReactElement {
   )
   const [input, setInput] = useState('')
   const [mode, setMode] = useState<'plan' | 'agent'>('agent')
+  const [useWorktreePool, setUseWorktreePool] = useState(false)
+  const [worktreeBranch, setWorktreeBranch] = useState('')
   const [composerReasoningEffort, setComposerReasoningEffort] =
     useState<ComposerReasoningEffort>('max')
   const [runtimeInfo, setRuntimeInfo] = useState<CoreRuntimeInfoJson | null>(null)
   const [runtimeSkills, setRuntimeSkills] = useState<CoreRuntimeSkillJson[]>([])
   const [composerAttachments, setComposerAttachments] = useState<AttachmentReference[]>([])
   const [composerFileReferences, setComposerFileReferences] = useState<ComposerFileReference[]>([])
+  const [composerExecutionSettings, setComposerExecutionSettings] =
+    useState<ComposerExecutionSettings | null>(null)
+  const [composerExecutionApplying, setComposerExecutionApplying] = useState(false)
   const [attachmentUploadBusy, setAttachmentUploadBusy] = useState(false)
   const [attachmentUploadError, setAttachmentUploadError] = useState<string | null>(null)
   const [connectPhoneSidebarOpen, setConnectPhoneSidebarOpen] = useState(false)
+  const [fileTreeSidePanelOpen, setFileTreeSidePanelOpen] = useState(false)
+  const [openFilePreviewTargets, setOpenFilePreviewTargets] = useState<WorkspaceFileTarget[]>([])
+  const initUiPlugins = useUiPluginStore((s) => s.initUiPlugins)
+  const uiModeCameosEnabled = useUiModeCameosEnabled()
+  const [focusModeEnabled, setFocusModeEnabled] = useState(readFocusModePreference)
+  const [runtimeLogPath, setRuntimeLogPath] = useState('')
+  const [planPanelOverlayPreferred, setPlanPanelOverlayPreferred] = useState(false)
   const writeAssistantOpen = useWriteWorkspaceStore((s) => s.assistantOpen)
   const setWriteAssistantOpen = useWriteWorkspaceStore((s) => s.setAssistantOpen)
   const writeAssistantModel = useWriteWorkspaceStore((s) => s.assistantModel)
+  const writeAssistantProviderId = useWriteWorkspaceStore((s) => s.assistantProviderId)
   const setWriteAssistantModel = useWriteWorkspaceStore((s) => s.setAssistantModel)
   const activeSddDraft = useSddDraftStore((s) => s.activeDraft)
+  const sddDraftContent = useSddDraftStore((s) => s.content)
   const sddDraftOperationStatus = useSddDraftStore((s) => s.operationStatus)
   const writeAssistantPickList = useMemo(() => {
     const ordered = new Set<string>()
     for (const id of DEFAULT_COMPOSER_MODEL_IDS) {
       const normalized = id.trim()
-      if (normalized) ordered.add(normalized)
+      if (normalized && normalized.toLowerCase() !== 'auto') ordered.add(normalized)
     }
     for (const id of composerPickList) {
       const normalized = id.trim()
-      if (normalized) ordered.add(normalized)
+      if (normalized && normalized.toLowerCase() !== 'auto') ordered.add(normalized)
     }
     const current = writeAssistantModel.trim()
-    if (current) ordered.add(current)
+    if (current && current.toLowerCase() !== 'auto') ordered.add(current)
     return [...ordered]
   }, [composerPickList, writeAssistantModel])
+  const resolvedWriteAssistantProviderId = useMemo(() => {
+    const stored = writeAssistantProviderId.trim()
+    if (stored) {
+      const group = composerModelGroups.find((item) => item.providerId === stored)
+      const modelKey = normalizeModelCapabilityKey(writeAssistantModel)
+      const storedMatchesModel =
+        !modelKey ||
+        group?.modelIds.some((modelId) => normalizeModelCapabilityKey(modelId) === modelKey) === true
+      if (group && storedMatchesModel) return stored
+    }
+    return providerIdForComposerModel(composerModelGroups, writeAssistantModel)
+  }, [composerModelGroups, writeAssistantModel, writeAssistantProviderId])
   const stageInsetClass = 'ds-stage-inset'
+  const keyboardShortcuts = useKeyboardShortcutSettings()
+  const shortcutPlatform = typeof window === 'undefined' ? undefined : window.kunGui?.platform
+  const keyboardShortcutBindings = useMemo(
+    () => resolveKeyboardShortcutBindings(keyboardShortcuts, shortcutPlatform),
+    [keyboardShortcuts, shortcutPlatform]
+  )
 
   const draftByThread = useRef<Record<string, string>>({})
   const prevThreadId = useRef<string | null>(null)
+  // PM-skill framework selected via an assistant-panel button. The id is only
+  // applied on send when its injected prompt text is still present in the
+  // composer (see sendSddAssistantPrompt) — so editing the prompt away, clearing
+  // the composer, or switching drafts all drop it without a stale-guidance leak.
+  const pendingSddFrameworkRef = useRef<string | null>(null)
+  const pendingSddFrameworkPromptRef = useRef<string | null>(null)
   const inputRef = useRef('')
   const sddUpgradeInFlightRef = useRef(false)
   const sddUpgradeTargetRef = useRef<PendingSddPlanTarget | null>(null)
+  const sddTitleSyncTimerRef = useRef<number | null>(null)
+  const lastSyncedSddTitleRef = useRef<Record<string, string>>({})
   const timelineBlocks = blocks
+  const lockVisionToTextModelSwitch = route === 'chat' && timelineBlocks.some((block) => block.kind === 'user')
   const timelineLiveReasoning = liveReasoning
   const timelineLiveAssistant = liveAssistant
   const devPreviewBlocks = useMemo<ChatBlock[]>(() => {
@@ -373,6 +560,10 @@ export function Workbench(): ReactElement {
     () => threads.find((thread) => thread.id === activeThreadId)?.workspace || workspaceRoot || '',
     [activeThreadId, threads, workspaceRoot]
   )
+  const composerChangeSummary = useMemo(
+    () => collectComposerChangeSummary(timelineBlocks, activeSkillWorkspace),
+    [activeSkillWorkspace, timelineBlocks]
+  )
   const latestDevPreviewUrl = detectedDevPreviewUrls[0] ?? null
   const latestAutoOpenDevPreviewUrl = autoOpenDevPreviewUrls[0] ?? null
   const currentSideConversations = useMemo(
@@ -389,6 +580,7 @@ export function Workbench(): ReactElement {
   const {
     beginLeftResize,
     beginRightResize,
+    beginTerminalResize,
     filePreviewTarget,
     leftSidebarCollapsed,
     leftSidebarWidth,
@@ -400,8 +592,11 @@ export function Workbench(): ReactElement {
     setRightPanelMode,
     setRightSidebarWidth,
     shellRef,
+    terminalHeight,
+    terminalOpen,
     toggleLeftSidebar,
     toggleRightPanelMode,
+    toggleTerminal,
   } = useWorkbenchLayout({
     activeThreadId,
     latestAutoOpenDevPreviewUrl,
@@ -410,12 +605,40 @@ export function Workbench(): ReactElement {
     workspaceRoot,
     writeAssistantOpen
   })
+  const titleForSddDraft = useCallback((draft: SddDraft): string => {
+    const snapshot = useSddDraftStore.getState()
+    const markdown = snapshot.activeDraft?.id === draft.id ? snapshot.content : ''
+    return sddAssistantThreadTitle(markdown, t('sddUntitledRequirement'))
+  }, [t])
+  const renameSddAssistantThreadToDraft = useCallback(async (
+    threadId: string,
+    draft: SddDraft
+  ): Promise<void> => {
+    const targetId = threadId.trim()
+    const nextTitle = titleForSddDraft(draft)
+    if (!targetId || !nextTitle || runtimeConnection !== 'ready') return
+    const currentTitle = useChatStore.getState().threads.find((thread) => thread.id === targetId)?.title.trim()
+    if (currentTitle === nextTitle || lastSyncedSddTitleRef.current[targetId] === nextTitle) return
+    try {
+      await getProvider().renameThread(targetId, nextTitle)
+      lastSyncedSddTitleRef.current[targetId] = nextTitle
+      useChatStore.setState((state) => ({
+        threads: state.threads.map((thread) =>
+          thread.id === targetId ? { ...thread, title: nextTitle } : thread
+        )
+      }))
+    } catch (error) {
+      setError(error instanceof Error ? error.message : String(error))
+    }
+  }, [runtimeConnection, setError, titleForSddDraft])
   const {
     activeGuiPlan,
     buildGuiPlan,
     handleGuiPlanCommand,
     openGuiPlanPanel,
-    sendPlanTurn
+    replanChangedRequirements,
+    sendPlanTurn,
+    verifyGuiPlan
   } = useWorkbenchPlanController({
     blocks,
     busy,
@@ -430,13 +653,133 @@ export function Workbench(): ReactElement {
     workspaceRoot,
     onPlanBuildStarted: async (plan) => {
       const threadId = plan.threadId?.trim() || useChatStore.getState().activeThreadId
-      if (!threadId || !releaseSddAssistantThread(threadId)) return
+      const draft = useSddDraftStore.getState().activeDraft
+      if (!threadId) return
+      if (draft) await renameSddAssistantThreadToDraft(threadId, draft)
+      if (!releaseSddAssistantThread(threadId)) return
       await useChatStore.getState().refreshThreads()
     }
   })
+  const planPanelInOverlay =
+    route === 'chat' &&
+    !activeSddDraft &&
+    rightPanelMode === 'plan' &&
+    planPanelOverlayPreferred
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return
+    const media = window.matchMedia('(max-width: 900px), (orientation: portrait)')
+    const sync = (): void => setPlanPanelOverlayPreferred(media.matches)
+    sync()
+    if (typeof media.addEventListener === 'function') {
+      media.addEventListener('change', sync)
+      return () => media.removeEventListener('change', sync)
+    }
+    media.addListener(sync)
+    return () => media.removeListener(sync)
+  }, [])
+
+  useEffect(() => {
+    if (!planPanelInOverlay) return
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') setRightPanelMode(null)
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [planPanelInOverlay, setRightPanelMode])
+
+  useEffect(() => {
+    const runDesktopShortcut = (command: DesktopCommand): void => {
+      if (typeof window.kunGui?.runDesktopCommand !== 'function') return
+      void window.kunGui.runDesktopCommand(command)
+    }
+
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.defaultPrevented || event.repeat || event.isComposing) return
+      const commandId = findKeyboardShortcutCommand(
+        keyboardShortcutBindings,
+        keyboardEventToShortcut(event)
+      )
+      if (!commandId) return
+      event.preventDefault()
+
+      if (commandId === 'toggle-plan-mode') {
+        if (mode === 'plan') {
+          setMode('agent')
+        } else {
+          setMode('plan')
+          void handleGuiPlanCommand()
+        }
+        return
+      }
+      if (commandId === 'new-chat') {
+        void createThread({ useWorktreePool, worktreeBranch })
+        if (useWorktreePool) setUseWorktreePool(false)
+        return
+      }
+      if (commandId === 'choose-workspace') {
+        void chooseWorkspace()
+        return
+      }
+      if (commandId === 'toggle-terminal') {
+        toggleTerminal()
+        return
+      }
+      if (commandId === 'settings') {
+        openSettings()
+        return
+      }
+
+      const desktopCommand = DESKTOP_SHORTCUT_COMMANDS[commandId]
+      if (desktopCommand) runDesktopShortcut(desktopCommand)
+    }
+
+    window.addEventListener('keydown', onKeyDown, true)
+    return () => window.removeEventListener('keydown', onKeyDown, true)
+  }, [
+    chooseWorkspace,
+    createThread,
+    handleGuiPlanCommand,
+    keyboardShortcutBindings,
+    mode,
+    openSettings,
+    setMode,
+    toggleTerminal,
+    useWorktreePool,
+    worktreeBranch
+  ])
   const showDevPreviewCard =
     route === 'chat' &&
     latestDevPreviewUrl !== null
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.kunGui?.getLogPath !== 'function') return
+    let cancelled = false
+    void window.kunGui
+      .getLogPath()
+      .then((path) => {
+        if (!cancelled) setRuntimeLogPath(path)
+      })
+      .catch(() => undefined)
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
+    // 形象工坊:读取偏好、应用 DOM 属性/token,并在插件模式下加载图集
+    void initUiPlugins()
+  }, [initUiPlugins])
+
+  useEffect(() => {
+    if (typeof document === 'undefined') return
+    document.documentElement.setAttribute('data-focus-mode', focusModeEnabled ? 'on' : 'off')
+  }, [focusModeEnabled])
+
+  const updateFocusMode = (enabled: boolean): void => {
+    writeFocusModePreference(enabled)
+    setFocusModeEnabled(enabled)
+  }
 
   useEffect(() => {
     const previousThreadId = prevThreadId.current
@@ -455,6 +798,47 @@ export function Workbench(): ReactElement {
     openSideConversationDraft()
   }
 
+  useEffect(() => {
+    let cancelled = false
+    void rendererRuntimeClient.getSettings()
+      .then((settings) => {
+        if (cancelled) return
+        setComposerExecutionSettings({
+          approvalPolicy: settings.agents.kun.approvalPolicy,
+          sandboxMode: settings.agents.kun.sandboxMode
+        })
+      })
+      .catch(() => undefined)
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  const updateComposerExecutionSettings = (patch: Partial<ComposerExecutionSettings>): void => {
+    if (!composerExecutionSettings || composerExecutionApplying) return
+    const previous = composerExecutionSettings
+    const next = { ...previous, ...patch }
+    setComposerExecutionSettings(next)
+    setComposerExecutionApplying(true)
+    void rendererRuntimeClient.setSettings({
+      agents: {
+        kun: {
+          ...(patch.approvalPolicy ? { approvalPolicy: patch.approvalPolicy as ApprovalPolicy } : {}),
+          ...(patch.sandboxMode ? { sandboxMode: patch.sandboxMode as SandboxMode } : {})
+        }
+      }
+    }).then((settings) => {
+      setComposerExecutionSettings({
+        approvalPolicy: settings.agents.kun.approvalPolicy,
+        sandboxMode: settings.agents.kun.sandboxMode
+      })
+      void probeRuntime('background')
+    }).catch((error: unknown) => {
+      setComposerExecutionSettings(previous)
+      setError(error instanceof Error ? error.message : String(error))
+    }).finally(() => setComposerExecutionApplying(false))
+  }
+
   const codeThreads = useMemo(
     () => threads.filter((thread) =>
       !isWriteThreadId(thread.id) &&
@@ -465,14 +849,14 @@ export function Workbench(): ReactElement {
   )
 
   const mirrorClawCommand = async (userText: string, replyText: string): Promise<void> => {
-    if (!activeThreadId || typeof window.dsGui?.mirrorClawChannelMessage !== 'function') return
-    const userResult = await window.dsGui.mirrorClawChannelMessage(
+    if (!activeThreadId || typeof window.kunGui?.mirrorClawChannelMessage !== 'function') return
+    const userResult = await window.kunGui.mirrorClawChannelMessage(
       activeThreadId,
       userText,
       'user'
     )
     if (!userResult.ok) return
-    await window.dsGui.mirrorClawChannelMessage(
+    await window.kunGui.mirrorClawChannelMessage(
       activeThreadId,
       replyText,
       'assistant'
@@ -512,6 +896,8 @@ export function Workbench(): ReactElement {
     sddUpgradeInFlightRef.current = false
     sddUpgradeTargetRef.current = null
     useSddDraftStore.getState().setOperationStatus('idle')
+    const completedDraft = useSddDraftStore.getState().activeDraft
+    if (completedDraft) forgetRememberedSddDraft(completedDraft)
     useSddDraftStore.getState().clearActiveDraft()
   }, [activeGuiPlan])
 
@@ -539,8 +925,8 @@ export function Workbench(): ReactElement {
     const runtimeReady = runtimeConnection === 'ready'
     if (!runtimeReady) setRuntimeInfo(null)
     const provider = getProvider()
-    const localSkillsTask = typeof window !== 'undefined' && typeof window.dsGui?.listSkills === 'function'
-      ? window.dsGui.listSkills(activeSkillWorkspace || undefined)
+    const localSkillsTask = typeof window !== 'undefined' && typeof window.kunGui?.listSkills === 'function'
+      ? window.kunGui.listSkills(activeSkillWorkspace || undefined)
       : Promise.resolve({ ok: true as const, skills: [], validationErrors: [] })
     void Promise.allSettled([
       runtimeReady && provider.getRuntimeInfo ? provider.getRuntimeInfo() : Promise.resolve(null),
@@ -568,11 +954,43 @@ export function Workbench(): ReactElement {
     }
   }, [activeSkillWorkspace, runtimeConnection])
 
+  const selectedComposerModel = route === 'claw'
+    ? activeClawChannel?.model ?? 'auto'
+    : route === 'write' || rightPanelMode === 'sdd-ai'
+      ? writeAssistantModel
+    : composerModel
+  const selectedComposerProviderId = route === 'write' || rightPanelMode === 'sdd-ai'
+    ? resolvedWriteAssistantProviderId
+    : route === 'chat'
+      ? composerProviderId
+      : ''
+  const selectedModelSupportsImageInput = useMemo(() => {
+    const selected = selectedComposerModel.trim()
+    const runtimeModel = runtimeInfo?.capabilities.model
+    if (!selected || selected.toLowerCase() === 'auto') {
+      return runtimeModel?.inputModalities.includes('image') === true
+    }
+    const profile = modelProfileForSelection(composerModelGroups, selected, selectedComposerProviderId)
+    if (profile) return modelSupportsImageInput(profile)
+    if (runtimeModel && normalizeModelCapabilityKey(runtimeModel.id) === normalizeModelCapabilityKey(selected)) {
+      return runtimeModel.inputModalities.includes('image')
+    }
+    return false
+  }, [composerModelGroups, runtimeInfo, selectedComposerModel, selectedComposerProviderId])
+  const selectedContextWindowTokens = useMemo(() => {
+    return resolveComposerContextWindowTokens(
+      composerModelGroups,
+      selectedComposerModel,
+      selectedComposerProviderId
+    )
+  }, [composerModelGroups, selectedComposerModel, selectedComposerProviderId])
+
   const attachmentUploadEnabled = isChatAttachmentUploadEnabled({
     runtimeConnection,
     route,
     mode,
-    attachmentStoreAvailable: runtimeInfo?.capabilities.attachments.available
+    attachmentStoreAvailable: runtimeInfo?.capabilities.attachments.available,
+    modelSupportsImageInput: selectedModelSupportsImageInput
   })
   const webAccessAvailable =
     runtimeInfo?.capabilities.web.fetch.available === true ||
@@ -581,6 +999,19 @@ export function Workbench(): ReactElement {
   const clearComposerAttachments = (): void => {
     setComposerAttachments([])
   }
+
+  const activeComposerWorkspace = (): string | undefined => {
+    const sddDraft = useSddDraftStore.getState().activeDraft
+    if (rightPanelMode === 'sdd-ai' && sddDraft?.workspaceRoot) return sddDraft.workspaceRoot
+    const writeWorkspace = useWriteWorkspaceStore.getState().workspaceRoot
+    if (route === 'write' && writeWorkspace.trim()) return writeWorkspace
+    return threads.find((thread) => thread.id === activeThreadId)?.workspace || workspaceRoot || undefined
+  }
+
+  const fileTreeWorkspaceRoot = useMemo(
+    () => normalizeWorkspaceRoot(threads.find((thread) => thread.id === activeThreadId)?.workspace || workspaceRoot),
+    [activeThreadId, threads, workspaceRoot]
+  )
 
   const clearComposerFileReferences = (): void => {
     setComposerFileReferences([])
@@ -599,11 +1030,68 @@ export function Workbench(): ReactElement {
     )
   }
 
+  const openWorkspaceFilePreviewTarget = (target: WorkspaceFileTarget): void => {
+    const nextTarget = {
+      ...target,
+      workspaceRoot: target.workspaceRoot ?? fileTreeWorkspaceRoot
+    }
+    if (!nextTarget.workspaceRoot) return
+    setOpenFilePreviewTargets((current) => {
+      const key = workspaceFileTargetKey(nextTarget)
+      if (current.some((item) => workspaceFileTargetKey(item) === key)) return current
+      return [...current, nextTarget]
+    })
+    setFilePreviewTarget(nextTarget)
+    setRightSidebarWidth((width) => Math.max(width, CODE_PANEL_PREFERRED))
+    setRightPanelMode('file')
+  }
+
+  const previewWorkspaceFileFromSidebar = (path: string): void => {
+    const workspace = fileTreeWorkspaceRoot
+    if (!workspace) return
+    openWorkspaceFilePreviewTarget({ path, workspaceRoot: workspace })
+  }
+
+  const closeWorkspaceFilePreviewTarget = (target: WorkspaceFileTarget): void => {
+    const closingKey = workspaceFileTargetKey(target)
+    setOpenFilePreviewTargets((current) => {
+      const index = current.findIndex((item) => workspaceFileTargetKey(item) === closingKey)
+      if (index < 0) return current
+      const next = current.filter((_, itemIndex) => itemIndex !== index)
+      if (workspaceFileTargetKey(filePreviewTarget) === closingKey) {
+        const fallback = next[Math.max(0, index - 1)] ?? next[0] ?? null
+        setFilePreviewTarget(fallback)
+        if (!fallback) setRightPanelMode(null)
+      }
+      return next
+    })
+  }
+
+  const addWorkspaceReferenceFromSidebar = (reference: ChatFileTreeReference): void => {
+    addComposerFileReference(reference)
+  }
+
+  const toggleFileTreeSidePanel = (): void => {
+    setFileTreeSidePanelOpen((open) => !open)
+  }
+
+  useEffect(() => {
+    if (rightPanelMode !== 'file' || !filePreviewTarget) return
+    setOpenFilePreviewTargets((current) => {
+      const key = workspaceFileTargetKey(filePreviewTarget)
+      if (current.some((item) => workspaceFileTargetKey(item) === key)) return current
+      return [...current, filePreviewTarget]
+    })
+  }, [filePreviewTarget, rightPanelMode])
+
   useEffect(() => {
     if (route !== 'chat') setComposerFileReferences([])
   }, [route])
 
-  const handlePickAttachments = async (files: File[]): Promise<void> => {
+  const handlePickAttachments = async (
+    files: File[],
+    options: { localFilePaths?: string[] } = {}
+  ): Promise<void> => {
     if (!files.length || !attachmentUploadEnabled) return
     const provider = getProvider()
     if (typeof provider.uploadAttachment !== 'function') {
@@ -613,20 +1101,24 @@ export function Workbench(): ReactElement {
     setAttachmentUploadBusy(true)
     setAttachmentUploadError(null)
     try {
-      const workspace = threads.find((thread) => thread.id === activeThreadId)?.workspace || workspaceRoot || undefined
+      const workspace = activeComposerWorkspace()
       const attachmentCapabilities = runtimeInfo?.capabilities.attachments
       if (!attachmentCapabilities) {
         setAttachmentUploadError(t('composerAttachmentUnavailable'))
         return
       }
       const uploaded: AttachmentReference[] = []
-      for (const file of files) {
+      for (const [index, file] of files.entries()) {
         if (!file.type.startsWith('image/')) continue
         const prepared = await prepareImageAttachmentUpload(file, attachmentCapabilities)
+        const localFilePath =
+          options.localFilePaths?.[index] ||
+          (typeof window.kunGui?.getPathForFile === 'function' ? window.kunGui.getPathForFile(file) : '')
         const attachment = await provider.uploadAttachment({
           name: file.name || 'image',
           mimeType: prepared.mimeType,
           dataBase64: prepared.dataBase64,
+          ...(localFilePath ? { localFilePath } : {}),
           textFallback: prepared.textFallback,
           ...(activeThreadId ? { threadId: activeThreadId } : {}),
           ...(workspace ? { workspace } : {})
@@ -662,28 +1154,30 @@ export function Workbench(): ReactElement {
 
   const handlePasteClipboardImage = async (options: { silentNoImage?: boolean } = {}): Promise<void> => {
     if (!attachmentUploadEnabled) return
-    if (typeof window.dsGui?.readClipboardImage !== 'function') {
+    if (typeof window.kunGui?.readClipboardImage !== 'function') {
       setAttachmentUploadError(t('composerAttachmentUnavailable'))
       return
     }
-    const image = await window.dsGui.readClipboardImage()
+    const image = await window.kunGui.readClipboardImage()
     if (!image.ok) {
       if (options.silentNoImage) return
       setAttachmentUploadError(image.message)
       return
     }
-    await handlePickAttachments([clipboardImageToFile(image)])
+    await handlePickAttachments([clipboardImageToFile(image)], { localFilePaths: [image.localFilePath] })
   }
 
   const sendWritePrompt = (value: string): void => {
     const v = value.trim()
-    if (!v) return
+    const attachments = composerAttachments
+    const attachmentIds = attachments.map((attachment) => attachment.id)
+    if (!v && attachmentIds.length === 0) return
+    if (attachmentIds.length > 0 && !attachmentUploadEnabled) {
+      setAttachmentUploadError(t('composerAttachmentModelUnsupported'))
+      return
+    }
     const writeState = useWriteWorkspaceStore.getState()
     const writeWorkspaceRoot = writeState.workspaceRoot || workspaceRoot
-    const prompt = composeWritePrompt(v, writeState.quotedSelections, {
-      workspaceRoot: writeWorkspaceRoot,
-      activeFilePath: writeState.activeFilePath
-    })
     setInput('')
     void (async () => {
       const threadId = await ensureWriteThreadForWorkspace(writeWorkspaceRoot)
@@ -691,14 +1185,52 @@ export function Workbench(): ReactElement {
         setInput(v)
         return
       }
+      const retrievalQuery = [
+        ...writeState.quotedSelections.map((selection) => selection.text),
+        v
+      ].join('\n\n').trim()
+      let retrieval: WriteRetrievalContext | null = null
+      if (retrievalQuery && typeof window.kunGui?.retrieveWriteContext === 'function') {
+        try {
+          const result = await window.kunGui.retrieveWriteContext({
+            workspaceRoot: writeWorkspaceRoot,
+            currentFilePath: writeState.activeFilePath ?? undefined,
+            query: retrievalQuery,
+            maxSnippets: 4,
+            includeCurrentFile: true
+          })
+          if (result.ok) retrieval = result.context
+        } catch (error) {
+          void window.kunGui?.logError?.('write-retrieval', 'Failed to retrieve write context', {
+            message: error instanceof Error ? error.message : String(error)
+          })
+        }
+      }
+      const messageText = v || t('composerImageOnlyPrompt')
+      const activeAgentPreset = writeState.agentPresets.find(
+        (preset) => preset.id === writeState.assistantAgentPresetId
+      )
+      const agentPersona = activeAgentPreset ? resolveWriteAgentPreset(activeAgentPreset).persona : ''
+      const prompt = composeWritePrompt(messageText, writeState.quotedSelections, {
+        workspaceRoot: writeWorkspaceRoot,
+        activeFilePath: writeState.activeFilePath,
+        retrieval,
+        ...(agentPersona ? { agentPersona } : {})
+      })
       const model = writeState.assistantModel.trim()
+      const providerId =
+        writeState.assistantProviderId.trim() || providerIdForComposerModel(composerModelGroups, model)
       const reasoningEffort = composerReasoningEffortRequestValue(composerReasoningEffort)
       const sent = await sendMessage(prompt, mode === 'plan' ? 'plan' : 'agent', {
+        ...(!v && attachmentIds.length > 0 ? { displayText: t('composerImageOnlyDisplay') } : {}),
         ...(model ? { model } : {}),
-        ...(reasoningEffort ? { reasoningEffort } : {})
+        ...(providerId ? { providerId } : {}),
+        ...(reasoningEffort ? { reasoningEffort } : {}),
+        ...(attachmentIds.length ? { attachmentIds, attachments } : {})
       })
       if (sent) {
         useWriteWorkspaceStore.getState().clearQuotedSelections()
+        if (attachmentIds.length > 0) clearComposerAttachments()
       }
     })()
   }
@@ -717,7 +1249,7 @@ export function Workbench(): ReactElement {
       const provider = getProvider()
       const thread = await provider.createThread({
         workspace: normalizedWorkspace,
-        title: t('sddAssistant'),
+        title: titleForSddDraft(draft),
         mode: 'agent'
       })
       const normalizedThread = {
@@ -725,6 +1257,13 @@ export function Workbench(): ReactElement {
         workspace: normalizeWorkspaceRoot(thread.workspace) || normalizedWorkspace
       }
       markSddAssistantThread(draft, normalizedThread.id)
+      // Record the thread association inside the requirement unit right away.
+      void writeSddChatTranscriptForThread({
+        workspaceRoot: draft.workspaceRoot,
+        draftRelativePath: draft.relativePath,
+        threadId: normalizedThread.id,
+        blocks: []
+      })
       useChatStore.setState((state) => ({
         activeThreadId: normalizedThread.id,
         threads: state.threads.some((item) => item.id === normalizedThread.id)
@@ -749,10 +1288,103 @@ export function Workbench(): ReactElement {
         await selectThread(registeredThreadId)
       }
       if (useChatStore.getState().activeThreadId === registeredThreadId) {
+        void renameSddAssistantThreadToDraft(registeredThreadId, draft)
         return registeredThreadId
       }
     }
     return createSddAssistantThreadForDraft(draft)
+  }
+
+  useEffect(() => {
+    const draft = activeSddDraft
+    if (!draft || runtimeConnection !== 'ready') return
+    const threadId = sddAssistantThreadIdForDraft(draft)
+    if (!threadId) return
+    const nextTitle = sddAssistantThreadTitle(sddDraftContent, t('sddUntitledRequirement'))
+    if (!nextTitle || lastSyncedSddTitleRef.current[threadId] === nextTitle) return
+    if (sddTitleSyncTimerRef.current) {
+      window.clearTimeout(sddTitleSyncTimerRef.current)
+    }
+    sddTitleSyncTimerRef.current = window.setTimeout(() => {
+      sddTitleSyncTimerRef.current = null
+      const latestDraft = useSddDraftStore.getState().activeDraft
+      if (!latestDraft || latestDraft.id !== draft.id) return
+      const latestThreadId = sddAssistantThreadIdForDraft(latestDraft)
+      if (latestThreadId !== threadId) return
+      void renameSddAssistantThreadToDraft(threadId, latestDraft)
+    }, SDD_ASSISTANT_TITLE_SYNC_DELAY_MS)
+    return () => {
+      if (sddTitleSyncTimerRef.current) {
+        window.clearTimeout(sddTitleSyncTimerRef.current)
+        sddTitleSyncTimerRef.current = null
+      }
+    }
+  }, [activeSddDraft, renameSddAssistantThreadToDraft, runtimeConnection, sddDraftContent, t])
+
+  const openSddRequirementDraft = async (
+    draft: SddDraft,
+    content: string,
+    options: {
+      lastSavedContent?: string
+      saveStatus?: SddDraftSaveStatus
+      openAssistant?: boolean
+    } = {}
+  ): Promise<boolean> => {
+    useSddDraftStore.getState().setActiveDraft(draft, content, {
+      lastSavedContent: options.lastSavedContent,
+      saveStatus: options.saveStatus
+    })
+    // Self-heal the unit's conversation record (covers turns that completed
+    // while the draft was closed or in another thread).
+    void refreshSddChatTranscriptFromProvider(draft)
+    setInput('')
+    setMode('agent')
+    setRoute('chat')
+    if (options.openAssistant ?? runtimeConnection === 'ready') {
+      setRightSidebarWidth((width) => Math.max(width, 420))
+      const sddThreadId = await ensureSddAssistantThreadForDraft(draft)
+      if (sddThreadId) {
+        setRightPanelMode('sdd-ai')
+      } else {
+        setRightPanelMode(null)
+      }
+    } else {
+      setRightPanelMode(null)
+    }
+    return true
+  }
+
+  const dismissActiveSddDraft = (options: { closeAssistant?: boolean } = {}): void => {
+    const draft = useSddDraftStore.getState().activeDraft
+    if (draft) {
+      void saveActiveSddDraftToDisk()
+      useSddDraftStore.getState().clearActiveDraft()
+    }
+    if (options.closeAssistant && rightPanelMode === 'sdd-ai') setRightPanelMode(null)
+  }
+
+  const openSddAssistantPanel = async (): Promise<void> => {
+    const draft = useSddDraftStore.getState().activeDraft
+    if (!draft) return
+    setRightSidebarWidth((width) => Math.max(width, 420))
+    const threadId = await ensureSddAssistantThreadForDraft(draft)
+    if (!threadId) return
+    setRightPanelMode('sdd-ai')
+  }
+
+  const toggleSddAssistantPanel = async (): Promise<void> => {
+    if (rightPanelMode === 'sdd-ai') {
+      setRightPanelMode(null)
+      return
+    }
+    await openSddAssistantPanel()
+  }
+
+  const quoteToSddAssistant = (prompt: string): void => {
+    const trimmed = prompt.trim()
+    if (!trimmed) return
+    setInput(input.trim() ? `${input.trim()}\n\n${trimmed}` : trimmed)
+    void openSddAssistantPanel()
   }
 
   const startNewSddRequirement = async (): Promise<void> => {
@@ -768,6 +1400,18 @@ export function Workbench(): ReactElement {
       setError(t('workspaceRequiredToCreateThread'))
       return
     }
+    const restored = await restoreRememberedSddDraft({
+      workspaceRoot: targetWorkspace,
+      readWorkspaceFile: window.kunGui.readWorkspaceFile
+    })
+    if (restored.kind === 'restored') {
+      await openSddRequirementDraft(restored.draft, restored.content, {
+        lastSavedContent: restored.lastSavedContent,
+        saveStatus: restored.saveStatus
+      })
+      return
+    }
+
     const draftUuid = globalThis.crypto?.randomUUID?.() ?? `draft-${Date.now()}`
     const draft = createSddDraft({ id: draftUuid, workspaceRoot: targetWorkspace })
     const initialContent = [
@@ -780,7 +1424,7 @@ export function Workbench(): ReactElement {
       `## ${t('sddTemplateAcceptance')}`,
       ''
     ].join('\n')
-    const result = await window.dsGui.createWorkspaceFile({
+    const result = await window.kunGui.createWorkspaceFile({
       workspaceRoot: targetWorkspace,
       path: draft.relativePath,
       content: initialContent
@@ -790,39 +1434,142 @@ export function Workbench(): ReactElement {
       return
     }
     const activeDraft = { ...draft, absolutePath: result.path }
-    useSddDraftStore.getState().setActiveDraft(activeDraft, initialContent)
-    setInput('')
-    setMode('agent')
-    setRoute('chat')
-    setRightSidebarWidth((width) => Math.max(width, 420))
-    const sddThreadId = await createSddAssistantThreadForDraft(activeDraft)
-    if (!sddThreadId) return
-    setRightPanelMode('sdd-ai')
+    await openSddRequirementDraft(activeDraft, initialContent)
+  }
+
+  const openSddRequirementDraftFromHistory = async (draft: SddDraft): Promise<void> => {
+    const current = useSddDraftStore.getState().activeDraft
+    if (current && current.id !== draft.id) {
+      await saveActiveSddDraftToDisk()
+    }
+    const restored = await restoreSddDraft({
+      draft,
+      readWorkspaceFile: window.kunGui.readWorkspaceFile
+    })
+    if (restored.kind !== 'restored') {
+      setError(restored.kind === 'unreadable' ? restored.message : t('sddDraftHistoryOpenFailed'))
+      return
+    }
+    await openSddRequirementDraft(restored.draft, restored.content, {
+      lastSavedContent: restored.lastSavedContent,
+      saveStatus: restored.saveStatus
+    })
+  }
+
+  const sddDraftFromRegisteredThread = (threadId: string): SddDraft | null => {
+    const ref = sddDraftRefForThreadId(threadId)
+    if (!ref) return null
+    const timestamp = new Date(0).toISOString()
+    return {
+      id: buildSddDraftId(ref.workspaceRoot, ref.draftRelativePath),
+      workspaceRoot: ref.workspaceRoot,
+      relativePath: ref.draftRelativePath,
+      createdAt: timestamp,
+      updatedAt: timestamp
+    }
+  }
+
+  const findSddDraftForSidebarThread = async (
+    threadId: string,
+    thread: NormalizedThread | null
+  ): Promise<SddDraft | null> => {
+    const normalizedThreadId = threadId.trim()
+    if (!normalizedThreadId) return null
+
+    if (isSddAssistantThread(thread ?? { id: normalizedThreadId })) {
+      return sddDraftFromRegisteredThread(normalizedThreadId)
+    }
+
+    if (thread && !isEmptySddAssistantThreadCandidate(thread)) return null
+    const listWorkspaceDirectory = window.kunGui?.listWorkspaceDirectory
+    const readWorkspaceFile = window.kunGui?.readWorkspaceFile
+    if (typeof listWorkspaceDirectory !== 'function' || typeof readWorkspaceFile !== 'function') {
+      return null
+    }
+
+    const targetWorkspace = normalizeWorkspaceRoot(thread?.workspace || workspaceRoot)
+    if (!targetWorkspace) return null
+    const history = await listSddDraftHistory({
+      workspaceRoot: targetWorkspace,
+      listWorkspaceDirectory,
+      readWorkspaceFile,
+      limit: 80
+    }).catch(() => [])
+    return history.find((draft) => draft.chatThreadIds?.includes(normalizedThreadId)) ?? null
+  }
+
+  // NOTE: We intentionally do NOT auto-restore a remembered requirement draft
+  // on mount / workspace switch. Opening the app (or switching the working
+  // directory) should land on a clean new conversation in the selected
+  // directory — not silently reopen the last requirement. Remembered drafts
+  // stay reachable from the sidebar (需求草稿) and the "新建需求" restore-or-create
+  // flow; they just no longer hijack startup. See the workspace picker below
+  // the composer for switching directories.
+
+  // Inject a PM-skill framework prompt (see pm-skill-frameworks.ts) into the
+  // Requirement AI composer and remember it so the next send applies the
+  // framework's guidance. Frameworks without guidance (the generic
+  // clarify/research actions) only set the composer text.
+  const applySddFramework = (frameworkId: string): void => {
+    const framework = frameworkById(frameworkId)
+    if (!framework?.promptKey) return
+    const promptText = t(framework.promptKey)
+    setInput(input.trim() ? `${input.trim()}\n\n${promptText}` : promptText)
+    // Arm the framework only when it carries guidance; the latest click wins.
+    pendingSddFrameworkRef.current = framework.guidance ? framework.id : null
+    pendingSddFrameworkPromptRef.current = framework.guidance ? promptText : null
   }
 
   const sendSddAssistantPrompt = async (value: string): Promise<void> => {
     const v = value.trim()
     const draft = useSddDraftStore.getState().activeDraft
-    if (!v || !draft) return
+    const attachments = composerAttachments
+    const attachmentIds = attachments.map((attachment) => attachment.id)
+    if ((!v && attachmentIds.length === 0) || !draft) return
+    if (attachmentIds.length > 0 && !attachmentUploadEnabled) {
+      setAttachmentUploadError(t('composerAttachmentModelUnsupported'))
+      return
+    }
     const threadId = await ensureSddAssistantThreadForDraft(draft)
     if (!threadId) return
     const snapshot = useSddDraftStore.getState()
     void saveActiveSddDraftToDisk()
+    const userPrompt = v || t('composerImageOnlyPrompt')
+    // Apply the armed framework only if its injected prompt is still in the
+    // message being sent — editing it away, clearing the composer, or switching
+    // drafts all leave a value that no longer contains it, so it is dropped.
+    const pendingPrompt = pendingSddFrameworkPromptRef.current
+    const frameworkId =
+      pendingSddFrameworkRef.current && pendingPrompt && value.includes(pendingPrompt)
+        ? pendingSddFrameworkRef.current
+        : null
     const prompt = composeSddAssistantPrompt({
-      userPrompt: v,
+      userPrompt,
       draftMarkdown: snapshot.content,
       draftRelativePath: draft.relativePath,
-      workspaceRoot: draft.workspaceRoot
+      workspaceRoot: draft.workspaceRoot,
+      ...(frameworkId ? { frameworkIds: [frameworkId] } : {})
     })
     setInput('')
     const model = writeAssistantModel.trim()
+    const providerId = resolvedWriteAssistantProviderId.trim()
     const reasoningEffort = composerReasoningEffortRequestValue(composerReasoningEffort)
     const sent = await sendMessage(prompt, mode === 'plan' ? 'plan' : 'agent', {
-      displayText: v,
+      displayText: v || t('composerImageOnlyDisplay'),
       ...(model ? { model } : {}),
-      ...(reasoningEffort ? { reasoningEffort } : {})
+      ...(providerId ? { providerId } : {}),
+      ...(reasoningEffort ? { reasoningEffort } : {}),
+      ...(attachmentIds.length ? { attachmentIds, attachments } : {})
     })
-    if (!sent) setInput(v)
+    if (sent) {
+      pendingSddFrameworkRef.current = null
+      pendingSddFrameworkPromptRef.current = null
+      if (attachmentIds.length > 0) clearComposerAttachments()
+    } else {
+      // Restore the composer (incl. any framework prompt) so a retry re-applies
+      // the same guidance the user still sees; the refs are intentionally kept.
+      setInput(v)
+    }
   }
 
   const uploadSddImagesAsAttachments = async (
@@ -852,31 +1599,137 @@ export function Workbench(): ReactElement {
     return { images: withAttachmentIds(images, attachmentIds), attachmentIds }
   }
 
+  const firstVisionCapableModel = (): { modelId: string; providerId?: string } | null => {
+    for (const group of composerModelGroups) {
+      for (const modelId of group.modelIds) {
+        const profile = modelProfileForSelection(composerModelGroups, modelId, group.providerId)
+        if (profile && modelSupportsImageInput(profile)) {
+          const providerId = group.providerId.trim()
+          return {
+            modelId,
+            ...(providerId ? { providerId } : {})
+          }
+        }
+      }
+    }
+    return null
+  }
+
+  /** Send a prototype-generation turn to the SDD assistant. Image-driven
+   * prototypes need a vision model: prompt to switch when the current one
+   * cannot read images. Returns false when nothing was sent. */
+  const sendSddPrototypeTurn = async (payload: {
+    prompt: string
+    displayText: string
+    image?: { absolutePath: string; alt: string }
+  }): Promise<boolean> => {
+    const draft = useSddDraftStore.getState().activeDraft
+    if (!draft) return false
+    if (runtimeConnection !== 'ready') {
+      useSddDraftStore.getState().setOperationStatus('error', t('runtimeActionNeedsConnection'))
+      return false
+    }
+
+    if (payload.image && !selectedModelSupportsImageInput) {
+      const visionSelection = firstVisionCapableModel()
+      if (!visionSelection) {
+        useSddDraftStore.getState().setOperationStatus('error', t('sddPrototypeNoVisionModel'))
+        return false
+      }
+      const switchModel = await confirmDialog(
+        t('sddPrototypeSwitchVisionModel', { model: visionSelection.modelId })
+      )
+      if (!switchModel) return false
+      setWriteAssistantModel(visionSelection.modelId, visionSelection.providerId)
+    }
+
+    const threadId = await ensureSddAssistantThreadForDraft(draft)
+    if (!threadId) return false
+    await openSddAssistantPanel()
+
+    let attachmentIds: string[] = []
+    if (payload.image) {
+      try {
+        const read = await window.kunGui.readWorkspaceImage({
+          path: payload.image.absolutePath,
+          workspaceRoot: draft.workspaceRoot
+        })
+        if (!read.ok) throw new Error(read.message)
+        const dataBase64 = read.dataUrl.split(';base64,', 2)[1] ?? ''
+        if (!dataBase64) throw new Error(t('composerAttachmentUnavailable'))
+        const uploaded = await uploadSddImagesAsAttachments(
+          [
+            {
+              index: 1,
+              alt: payload.image.alt,
+              markdownPath: payload.image.absolutePath,
+              relativePath: payload.image.absolutePath,
+              mimeType: read.mimeType,
+              dataBase64,
+              byteSize: read.size
+            }
+          ],
+          threadId,
+          draft.workspaceRoot
+        )
+        attachmentIds = uploaded.attachmentIds
+      } catch (error) {
+        useSddDraftStore.getState().setOperationStatus(
+          'error',
+          error instanceof Error ? error.message : String(error)
+        )
+        return false
+      }
+    }
+
+    const assistantSelection = useWriteWorkspaceStore.getState()
+    const model = assistantSelection.assistantModel.trim()
+    const providerId =
+      assistantSelection.assistantProviderId.trim() || providerIdForComposerModel(composerModelGroups, model)
+    return sendMessage(payload.prompt, 'agent', {
+      displayText: payload.displayText,
+      ...(model ? { model } : {}),
+      ...(providerId ? { providerId } : {}),
+      ...(attachmentIds.length ? { attachmentIds } : {})
+    })
+  }
+
   const handleSddNextStep = async (): Promise<void> => {
     const snapshot = useSddDraftStore.getState()
     const draft = snapshot.activeDraft
     if (!draft) return
+    if (sddUpgradeInFlightRef.current || snapshot.operationStatus === 'upgrading') return
     if (!snapshot.content.trim()) {
       useSddDraftStore.getState().setOperationStatus('error', t('sddEmptyDraftError'))
       return
     }
-    if (busy) {
+    // An in-flight image placeholder would be snapshotted into the plan prompt
+    // (and trip the image collector); finish or delete it first.
+    if (snapshot.content.includes(PENDING_INFOGRAPHIC_PROTOCOL)) {
+      useSddDraftStore.getState().setOperationStatus('error', t('sddPendingImageBlocked'))
+      return
+    }
+    const chatSnapshot = useChatStore.getState()
+    if (chatSnapshot.busy || threadHasPendingRuntimeWork(chatSnapshot.blocks)) {
       setError(t('composerQueuePlaceholder'))
       return
     }
-    if (runtimeConnection !== 'ready') {
+    if (chatSnapshot.runtimeConnection !== 'ready') {
       setError(t('runtimeActionNeedsConnection'))
       return
     }
+    sddUpgradeInFlightRef.current = true
     useSddDraftStore.getState().setOperationStatus('upgrading')
     const saved = await saveActiveSddDraftToDisk()
     if (!saved) {
+      sddUpgradeInFlightRef.current = false
       useSddDraftStore.getState().setOperationStatus('error', useSddDraftStore.getState().error)
       return
     }
 
     const threadId = await ensureSddAssistantThreadForDraft(draft)
     if (!threadId) {
+      sddUpgradeInFlightRef.current = false
       useSddDraftStore.getState().setOperationStatus('idle')
       return
     }
@@ -887,6 +1740,7 @@ export function Workbench(): ReactElement {
       workspaceRoot: draft.workspaceRoot
     })
     if (collected.errors.length > 0) {
+      sddUpgradeInFlightRef.current = false
       useSddDraftStore.getState().setOperationStatus('error', collected.errors.join('\n'))
       return
     }
@@ -909,6 +1763,7 @@ export function Workbench(): ReactElement {
         attachmentIds = uploaded.attachmentIds
         imageMode = 'attachments'
       } catch (error) {
+        sddUpgradeInFlightRef.current = false
         useSddDraftStore.getState().setOperationStatus(
           'error',
           error instanceof Error ? error.message : String(error)
@@ -929,9 +1784,9 @@ export function Workbench(): ReactElement {
       assistantContext,
       workspaceRoot: draft.workspaceRoot,
       images: imagesForPrompt,
-      imageMode
+      imageMode,
+      ...(draft.designContext ? { designContext: draft.designContext } : {})
     })
-    sddUpgradeInFlightRef.current = true
     sddUpgradeTargetRef.current = {
       planId,
       relativePath: planRelativePath,
@@ -954,6 +1809,23 @@ export function Workbench(): ReactElement {
       sddUpgradeInFlightRef.current = false
       sddUpgradeTargetRef.current = null
       useSddDraftStore.getState().setOperationStatus('idle')
+      return
+    }
+    // Baseline the trace snapshot so later draft edits can be detected as
+    // requirement drift against the plan that is about to be generated.
+    const tracePath = sddDraftTraceRelativePath(draft.relativePath)
+    if (tracePath) {
+      await window.kunGui
+        .writeWorkspaceFile({
+          workspaceRoot: draft.workspaceRoot,
+          path: tracePath,
+          content: JSON.stringify(
+            buildSddTraceSnapshot(latestDraftContent, planRelativePath),
+            null,
+            2
+          )
+        })
+        .catch(() => undefined)
     }
   }
 
@@ -962,19 +1834,33 @@ export function Workbench(): ReactElement {
     workspace: string
   ): Promise<ComposerFileContextEntry[]> => {
     const entries: ComposerFileContextEntry[] = []
+    const seen = new Set<string>()
     let remainingChars = COMPOSER_FILE_CONTEXT_MAX_TOTAL_CHARS
-    for (const reference of references) {
-      if (remainingChars <= 0) break
-      const result = await window.dsGui.readWorkspaceFile({
+
+    const contextKey = (path: string): string =>
+      path.trim().replaceAll('\\', '/').replace(/\/+/g, '/').toLowerCase()
+
+    // strict=true (explicit file mention) surfaces read errors to the user;
+    // strict=false (directory expansion) silently skips files that vanished.
+    const appendFileEntry = async (
+      reference: ComposerFileReference,
+      strict: boolean
+    ): Promise<void> => {
+      if (remainingChars <= 0) return
+      const key = contextKey(reference.relativePath || reference.path)
+      if (seen.has(key)) return
+      const result = await window.kunGui.readWorkspaceFile({
         workspaceRoot: workspace,
         path: reference.relativePath || reference.path
       })
       if (!result.ok) {
+        if (!strict) return
         throw new Error(t('composerFileReadFailed', {
           path: reference.relativePath,
           message: result.message
         }))
       }
+      seen.add(key)
       const clipped = clipComposerFileContext(result.content, remainingChars, result.truncated)
       remainingChars -= clipped.consumed
       entries.push({
@@ -982,6 +1868,23 @@ export function Workbench(): ReactElement {
         content: clipped.content,
         ...(clipped.truncated ? { truncated: true } : {})
       })
+    }
+
+    for (const reference of references) {
+      if (remainingChars <= 0) break
+      if (isComposerDirectoryReference(reference)) {
+        const index = await loadWorkspaceFileIndex(workspace).catch(() => null)
+        const dirFiles = index
+          ? filesUnderDirectory(index.files, reference.relativePath)
+              .slice(0, COMPOSER_DIRECTORY_CONTEXT_MAX_FILES)
+          : []
+        for (const file of dirFiles) {
+          if (remainingChars <= 0) break
+          await appendFileEntry(file, false)
+        }
+        continue
+      }
+      await appendFileEntry(reference, true)
     }
     return entries
   }
@@ -992,11 +1895,16 @@ export function Workbench(): ReactElement {
 
   const handleSendAsync = async (): Promise<void> => {
     const v = input.trim()
-    const attachments = route === 'chat' ? composerAttachments : []
+    const attachments = route === 'chat' || route === 'write' ? composerAttachments : []
     const attachmentIds = attachments.map((attachment) => attachment.id)
     const fileReferences = route === 'chat' ? composerFileReferences : []
+    const userFileReferences = composerReferencesToUserFileReferences(fileReferences)
     const reasoningEffort = composerReasoningEffortRequestValue(composerReasoningEffort)
     if (!v && attachmentIds.length === 0 && fileReferences.length === 0) return
+    if (attachmentIds.length > 0 && !attachmentUploadEnabled) {
+      setAttachmentUploadError(t('composerAttachmentModelUnsupported'))
+      return
+    }
     const emptyPrompt =
       fileReferences.length > 0 && attachmentIds.length > 0
         ? t('composerFileAndImageOnlyPrompt')
@@ -1057,7 +1965,8 @@ export function Workbench(): ReactElement {
       void sendPlanTurn(prepared.text, {
         ...(prepared.displayText ? { displayText: prepared.displayText } : {}),
         ...(reasoningEffort ? { reasoningEffort } : {}),
-        ...(attachmentIds.length ? { attachmentIds, attachments } : {})
+        ...(attachmentIds.length ? { attachmentIds, attachments } : {}),
+        ...(userFileReferences.length ? { fileReferences: userFileReferences } : {})
       })
       return
     }
@@ -1115,8 +2024,8 @@ export function Workbench(): ReactElement {
         void mirrorClawCommand(v, replyText)
         return
       }
-      if (command?.kind === 'invalidModel') {
-        setError(t('clawModelCommandHint'))
+      if (command?.kind === 'showProvider' || command?.kind === 'provider') {
+        setError('Provider commands are available in IM chats.')
         return
       }
       if (!activeClawChannelId) {
@@ -1125,10 +2034,11 @@ export function Workbench(): ReactElement {
       }
       setInput('')
       void (async () => {
-        const taskResult = typeof window.dsGui?.createClawTaskFromText === 'function'
-          ? await window.dsGui.createClawTaskFromText(v, {
+        const taskResult = typeof window.kunGui?.createClawTaskFromText === 'function'
+          ? await window.kunGui.createClawTaskFromText(v, {
               channelId: activeClawChannelId,
               modelHint: activeClawChannel?.model,
+              ...(reasoningEffort ? { reasoningEffort } : {}),
               mode
             })
           : { kind: 'noop' as const }
@@ -1162,38 +2072,42 @@ export function Workbench(): ReactElement {
     void sendMessage(prepared.text, mode === 'plan' ? 'plan' : 'agent', {
       ...(prepared.displayText ? { displayText: prepared.displayText } : {}),
       ...(reasoningEffort ? { reasoningEffort } : {}),
-      ...(attachmentIds.length ? { attachmentIds, attachments } : {})
+      ...(attachmentIds.length ? { attachmentIds, attachments } : {}),
+      ...(userFileReferences.length ? { fileReferences: userFileReferences } : {})
     })
   }
 
   const openThread = (id: string): void => {
-    if (activeSddDraft) {
-      void saveActiveSddDraftToDisk()
-      useSddDraftStore.getState().clearActiveDraft()
-    }
     setConnectPhoneSidebarOpen(false)
-    setRoute('chat')
-    void selectThread(id)
+    void (async () => {
+      const thread = threads.find((item) => item.id === id) ?? null
+      const sddDraft = await findSddDraftForSidebarThread(id, thread)
+      if (sddDraft) {
+        markSddAssistantThread(sddDraft, id)
+        await openSddRequirementDraftFromHistory(sddDraft)
+        void useChatStore.getState().refreshThreads()
+        return
+      }
+      if (useSddDraftStore.getState().activeDraft) dismissActiveSddDraft({ closeAssistant: true })
+      setRoute('chat')
+      await selectThread(id)
+    })()
   }
 
   const startNewChat = (): void => {
-    if (activeSddDraft) {
-      void saveActiveSddDraftToDisk()
-      useSddDraftStore.getState().clearActiveDraft()
-    }
+    if (activeSddDraft) dismissActiveSddDraft({ closeAssistant: true })
     setConnectPhoneSidebarOpen(false)
     setRoute('chat')
-    void createThread()
+    void createThread({ useWorktreePool, worktreeBranch })
+    if (useWorktreePool) setUseWorktreePool(false)
   }
 
   const startNewChatInWorkspace = (workspaceRoot: string): void => {
-    if (activeSddDraft) {
-      void saveActiveSddDraftToDisk()
-      useSddDraftStore.getState().clearActiveDraft()
-    }
+    if (activeSddDraft) dismissActiveSddDraft({ closeAssistant: true })
     setConnectPhoneSidebarOpen(false)
     setRoute('chat')
-    void createThread({ workspaceRoot })
+    void createThread({ workspaceRoot, useWorktreePool, worktreeBranch })
+    if (useWorktreePool) setUseWorktreePool(false)
   }
 
   const openCodeMode = (): void => {
@@ -1216,21 +2130,24 @@ export function Workbench(): ReactElement {
     openSchedule()
   }
 
+  const openWorkflowView = (): void => {
+    setConnectPhoneSidebarOpen(false)
+    openWorkflow()
+  }
+
   const toggleConnectPhone = (): void => {
-    if (activeSddDraft) {
-      void saveActiveSddDraftToDisk()
-      useSddDraftStore.getState().clearActiveDraft()
-      if (rightPanelMode === 'sdd-ai') setRightPanelMode(null)
-    }
+    if (activeSddDraft) dismissActiveSddDraft({ closeAssistant: true })
     openClaw()
     setConnectPhoneSidebarOpen((open) => !open)
   }
 
-  const sidebarView: 'chat' | 'write' | 'claw' | 'schedule' =
+  const sidebarView: 'chat' | 'write' | 'claw' | 'schedule' | 'workflow' =
     route === 'claw' || (route === 'plugins' && pluginHostRoute === 'claw')
       ? 'claw'
       : route === 'schedule'
         ? 'schedule'
+      : route === 'workflow'
+        ? 'workflow'
       : route === 'write'
         ? 'write'
         : 'chat'
@@ -1240,6 +2157,7 @@ export function Workbench(): ReactElement {
       setWriteAssistantOpen(false)
       return
     }
+    if (rightPanelMode === 'file') setOpenFilePreviewTargets([])
     setRightPanelMode(null)
     setFilePreviewTarget(null)
   }
@@ -1252,23 +2170,70 @@ export function Workbench(): ReactElement {
     void createWriteThread(writeWorkspaceRoot)
   }
 
-  const renderRuntimeBanner = (message: string): ReactElement => (
+  const pickWriteAssistantWorkspace = async (): Promise<void> => {
+    try {
+      const writeState = useWriteWorkspaceStore.getState()
+      writeState.setFileError(null)
+      if (typeof window.kunGui?.pickWorkspaceDirectory !== 'function') {
+        throw new Error('workspace:pick-directory unavailable')
+      }
+      const picked = await window.kunGui.pickWorkspaceDirectory(
+        writeState.workspaceRoot || writeState.defaultWorkspaceRoot || workspaceRoot || undefined
+      )
+      if (!picked.canceled && picked.path) {
+        await useWriteWorkspaceStore.getState().addWriteWorkspace(picked.path)
+        if (runtimeConnection === 'ready') void ensureWriteThreadForWorkspace(picked.path)
+      }
+    } catch (error) {
+      useWriteWorkspaceStore.getState().setFileError(formatWorkspacePickerError(error))
+    }
+  }
+
+  const renderRuntimeBanner = (message: string, detail?: string | null): ReactElement => (
     <RuntimeBanner
       message={message}
+      detail={detail}
+      logPath={runtimeLogPath || null}
       runtimeReady={runtimeConnection === 'ready'}
       stageInsetClass={stageInsetClass}
       t={t}
+      onOpenLogDir={
+        typeof window !== 'undefined' && typeof window.kunGui?.openLogDir === 'function'
+          ? () => window.kunGui.openLogDir()
+          : undefined
+      }
       onOpenSettings={() => openSettings('agents')}
-      onRetryConnection={() => void probeRuntime('user')}
+      onRetryConnection={() => void probeRuntime('user', { restart: true })}
     />
   )
 
-  const writeRuntimeBannerMessage = runtimeConnection !== 'ready'
-    ? (error?.trim() || t('writeRuntimeUnavailable'))
-    : null
+  const runtimeErrorSuppressed = shouldSuppressRuntimeErrorBanner(runtimeStatus)
+  const visibleRuntimeError = runtimeErrorSuppressed ? null : error
+  const visibleRuntimeErrorDetail = runtimeErrorSuppressed ? null : runtimeErrorDetail
+  const writeRuntimeBannerMessage = resolveWriteRuntimeBannerMessage({
+    runtimeConnection,
+    error: visibleRuntimeError,
+    runtimeActionNeedsConnection: t('runtimeActionNeedsConnection')
+  })
+  const rightPanelDockedVisible = rightPanelVisible && !planPanelInOverlay
+  const fileTreeSidePanelOffset = fileTreeSidePanelOpen ? FILE_TREE_SIDEBAR_WIDTH + 24 : 0
+
+  const renderPlanPanel = (className: string): ReactElement => (
+    <PlanPanel
+      workspaceRoot={workspaceRoot}
+      activeThreadId={activeThreadId}
+      runtimeReady={runtimeConnection === 'ready'}
+      busy={busy}
+      className={className}
+      onCollapse={closeRightPanel}
+      onBuildPlan={() => void buildGuiPlan()}
+      onVerifyPlan={() => void verifyGuiPlan()}
+      onReplanChanged={(ids) => void replanChangedRequirements(ids)}
+    />
+  )
 
   const renderRightPanel = (): ReactElement | null => {
-    if (!rightPanelVisible) return null
+    if (!rightPanelDockedVisible) return null
     return (
       <>
         <div
@@ -1292,6 +2257,7 @@ export function Workbench(): ReactElement {
                 liveReasoning={liveReasoning}
                 liveAssistant={liveAssistant}
                 composerModel={writeAssistantModel}
+                composerProviderId={resolvedWriteAssistantProviderId}
                 composerPickList={writeAssistantPickList}
                 composerModelGroups={composerModelGroups}
                 composerReasoningEffort={composerReasoningEffort}
@@ -1299,11 +2265,20 @@ export function Workbench(): ReactElement {
                 setComposerReasoningEffort={setComposerReasoningEffort}
                 queuedMessages={queuedMessages}
                 removeQueuedMessage={removeQueuedMessage}
+                attachments={composerAttachments}
+                attachmentUploadEnabled={attachmentUploadEnabled}
+                attachmentUploadBusy={attachmentUploadBusy}
+                attachmentUploadError={attachmentUploadError}
+                onPickAttachments={(files) => void handlePickAttachments(files)}
+                onPasteClipboardImage={(options) => void handlePasteClipboardImage(options)}
+                onRemoveAttachment={removeComposerAttachment}
                 onSend={handleSend}
                 onInterrupt={(options) => void interrupt(options)}
-                onRetryConnection={() => void probeRuntime('user')}
+                onRetryConnection={() => void probeRuntime('user', { restart: true })}
                 onOpenSettings={() => openSettings('agents')}
+                onConfigureProviders={() => openSettings('providers')}
                 onNewConversation={startNewWriteAssistantConversation}
+                onPickWorkspace={() => void pickWriteAssistantWorkspace()}
                 onCollapse={closeRightPanel}
                 className="h-full max-h-full w-full"
               />
@@ -1321,6 +2296,7 @@ export function Workbench(): ReactElement {
                 liveReasoning={liveReasoning}
                 liveAssistant={liveAssistant}
                 composerModel={writeAssistantModel}
+                composerProviderId={resolvedWriteAssistantProviderId}
                 composerPickList={writeAssistantPickList}
                 composerModelGroups={composerModelGroups}
                 composerReasoningEffort={composerReasoningEffort}
@@ -1328,12 +2304,23 @@ export function Workbench(): ReactElement {
                 setComposerReasoningEffort={setComposerReasoningEffort}
                 queuedMessages={queuedMessages}
                 removeQueuedMessage={removeQueuedMessage}
+                attachments={composerAttachments}
+                attachmentUploadEnabled={attachmentUploadEnabled}
+                attachmentUploadBusy={attachmentUploadBusy}
+                attachmentUploadError={attachmentUploadError}
+                onPickAttachments={(files) => void handlePickAttachments(files)}
+                onPasteClipboardImage={(options) => void handlePasteClipboardImage(options)}
+                onRemoveAttachment={removeComposerAttachment}
                 onSend={handleSend}
                 onInterrupt={(options) => void interrupt(options)}
-                onRetryConnection={() => void probeRuntime('user')}
+                onRetryConnection={() => void probeRuntime('user', { restart: true })}
                 onOpenSettings={() => openSettings('agents')}
+                onConfigureProviders={() => openSettings('providers')}
+                onApplyFramework={applySddFramework}
                 onNewConversation={() => {
                   setInput('')
+                  pendingSddFrameworkRef.current = null
+                  pendingSddFrameworkPromptRef.current = null
                   void createSddAssistantThreadForDraft(activeSddDraft)
                 }}
                 onCollapse={closeRightPanel}
@@ -1359,26 +2346,77 @@ export function Workbench(): ReactElement {
                 onCollapse={closeRightPanel}
               />
             ) : rightPanelMode === 'plan' ? (
-              <PlanPanel
-                workspaceRoot={workspaceRoot}
-                activeThreadId={activeThreadId}
-                runtimeReady={runtimeConnection === 'ready'}
-                busy={busy}
-                className="h-full max-h-full w-full"
-                onCollapse={closeRightPanel}
-                onBuildPlan={() => void buildGuiPlan()}
-              />
+              renderPlanPanel('h-full max-h-full w-full')
             ) : (
               <WorkspaceFilePreviewPanel
                 target={filePreviewTarget}
+                openTargets={openFilePreviewTargets}
                 workspaceRoot={workspaceRoot}
                 className="h-full max-h-full w-full"
+                onSelectTarget={openWorkspaceFilePreviewTarget}
+                onCloseTarget={closeWorkspaceFilePreviewTarget}
                 onClose={closeRightPanel}
               />
             )}
           </Suspense>
         </div>
       </>
+    )
+  }
+
+  const renderFileTreeSidePanel = (): ReactElement | null => {
+    if (!fileTreeSidePanelOpen) return null
+    return (
+      <>
+        <div
+          role="separator"
+          aria-orientation="vertical"
+          className="ds-workbench-divider ds-no-drag relative z-20 shrink-0"
+        />
+        <aside
+          className="ds-no-drag h-full min-h-0 shrink-0 border-l border-ds-border-muted bg-ds-sidebar"
+          style={{ width: FILE_TREE_SIDEBAR_WIDTH }}
+        >
+          {fileTreeWorkspaceRoot ? (
+            <ChatFileTreePanel
+              workspaceRoot={fileTreeWorkspaceRoot}
+              selectedPath={filePreviewTarget?.path}
+              onPreviewFile={previewWorkspaceFileFromSidebar}
+              onAddReference={addWorkspaceReferenceFromSidebar}
+              t={t}
+              fill
+            />
+          ) : (
+            <div className="px-4 py-3 text-[12px] leading-5 text-ds-muted">
+              {t('workspaceRequiredToCreateThread')}
+            </div>
+          )}
+        </aside>
+      </>
+    )
+  }
+
+  const renderPlanPanelOverlay = (): ReactElement | null => {
+    if (!planPanelInOverlay) return null
+    return (
+      <div
+        className="ds-plan-panel-overlay ds-no-drag"
+        role="dialog"
+        aria-modal="true"
+        aria-label={t('planPanelTitle')}
+      >
+        <button
+          type="button"
+          className="ds-plan-panel-overlay-backdrop"
+          aria-label={t('cancel')}
+          onClick={closeRightPanel}
+        />
+        <div className="ds-plan-panel-overlay-card">
+          <Suspense fallback={<div className="h-full w-full bg-ds-sidebar" />}>
+            {renderPlanPanel('h-full max-h-full w-full')}
+          </Suspense>
+        </div>
+      </div>
     )
   }
 
@@ -1392,13 +2430,12 @@ export function Workbench(): ReactElement {
           <div className="min-h-0 shrink-0" style={{ width: leftSidebarWidth }}>
             {route === 'write' ? (
               <WriteSidebar
-                activeView={sidebarView}
+                activeView="write"
                 connectPhoneSidebarOpen={connectPhoneSidebarOpen}
                 onCodeOpen={openCodeMode}
                 onWriteOpen={openWriteMode}
                 onOpenSettings={(section) => openSettings(section)}
                 onToggleConnectPhone={toggleConnectPhone}
-                onToggleSidebar={toggleLeftSidebar}
               />
             ) : (
             <Sidebar
@@ -1411,7 +2448,6 @@ export function Workbench(): ReactElement {
               threadSearch={threadSearch}
               showArchivedThreads={showArchivedThreads}
               onThreadSearchChange={setThreadSearch}
-              onShowArchivedThreadsChange={setShowArchivedThreads}
               onSelectThread={openThread}
               onRenameThread={renameThread}
               onArchiveThread={(id) => archiveThread(id, true)}
@@ -1420,13 +2456,16 @@ export function Workbench(): ReactElement {
               onNewChat={startNewChat}
               onNewChatInWorkspace={startNewChatInWorkspace}
               onNewRequirement={() => void startNewSddRequirement()}
+              onOpenRequirementDraft={(draft) => void openSddRequirementDraftFromHistory(draft)}
               onOpenSettings={(section) => openSettings(section)}
               onOpenPlugins={openPluginsView}
+              focusModeEnabled={focusModeEnabled}
+              onFocusModeChange={updateFocusMode}
               onToggleConnectPhone={toggleConnectPhone}
               onCodeOpen={openCodeMode}
               onWriteOpen={openWriteMode}
               onScheduleOpen={openScheduleView}
-              onToggleSidebar={toggleLeftSidebar}
+              onWorkflowOpen={openWorkflowView}
             />
             )}
           </div>
@@ -1465,9 +2504,17 @@ export function Workbench(): ReactElement {
               onOpenThread={openThread}
             />
           </Suspense>
+        ) : route === 'workflow' ? (
+          <Suspense fallback={<div className="h-full bg-ds-main" />}>
+            <WorkflowView
+              leftSidebarCollapsed={leftSidebarCollapsed}
+              onToggleLeftSidebar={toggleLeftSidebar}
+              onOpenThread={openThread}
+            />
+          </Suspense>
         ) : route === 'write' ? (
           <>
-            {writeRuntimeBannerMessage ? renderRuntimeBanner(writeRuntimeBannerMessage) : null}
+            {writeRuntimeBannerMessage ? renderRuntimeBanner(writeRuntimeBannerMessage, visibleRuntimeErrorDetail) : null}
             <div className="flex min-h-0 flex-1">
               <WriteWorkspaceView
                 leftSidebarCollapsed={leftSidebarCollapsed}
@@ -1475,47 +2522,49 @@ export function Workbench(): ReactElement {
                 input={input}
                 setInput={setInput}
                 onSubmitPrompt={sendWritePrompt}
+                onOpenAgentSettings={() => openSettings('write')}
               />
               {renderRightPanel()}
             </div>
           </>
         ) : (
           <>
-        {error && !(runtimeConnection !== 'ready' && !activeThreadId) ? renderRuntimeBanner(error) : null}
+        {visibleRuntimeError && !(runtimeConnection !== 'ready' && !activeThreadId)
+          ? renderRuntimeBanner(visibleRuntimeError, visibleRuntimeErrorDetail)
+          : null}
 
         <div className="flex min-h-0 flex-1">
-          <div className={`flex min-h-0 min-w-0 flex-1 ${activeSddDraft ? '' : stageInsetClass}`}>
+          <div className="flex min-h-0 min-w-0 flex-1">
           {activeSddDraft ? (
             <SddDraftEditorView
               leftSidebarCollapsed={leftSidebarCollapsed}
+              assistantOpen={rightPanelMode === 'sdd-ai'}
               onToggleLeftSidebar={toggleLeftSidebar}
+              onToggleAssistant={() => void toggleSddAssistantPanel()}
+              onAssistantQuote={quoteToSddAssistant}
+              onPrototypeTurn={sendSddPrototypeTurn}
               onNext={() => void handleSddNextStep()}
-              onClose={() => {
-                void saveActiveSddDraftToDisk()
-                useSddDraftStore.getState().clearActiveDraft()
-                if (rightPanelMode === 'sdd-ai') setRightPanelMode(null)
-              }}
+              onClose={() => dismissActiveSddDraft({ closeAssistant: true })}
               nextDisabled={busy || runtimeConnection !== 'ready' || sddDraftOperationStatus === 'upgrading'}
             />
           ) : (
             <section className="ds-chat-stage ds-drag flex min-h-0 min-w-0 flex-1 flex-col">
+            <div className={`${stageInsetClass} flex min-h-0 min-w-0 flex-1 flex-col`}>
             <header className="chat-topbar ds-topbar-surface relative z-10 mt-3 flex min-h-[46px] w-full shrink-0 items-stretch overflow-visible rounded-[24px]">
-              <div className="chat-topbar-grid grid w-full min-w-0 items-center gap-2.5 px-3 py-2 sm:px-4 md:pl-5 md:pr-2">
+              <div className="chat-topbar-grid grid w-full min-w-0 items-start gap-2.5 px-3 py-2 sm:px-4 md:pl-5 md:pr-2">
                 <div
                   className={`chat-topbar-session flex min-w-0 items-center gap-2.5 ${
                     leftSidebarCollapsed ? 'ds-window-controls-safe-inset' : ''
                   }`}
                 >
-                  {leftSidebarCollapsed ? (
-                    <SidebarTitlebarToggleButton
-                      onClick={toggleLeftSidebar}
-                      title={t('sidebarExpand')}
-                      ariaLabel={t('sidebarExpand')}
-                    />
-                  ) : null}
+                  <SidebarTitlebarToggleButton
+                    onClick={toggleLeftSidebar}
+                    title={leftSidebarCollapsed ? t('sidebarExpand') : t('sidebarCollapse')}
+                    ariaLabel={leftSidebarCollapsed ? t('sidebarExpand') : t('sidebarCollapse')}
+                  />
                   <SessionHeader compact className="min-w-0 flex-1" />
                 </div>
-                <div className="chat-topbar-actions flex min-w-0 flex-wrap items-center justify-end gap-2">
+                <div className="chat-topbar-actions flex min-w-0 flex-wrap items-center justify-end gap-2 self-start">
                   {busy ? (
                     <span className="inline-flex shrink-0 rounded-full bg-amber-500/16 px-2.5 py-1 text-[11.5px] font-semibold text-amber-950 dark:text-amber-100">
                       {t('running')}
@@ -1525,38 +2574,49 @@ export function Workbench(): ReactElement {
                     rightPanelMode={rightPanelMode}
                     onToggleRightPanelMode={toggleRightPanelMode}
                     planPanelEnabled={Boolean(activeGuiPlan)}
+                    terminalOpen={terminalOpen}
+                    onToggleTerminal={toggleTerminal}
                     sideChatCount={currentSideConversations.length}
                     sideChatRunningCount={currentSideRunningCount}
                     sideChatOpen={sidePanel.open}
                     sideChatEnabled={runtimeConnection === 'ready' && Boolean(activeThreadId)}
+                    fileTreeOpen={fileTreeSidePanelOpen}
+                    fileTreeEnabled={Boolean(fileTreeWorkspaceRoot)}
+                    onToggleFileTree={toggleFileTreeSidePanel}
                     onOpenSideChat={openSideChat}
                   />
                 </div>
               </div>
             </header>
-            <MessageTimeline
-              blocks={timelineBlocks}
-              liveReasoning={timelineLiveReasoning}
-              live={timelineLiveAssistant}
-              activeThreadId={activeThreadId}
-              runtimeConnection={runtimeConnection}
-              onRetryConnection={() => void probeRuntime('user')}
-              onOpenSettings={() => openSettings('agents')}
-              onSelectSuggestion={(text) => setInput(text)}
-              planActionsBusy={busy}
-              onBuildPlan={() => void buildGuiPlan()}
-              onOpenPlan={openGuiPlanPanel}
-              devPreviewCard={
-                showDevPreviewCard ? (
-                  <DevPreviewLaunchCard
-                    url={latestDevPreviewUrl}
-                    opened={rightPanelMode === 'browser'}
-                    onOpen={openDevPreview}
-                  />
-                ) : null
-              }
-            />
-            <div className="flex shrink-0 justify-center px-2 pb-3 pt-0 sm:px-4 md:px-6 lg:px-8">
+            <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+              <MessageTimeline
+                blocks={timelineBlocks}
+                liveReasoning={timelineLiveReasoning}
+                live={timelineLiveAssistant}
+                activeThreadId={activeThreadId}
+                runtimeConnection={runtimeConnection}
+                runtimeError={error}
+                onRetryConnection={() => void probeRuntime('user', { restart: true })}
+                onOpenSettings={() => openSettings('agents')}
+                onSelectSuggestion={(text) => setInput(text)}
+                focusModeEnabled={focusModeEnabled}
+                planActionsBusy={busy}
+                onBuildPlan={() => void buildGuiPlan()}
+                onOpenPlan={openGuiPlanPanel}
+                devPreviewCard={
+                  showDevPreviewCard ? (
+                    <DevPreviewLaunchCard
+                      url={latestDevPreviewUrl}
+                      opened={rightPanelMode === 'browser'}
+                      onOpen={openDevPreview}
+                    />
+                  ) : null
+                }
+              />
+              {uiModeCameosEnabled && !focusModeEnabled ? <IkunCameoLayer /> : null}
+              {!focusModeEnabled ? <KunCelebrationLayer active={busy} suppressed={Boolean(error)} /> : null}
+            </div>
+            <div className="ds-no-drag flex shrink-0 justify-center px-2 pb-3 pt-0 sm:px-4 md:px-6 lg:px-8">
               <FloatingComposer
                 input={input}
                 setInput={setInput}
@@ -1565,26 +2625,38 @@ export function Workbench(): ReactElement {
                 busy={busy}
                 runtimeReady={runtimeConnection === 'ready'}
                 hasActiveThread={Boolean(activeThreadId)}
+                contextWindowTokens={selectedContextWindowTokens}
+                runtimeToolCount={
+                  runtimeInfo
+                    ? runtimeInfo.capabilities.mcp.search?.active
+                      ? runtimeInfo.capabilities.mcp.search.advertisedToolCount
+                      : runtimeInfo.capabilities.mcp.toolCount
+                    : undefined
+                }
+                runtimeSkillCount={runtimeInfo?.capabilities.skills.discoveredSkills}
                 composerModel={
                   route === 'claw'
                     ? clawChannels.find((channel) => channel.id === activeClawChannelId)?.model ?? 'auto'
                     : composerModel
                 }
+                composerProviderId={route === 'chat' ? composerProviderId : undefined}
                 composerPickList={composerPickList}
                 composerModelGroups={composerModelGroups}
                 composerReasoningEffort={
                   route === 'chat' || route === 'claw' ? composerReasoningEffort : undefined
                 }
-                onComposerModelChange={(modelId) => {
+                lockVisionToTextModelSwitch={lockVisionToTextModelSwitch}
+                onComposerModelChange={(modelId, providerId) => {
                   if (route === 'claw' && activeClawChannelId) {
                     void setClawChannelModel(activeClawChannelId, modelId)
                     return
                   }
-                  setComposerModel(modelId)
+                  setComposerModel(modelId, providerId)
                 }}
                 onComposerReasoningEffortChange={
                   route === 'chat' || route === 'claw' ? setComposerReasoningEffort : undefined
                 }
+                onConfigureProviders={() => openSettings('providers')}
                 onSend={handleSend}
                 attachments={composerAttachments}
                 attachmentUploadEnabled={attachmentUploadEnabled}
@@ -1593,7 +2665,12 @@ export function Workbench(): ReactElement {
                 fileReferenceEnabled={route === 'chat' && !activeSddDraft}
                 fileReferences={composerFileReferences}
                 webAccessAvailable={webAccessAvailable}
+                executionSettings={composerExecutionSettings}
+                executionSettingsApplying={composerExecutionApplying}
+                changedFiles={composerChangeSummary?.files}
+                changedFileStats={composerChangeSummary}
                 skillCommands={runtimeSkills}
+                disabledSkillIds={disabledSkillIds}
                 onPickAttachments={(files) => void handlePickAttachments(files)}
                 onPasteClipboardImage={(options) => void handlePasteClipboardImage(options)}
                 onRemoveAttachment={removeComposerAttachment}
@@ -1603,7 +2680,16 @@ export function Workbench(): ReactElement {
                 onRemoveQueuedMessage={removeQueuedMessage}
                 onInterrupt={(options) => void interrupt(options)}
                 onPlanCommand={() => void handleGuiPlanCommand()}
+                useWorktreePool={useWorktreePool}
+                worktreeBranch={worktreeBranch}
+                onWorktreeBranchChange={setWorktreeBranch}
+                onToggleWorktreeMode={() => setUseWorktreePool((v) => !v)}
+                onNewCommand={() => void createThread({ workspaceRoot: activeSkillWorkspace, forceNew: true })}
                 onReviewCommand={(target) => void reviewActiveThread(target)}
+                onExecutionSettingsChange={updateComposerExecutionSettings}
+                onOpenChanges={() => setRightPanelMode('changes')}
+                onReviewChanges={() => void reviewActiveThread({ kind: 'uncommittedChanges' })}
+                reviewChangesDisabled={busy || runtimeConnection !== 'ready'}
                 onBtwCommand={(seedText) => {
                   if (seedText?.trim()) {
                     void spawnSideConversation(seedText)
@@ -1613,20 +2699,48 @@ export function Workbench(): ReactElement {
                 }}
               />
             </div>
+            </div>
+            {terminalOpen ? (
+              <div className="ds-no-drag flex w-full shrink-0 flex-col px-0 pb-0">
+                <div
+                  role="separator"
+                  aria-orientation="horizontal"
+                  className="relative z-20 h-1 shrink-0 cursor-row-resize bg-transparent transition hover:bg-ds-border-muted"
+                  onPointerDown={beginTerminalResize}
+                />
+                <Suspense fallback={<div className="ds-surface-strong h-full w-full" />}>
+                  <TerminalPanel
+                    workspaceRoot={fileTreeWorkspaceRoot}
+                    height={terminalHeight}
+                    className="w-full"
+                    onCollapse={toggleTerminal}
+                  />
+                </Suspense>
+              </div>
+            ) : null}
           </section>
           )}
           </div>
 
           {route === 'chat' && !activeSddDraft ? (
-            <SideConversationPanel rightOffset={rightPanelVisible ? rightSidebarWidth + 24 : 24} />
+            <SideConversationPanel
+              rightOffset={(rightPanelDockedVisible ? rightSidebarWidth + 24 : 24) + fileTreeSidePanelOffset}
+            />
           ) : null}
 
           {renderRightPanel()}
+          {renderFileTreeSidePanel()}
         </div>
 
           </>
         )}
+        {renderPlanPanelOverlay()}
       </main>
+      {route === 'chat' ? (
+        <Suspense fallback={null}>
+          <WorkflowRunPanel enabled />
+        </Suspense>
+      ) : null}
     </div>
   )
 }

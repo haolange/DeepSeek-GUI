@@ -19,6 +19,12 @@ export const UsageSnapshotSchema = z.object({
   turns: z.number().int().nonnegative(),
   costUsd: z.number().nonnegative().optional(),
   costCny: z.number().nonnegative().optional(),
+  /**
+   * @deprecated Savings are reported in tokens only (cache hits via
+   * `cacheHitTokens`, compression via `tokenEconomySavingsTokens`).
+   * The money fields remain parseable for persisted threads recorded
+   * by older runtimes but are no longer populated.
+   */
   cacheSavingsUsd: z.number().nonnegative().optional(),
   cacheSavingsCny: z.number().nonnegative().optional(),
   tokenEconomySavingsTokens: z.number().int().nonnegative().optional(),
@@ -75,7 +81,14 @@ export type DailyUsageResponse = z.infer<typeof DailyUsageResponseSchema>
 export const ThreadUsageBucketSchema = DailyUsageCountersSchema.omit({
   thread_count: true
 }).extend({
-  thread_id: z.string().min(1)
+  thread_id: z.string().min(1),
+  /**
+   * Cache hit rate of the most recent turn (by completedAt), distinct from the
+   * thread-cumulative `cache_hit_rate`. The cumulative rate is dragged down by
+   * the unavoidable cold first turn; this reflects steady-state caching for the
+   * usage chip. Null when the latest turn had no cache telemetry.
+   */
+  last_turn_cache_hit_rate: z.number().min(0).max(1).nullable().default(null)
 })
 export type ThreadUsageBucket = z.infer<typeof ThreadUsageBucketSchema>
 
@@ -121,9 +134,5 @@ export const emptyUsageSnapshot = (): UsageSnapshot => ({
   cacheMissTokens: 0,
   cacheHitRate: null,
   turns: 0,
-  cacheSavingsUsd: 0,
-  cacheSavingsCny: 0,
-  tokenEconomySavingsTokens: 0,
-  tokenEconomySavingsUsd: 0,
-  tokenEconomySavingsCny: 0
+  tokenEconomySavingsTokens: 0
 })

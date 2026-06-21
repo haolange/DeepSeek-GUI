@@ -16,9 +16,11 @@ import {
 } from './claw-schedule-mcp-config'
 import {
   defaultClawSettings,
+  defaultKeyboardShortcuts,
   defaultKunRuntimeSettings,
   defaultModelProviderSettings,
   defaultScheduleSettings,
+  defaultWorkflowSettings,
   defaultWriteSettings,
   type AppSettingsV1
 } from '../shared/app-settings'
@@ -43,6 +45,8 @@ function createSettings(patch: Partial<AppSettingsV1['schedule']['internal']> = 
     notifications: {
       turnComplete: true
     },
+    appBehavior: { openAtLogin: false, startMinimized: false, closeToTray: false },
+    keyboardShortcuts: defaultKeyboardShortcuts(),
     write: defaultWriteSettings(),
     schedule: {
       ...schedule,
@@ -51,9 +55,12 @@ function createSettings(patch: Partial<AppSettingsV1['schedule']['internal']> = 
         ...patch
       }
     },
+    workflow: defaultWorkflowSettings(),
     guiUpdate: {
       channel: 'stable'
     },
+    codePromptPrefix: '',
+    disabledSkillIds: [],
     claw: {
       ...claw,
       enabled: true,
@@ -68,8 +75,8 @@ function createSettings(patch: Partial<AppSettingsV1['schedule']['internal']> = 
 }
 
 const launch: ClawScheduleMcpLaunchConfig = {
-  appPath: '/Applications/DeepSeek GUI.app',
-  execPath: '/Applications/DeepSeek GUI.app/Contents/MacOS/DeepSeek GUI',
+  appPath: '/Applications/Kun.app',
+  execPath: '/Applications/Kun.app/Contents/MacOS/Kun',
   isPackaged: false
 }
 
@@ -110,7 +117,9 @@ describe('claw schedule MCP config', () => {
           '--base-url',
           'http://127.0.0.1:9787',
           '--secret',
-          'top-secret'
+          'top-secret',
+          '--workflow-base-url',
+          'http://127.0.0.1:8799'
         ],
         env: {
           ELECTRON_RUN_AS_NODE: '1'
@@ -124,7 +133,7 @@ describe('claw schedule MCP config', () => {
 
   it('uses the macOS Electron helper for real app bundle paths', () => {
     expect(resolveClawScheduleMcpCommand(launch, 'darwin')).toBe(
-      '/Applications/DeepSeek GUI.app/Contents/Frameworks/DeepSeek GUI Helper.app/Contents/MacOS/DeepSeek GUI Helper'
+      '/Applications/Kun.app/Contents/Frameworks/Kun Helper.app/Contents/MacOS/Kun Helper'
     )
     expect(resolveClawScheduleMcpCommand({
       appPath: '/tmp/deepseek-gui-test-app',
@@ -227,7 +236,9 @@ describe('claw schedule MCP config', () => {
             resolveClawScheduleMcpNodeEntryPath(launch),
             '--gui-schedule-mcp-server',
             '--base-url',
-            'http://127.0.0.1:8788'
+            'http://127.0.0.1:8788',
+            '--workflow-base-url',
+            'http://127.0.0.1:8799'
           ],
           env: {
             ELECTRON_RUN_AS_NODE: '1'

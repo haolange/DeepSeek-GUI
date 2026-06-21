@@ -5,9 +5,11 @@ import { join } from 'node:path'
 import {
   DEFAULT_DEEPSEEK_BASE_URL,
   defaultClawSettings,
+  defaultKeyboardShortcuts,
   defaultKunRuntimeSettings,
   defaultModelProviderSettings,
   defaultScheduleSettings,
+  defaultWorkflowSettings,
   defaultWriteSettings,
   migrateLegacyAppSettings,
   type AppSettingsV1
@@ -116,10 +118,15 @@ describe('Kun single-agent regression', () => {
       workspaceRoot: '/tmp',
       log: { enabled: true, retentionDays: 7 },
       notifications: { turnComplete: true },
+      appBehavior: { openAtLogin: false, startMinimized: false, closeToTray: false },
+      keyboardShortcuts: defaultKeyboardShortcuts(),
       write: defaultWriteSettings(),
       claw: defaultClawSettings(),
       schedule: defaultScheduleSettings(),
-      guiUpdate: { channel: 'stable' }
+      workflow: defaultWorkflowSettings(),
+      guiUpdate: { channel: 'stable' },
+      codePromptPrefix: '',
+      disabledSkillIds: []
     }
 
     expect(kunRuntimeAdapter.id).toBe('kun')

@@ -3,9 +3,11 @@ import type { AddressInfo } from 'node:net'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   defaultClawSettings,
+  defaultKeyboardShortcuts,
   defaultKunRuntimeSettings,
   defaultModelProviderSettings,
   defaultScheduleSettings,
+  defaultWorkflowSettings,
   defaultWriteSettings,
   type AppSettingsV1
 } from '../../shared/app-settings'
@@ -29,10 +31,15 @@ function settingsForPort(port: number): AppSettingsV1 {
     workspaceRoot: '/tmp',
     log: { enabled: true, retentionDays: 7 },
     notifications: { turnComplete: true },
+    appBehavior: { openAtLogin: false, startMinimized: false, closeToTray: false },
+    keyboardShortcuts: defaultKeyboardShortcuts(),
     write: defaultWriteSettings(),
     claw: defaultClawSettings(),
     schedule: defaultScheduleSettings(),
-    guiUpdate: { channel: 'stable' }
+    workflow: defaultWorkflowSettings(),
+    guiUpdate: { channel: 'stable' },
+    codePromptPrefix: '',
+    disabledSkillIds: []
   }
 }
 
@@ -104,5 +111,25 @@ describe('runtimeRequestViaHost', () => {
     expect(JSON.parse(response.body)).toEqual(expect.objectContaining({ group_by: 'day' }))
     expect(seenUrl).toBe('/v1/usage?group_by=day&from=2026-06-01&to=2026-06-02&timezone=Asia%2FShanghai')
     expect(seenAuthorization).toBe('Bearer usage-token')
+  })
+
+  it('uses settings returned by ensureRuntime when the managed port changes', async () => {
+    let seenUrl = ''
+    const port = await listen((req, res) => {
+      seenUrl = req.url ?? ''
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ ok: true }))
+    })
+
+    const response = await runtimeRequestViaHost(
+      settingsForPort(1),
+      '/v1/threads?limit=1',
+      { method: 'GET' },
+      async () => settingsForPort(port)
+    )
+
+    expect(response.ok).toBe(true)
+    expect(response.status).toBe(200)
+    expect(seenUrl).toBe('/v1/threads?limit=1')
   })
 })

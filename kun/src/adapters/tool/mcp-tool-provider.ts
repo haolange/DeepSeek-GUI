@@ -1,5 +1,6 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { createHash } from 'node:crypto'
+import { posix, win32 } from 'node:path'
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
@@ -71,12 +72,54 @@ export type McpToolProviderBuildResult = {
   search: McpSearchRuntimeDiagnostic
   connectedServers: number
   toolCount: number
+  /**
+   * Begin retrying servers that failed/timed out during the fast startup pass.
+   * Call once, after the tool registries exist, passing a callback that adds a
+   * late-connected server's provider to them. Without this, a server that loses
+   * the startup race (e.g. an npx-based stdio server whose first cold start
+   * exceeds the connect timeout on Windows) stays "error" forever until the
+   * whole runtime restarts — exactly issue #342. Safe to call when there is
+   * nothing to retry (it no-ops). The returned promise resolves once every
+   * failed server has reconnected or exhausted its retries (used by tests).
+   */
+  startBackgroundReconnect: (register: (provider: CapabilityToolProvider) => void) => Promise<void>
   close: () => Promise<void>
 }
 
 export type McpToolProviderOptions = {
   clientFactory?: (serverId: string, server: McpServerConfig) => Promise<McpClientLike>
   nowIso?: () => string
+  /**
+   * Upper bound for connect + initial tool listing per server during startup.
+   * A slow or hung server (e.g. an npx-based stdio server resolving packages)
+   * must not keep the whole runtime from reporting ready.
+   */
+  startupConnectTimeoutMs?: number
+  /** Tunables for the post-startup background reconnect of failed servers. */
+  backgroundReconnect?: McpBackgroundReconnectOptions
+  /** Test seam for the inter-attempt backoff; defaults to a real unref'd timer. */
+  delay?: (ms: number) => Promise<void>
+}
+
+export type McpBackgroundReconnectOptions = {
+  /** Disable the retry loop entirely. Defaults to enabled. */
+  enabled?: boolean
+  /** Attempts per failed server before giving up. Default 5. */
+  maxAttempts?: number
+  /** First backoff delay; doubles each attempt up to maxDelayMs. Default 4000. */
+  baseDelayMs?: number
+  /** Backoff ceiling. Default 30000. */
+  maxDelayMs?: number
+}
+
+const DEFAULT_MCP_STARTUP_CONNECT_TIMEOUT_MS = 10_000
+const DEFAULT_MCP_RECONNECT_MAX_ATTEMPTS = 5
+const DEFAULT_MCP_RECONNECT_BASE_DELAY_MS = 4_000
+const DEFAULT_MCP_RECONNECT_MAX_DELAY_MS = 30_000
+
+export type McpStdioEnvironmentOptions = {
+  platform?: NodeJS.Platform
+  baseEnv?: NodeJS.ProcessEnv
 }
 
 type McpConnectionState = {
@@ -124,40 +167,80 @@ export async function buildMcpToolProviders(
       }),
       connectedServers: 0,
       toolCount: 0,
+      startBackgroundReconnect: async () => undefined,
       close: async () => undefined
     }
   }
 
-  for (const [serverId, server] of Object.entries(mcp.servers)) {
-    if (!server.enabled) {
-      diagnostics.push(serverDiagnostic({ serverId, server }, 'disabled', 0))
+  // Connect all servers in parallel — startup previously paid the sum of
+  // every server's connect + list latency, and a single hung server (e.g.
+  // npx resolving a package) blocked the runtime ready signal forever.
+  const startupTimeoutMs = options.startupConnectTimeoutMs ?? DEFAULT_MCP_STARTUP_CONNECT_TIMEOUT_MS
+  type ConnectOutcome =
+    | { serverId: string; server: McpServerConfig; status: 'disabled' }
+    | { serverId: string; server: McpServerConfig; status: 'error'; error: unknown }
+    | {
+        serverId: string
+        server: McpServerConfig
+        status: 'connected'
+        state: McpConnectionState
+        listed: McpToolDescriptor[]
+      }
+  const outcomes = await Promise.all(
+    Object.entries(mcp.servers).map(async ([serverId, server]): Promise<ConnectOutcome> => {
+      if (!server.enabled) {
+        return { serverId, server, status: 'disabled' }
+      }
+      const attempt = (async () => {
+        const client = await clientFactory(serverId, server)
+        const state: McpConnectionState = {
+          serverId,
+          server,
+          client,
+          clientFactory,
+          nowIso,
+          lastConnectedAt: nowIso()
+        }
+        const listed = await refreshMcpConnectionCatalog(state)
+        return { state, listed }
+      })()
+      try {
+        const result = await raceStartupTimeout(attempt, startupTimeoutMs, serverId)
+        return { serverId, server, status: 'connected', ...result }
+      } catch (error) {
+        return { serverId, server, status: 'error', error }
+      }
+    })
+  )
+
+  for (const outcome of outcomes) {
+    if (outcome.status === 'disabled') {
+      diagnostics.push(serverDiagnostic({ serverId: outcome.serverId, server: outcome.server }, 'disabled', 0))
       continue
     }
-    try {
-      const client = await clientFactory(serverId, server)
-      const state: McpConnectionState = {
-        serverId,
-        server,
-        client,
-        clientFactory,
-        nowIso,
-        lastConnectedAt: nowIso()
-      }
-      connected.push(state)
-      const listed = await refreshMcpConnectionCatalog(state)
-      catalogState.records.push(...listed.map((tool) => createMcpSearchCatalogRecord(state, tool)))
-      const tools = listed.map((tool) => createMcpLocalTool(state, tool))
-      directProviders.push({
-        id: `mcp:${serverId}`,
-        kind: 'mcp',
-        enabled: true,
-        available: true,
-        tools
-      })
-      diagnostics.push(serverDiagnostic(state, 'connected', tools.length))
-    } catch (error) {
-      diagnostics.push(serverDiagnostic({ serverId, server }, 'error', 0, errorMessage(error)))
+    if (outcome.status === 'error') {
+      diagnostics.push(
+        serverDiagnostic(
+          { serverId: outcome.serverId, server: outcome.server },
+          'error',
+          0,
+          formatMcpConnectionError(outcome.error, outcome.server)
+        )
+      )
+      continue
     }
+    const { state, listed } = outcome
+    connected.push(state)
+    catalogState.records.push(...listed.map((tool) => createMcpSearchCatalogRecord(state, tool)))
+    const tools = listed.map((tool) => createMcpLocalTool(state, tool))
+    directProviders.push({
+      id: `mcp:${outcome.serverId}`,
+      kind: 'mcp',
+      enabled: true,
+      available: true,
+      tools
+    })
+    diagnostics.push(serverDiagnostic(state, 'connected', tools.length))
   }
 
   const connectedServers = diagnostics.filter((diagnostic) => diagnostic.status === 'connected').length
@@ -194,6 +277,13 @@ export async function buildMcpToolProviders(
     providers.push(...directProviders)
   }
   const advertisedToolCount = providers.reduce((total, provider) => total + provider.tools.length, 0)
+
+  const failedServers = outcomes.flatMap((outcome) =>
+    outcome.status === 'error' ? [{ serverId: outcome.serverId, server: outcome.server }] : []
+  )
+  let reconnectAborted = false
+  let reconnectStarted = false
+
   return {
     providers,
     diagnostics,
@@ -206,10 +296,139 @@ export async function buildMcpToolProviders(
     }),
     connectedServers,
     toolCount,
+    startBackgroundReconnect: (register) => {
+      if (reconnectStarted) return Promise.resolve()
+      reconnectStarted = true
+      if (failedServers.length === 0) return Promise.resolve()
+      if (options.backgroundReconnect?.enabled === false) return Promise.resolve()
+      return runMcpBackgroundReconnect({
+        failedServers,
+        clientFactory,
+        nowIso,
+        diagnostics,
+        connected,
+        catalogState,
+        searchActive,
+        register,
+        isAborted: () => reconnectAborted,
+        delay: options.delay ?? defaultMcpReconnectDelay,
+        options: options.backgroundReconnect
+      })
+    },
     close: async () => {
+      reconnectAborted = true
       await Promise.all(connected.map((state) => state.client.close().catch(() => undefined)))
     }
   }
+}
+
+type FailedMcpServer = { serverId: string; server: McpServerConfig }
+
+type McpBackgroundReconnectParams = {
+  failedServers: FailedMcpServer[]
+  clientFactory: (serverId: string, server: McpServerConfig) => Promise<McpClientLike>
+  nowIso: () => string
+  diagnostics: McpServerDiagnostic[]
+  connected: McpConnectionState[]
+  catalogState: McpSearchCatalogState
+  searchActive: boolean
+  register: (provider: CapabilityToolProvider) => void
+  isAborted: () => boolean
+  delay: (ms: number) => Promise<void>
+  options?: McpBackgroundReconnectOptions
+}
+
+/**
+ * Retry every server that lost the fast startup connect race. Each server is
+ * retried independently with exponential backoff; the per-attempt connect is
+ * bounded by the server's own `timeoutMs` (not the short startup race), so a
+ * cold `npx` download finally gets the time it needs. On success the server's
+ * tools are registered live and its diagnostic flips from "error" to
+ * "connected" — no full runtime restart required (issue #342).
+ */
+async function runMcpBackgroundReconnect(params: McpBackgroundReconnectParams): Promise<void> {
+  const maxAttempts = params.options?.maxAttempts ?? DEFAULT_MCP_RECONNECT_MAX_ATTEMPTS
+  const baseDelayMs = params.options?.baseDelayMs ?? DEFAULT_MCP_RECONNECT_BASE_DELAY_MS
+  const maxDelayMs = params.options?.maxDelayMs ?? DEFAULT_MCP_RECONNECT_MAX_DELAY_MS
+  await Promise.all(
+    params.failedServers.map((failed) =>
+      reconnectFailedMcpServer(params, failed, maxAttempts, baseDelayMs, maxDelayMs)
+    )
+  )
+}
+
+async function reconnectFailedMcpServer(
+  params: McpBackgroundReconnectParams,
+  failed: FailedMcpServer,
+  maxAttempts: number,
+  baseDelayMs: number,
+  maxDelayMs: number
+): Promise<void> {
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    if (params.isAborted()) return
+    await params.delay(Math.min(maxDelayMs, baseDelayMs * 2 ** (attempt - 1)))
+    if (params.isAborted()) return
+    try {
+      const client = await params.clientFactory(failed.serverId, failed.server)
+      const state: McpConnectionState = {
+        serverId: failed.serverId,
+        server: failed.server,
+        client,
+        clientFactory: params.clientFactory,
+        nowIso: params.nowIso,
+        lastConnectedAt: params.nowIso()
+      }
+      const listed = await refreshMcpConnectionCatalog(state)
+      if (params.isAborted()) {
+        await client.close().catch(() => undefined)
+        return
+      }
+      registerLateMcpConnection(params, state, listed)
+      return
+    } catch {
+      // Leave the diagnostic as "error" and try again until attempts run out.
+    }
+  }
+}
+
+function registerLateMcpConnection(
+  params: McpBackgroundReconnectParams,
+  state: McpConnectionState,
+  listed: McpToolDescriptor[]
+): void {
+  params.connected.push(state)
+  params.catalogState.records.push(...listed.map((tool) => createMcpSearchCatalogRecord(state, tool)))
+  const tools = listed.map((tool) => createMcpLocalTool(state, tool))
+  // In search mode the model reaches MCP tools through the search provider
+  // (which re-lists `connected`), so advertising them directly would double up.
+  // In direct mode, register the provider so its tools become callable.
+  if (!params.searchActive) {
+    try {
+      params.register({
+        id: `mcp:${state.serverId}`,
+        kind: 'mcp',
+        enabled: true,
+        available: true,
+        tools
+      })
+    } catch {
+      // A registry collision must not crash the loop; the diagnostic still
+      // flips to connected below so the UI stops showing the server as failed.
+    }
+  }
+  const diagnostic = serverDiagnostic(state, 'connected', tools.length)
+  const index = params.diagnostics.findIndex((entry) => entry.id === state.serverId)
+  if (index >= 0) params.diagnostics[index] = diagnostic
+  else params.diagnostics.push(diagnostic)
+}
+
+function defaultMcpReconnectDelay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms)
+    if (timer && typeof timer === 'object' && 'unref' in timer) {
+      ;(timer as { unref: () => void }).unref()
+    }
+  })
 }
 
 export function normalizeMcpToolName(serverId: string, toolName: string): string {
@@ -248,7 +467,7 @@ function createTransport(server: McpServerConfig): Transport {
       return new StdioClientTransport({
         command: server.command ?? '',
         args: server.args,
-        env: server.env,
+        env: buildMcpStdioEnvironment(server.env),
         stderr: 'pipe'
       })
     case 'streamable-http':
@@ -356,8 +575,55 @@ async function callMcpToolWithReconnect(
   } catch (error) {
     state.lastError = redactSecretText(errorMessage(error))
     if (signal?.aborted) throw error
+    // Deterministic server-side failures (validation errors, bad
+    // arguments) come back identically on a fresh connection; tearing
+    // down a healthy session for them just loses server state. Only
+    // transport-looking failures earn a reconnect + retry.
+    if (!looksLikeMcpTransportError(error)) throw error
     const client = await reconnectMcpConnection(state)
     return client.callTool(input, { signal, timeout })
+  }
+}
+
+function looksLikeMcpTransportError(error: unknown): boolean {
+  const message = errorMessage(error).toLowerCase()
+  return (
+    message.includes('connect') ||
+    message.includes('connection') ||
+    message.includes('transport') ||
+    message.includes('timed out') ||
+    message.includes('timeout') ||
+    message.includes('epipe') ||
+    message.includes('broken pipe') ||
+    message.includes('socket') ||
+    message.includes('stream closed') ||
+    message.includes('fetch failed') ||
+    message.includes('network')
+  )
+}
+
+async function raceStartupTimeout<T extends { state: McpConnectionState }>(
+  attempt: Promise<T>,
+  timeoutMs: number,
+  serverId: string
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      attempt,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`MCP server "${serverId}" did not connect within ${timeoutMs}ms during startup`)),
+          timeoutMs
+        )
+      })
+    ])
+  } catch (error) {
+    // A late successful connection would otherwise leak the child process.
+    void attempt.then((result) => result.state.client.close()).catch(() => undefined)
+    throw error
+  } finally {
+    if (timer) clearTimeout(timer)
   }
 }
 
@@ -413,13 +679,164 @@ function catalogFingerprint(values: readonly string[]): string {
 }
 
 function slug(value: string): string {
-  return value.trim().toLowerCase().replace(/[^a-z0-9_]+/g, '_').replace(/^_+|_+$/g, '') || 'tool'
+  let out = ''
+  for (const char of value.trim().toLowerCase()) {
+    if (isSlugChar(char)) {
+      out += char
+    } else if (out && out[out.length - 1] !== '_') {
+      out += '_'
+    }
+  }
+  return trimBoundaryUnderscores(out) || 'tool'
 }
 
 function normalizePathForTrust(value: string): string {
-  return value.replace(/\\/g, '/').replace(/\/+$/g, '')
+  return trimTrailingSlashes(value.replaceAll('\\', '/'))
+}
+
+function isSlugChar(char: string): boolean {
+  const code = char.charCodeAt(0)
+  return char === '_' || (code >= 48 && code <= 57) || (code >= 97 && code <= 122)
+}
+
+function trimBoundaryUnderscores(value: string): string {
+  let start = 0
+  let end = value.length
+  while (start < end && value[start] === '_') start += 1
+  while (end > start && value[end - 1] === '_') end -= 1
+  return value.slice(start, end)
+}
+
+function trimTrailingSlashes(value: string): string {
+  let end = value.length
+  while (end > 0 && value.charCodeAt(end - 1) === 47) end -= 1
+  return end === value.length ? value : value.slice(0, end)
 }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+export function buildMcpStdioEnvironment(
+  serverEnv: Record<string, string> = {},
+  options: McpStdioEnvironmentOptions = {}
+): Record<string, string> {
+  const platform = options.platform ?? process.platform
+  const baseEnv = options.baseEnv ?? process.env
+  const pathKey = findPathKey(serverEnv) ?? findPathKey(baseEnv) ?? 'PATH'
+  const configuredPath = readEnvPath(serverEnv)
+  const inheritedPath = readEnvPath(baseEnv)
+  const pathValue = mergePathEntries(
+    [configuredPath ?? inheritedPath ?? '', ...commonMcpCommandPathEntries(platform, baseEnv)],
+    pathDelimiter(platform)
+  )
+  return {
+    ...serverEnv,
+    ...(pathValue ? { [pathKey]: pathValue } : {})
+  }
+}
+
+export function formatMcpConnectionError(error: unknown, server: McpServerConfig): string {
+  const message = errorMessage(error)
+  if (server.transport !== 'stdio' || !isMissingExecutableError(error, message)) return message
+  const command = missingExecutableCommand(error) ?? server.command ?? 'configured command'
+  const hint = isBareCommand(command)
+    ? missingBareCommandHint(command)
+    : `Could not find MCP command "${command}". Check that the configured executable path exists.`
+  return `${message}. ${hint}`
+}
+
+function commonMcpCommandPathEntries(
+  platform: NodeJS.Platform,
+  env: NodeJS.ProcessEnv
+): string[] {
+  if (platform === 'darwin') {
+    return [
+      '/opt/homebrew/bin',
+      '/usr/local/bin',
+      '/opt/local/bin',
+      homePath(env, '.volta/bin'),
+      homePath(env, '.local/bin'),
+      homePath(env, '.bun/bin')
+    ].filter((entry): entry is string => Boolean(entry))
+  }
+  if (platform === 'linux') {
+    return [
+      '/home/linuxbrew/.linuxbrew/bin',
+      '/usr/local/bin',
+      '/usr/bin',
+      homePath(env, '.volta/bin'),
+      homePath(env, '.local/bin'),
+      homePath(env, '.bun/bin')
+    ].filter((entry): entry is string => Boolean(entry))
+  }
+  if (platform === 'win32') {
+    return [
+      env.APPDATA ? win32.join(env.APPDATA, 'npm') : '',
+      env.ProgramFiles ? win32.join(env.ProgramFiles, 'nodejs') : '',
+      env['ProgramFiles(x86)'] ? win32.join(env['ProgramFiles(x86)'], 'nodejs') : ''
+    ].filter((entry): entry is string => Boolean(entry))
+  }
+  return []
+}
+
+function findPathKey(env: Record<string, string | undefined>): string | undefined {
+  return Object.keys(env).find((key) => key.toLowerCase() === 'path')
+}
+
+function readEnvPath(env: Record<string, string | undefined>): string | undefined {
+  const key = findPathKey(env)
+  const value = key ? env[key] : undefined
+  return value && value.trim() ? value : undefined
+}
+
+function mergePathEntries(values: string[], delimiter: string): string {
+  const seen = new Set<string>()
+  const entries: string[] = []
+  for (const value of values) {
+    for (const entry of value.split(delimiter)) {
+      const trimmed = entry.trim()
+      if (!trimmed) continue
+      const key = trimmed.toLowerCase()
+      if (seen.has(key)) continue
+      seen.add(key)
+      entries.push(trimmed)
+    }
+  }
+  return entries.join(delimiter)
+}
+
+function pathDelimiter(platform: NodeJS.Platform): string {
+  return platform === 'win32' ? ';' : ':'
+}
+
+function homePath(env: NodeJS.ProcessEnv, relativePath: string): string {
+  return env.HOME ? posix.join(env.HOME, relativePath) : ''
+}
+
+function isMissingExecutableError(error: unknown, message: string): boolean {
+  const code = typeof error === 'object' && error !== null && 'code' in error
+    ? String((error as { code?: unknown }).code ?? '')
+    : ''
+  return code === 'ENOENT' || /\bspawn\s+\S+\s+ENOENT\b/i.test(message)
+}
+
+function missingExecutableCommand(error: unknown): string | undefined {
+  if (!error || typeof error !== 'object') return undefined
+  const path = (error as { path?: unknown }).path
+  return typeof path === 'string' && path.trim() ? path.trim() : undefined
+}
+
+function isBareCommand(command: string): boolean {
+  return Boolean(command.trim()) && !command.includes('/') && !command.includes('\\')
+}
+
+function missingBareCommandHint(command: string): string {
+  if (process.platform === 'win32') {
+    return `Could not find "${command}" on PATH while starting the MCP server. Make sure Node/npm is installed and available to Kun, or set the MCP command to an absolute path.`
+  }
+  if (process.platform === 'darwin') {
+    return `Could not find "${command}" on PATH while starting the MCP server. If Kun was launched from Finder or the desktop, make sure Node/npm is installed and available to GUI apps, or set the MCP command to an absolute path such as /opt/homebrew/bin/${command}.`
+  }
+  return `Could not find "${command}" on PATH while starting the MCP server. Make sure Node/npm is installed and available to Kun, or set the MCP command to an absolute path such as /usr/local/bin/${command}.`
 }

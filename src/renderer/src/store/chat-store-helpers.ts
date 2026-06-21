@@ -1,8 +1,12 @@
 import type { ChatBlock, NormalizedThread } from '../agent/types'
 import { DEFAULT_COMPOSER_MODEL_IDS } from '@shared/default-composer-models'
+import type { ModelProviderModelGroup } from '@shared/kun-gui-api'
 import {
   CLAW_MANAGED_INSTRUCTIONS_HEADING,
   CLAW_MODEL_IDS,
+  isComposerChatModelId,
+  modelProfileSupportsTextChat,
+  modelSupportsImageInput,
   type ClawImAgentProfileV1,
   type ClawImChannelV1,
   type ClawImPlatformCredentialV1,
@@ -13,15 +17,25 @@ import {
   isClawWorkspacePath,
   isInternalDeepSeekGuiWorkspace,
   isInternalTemporaryWorkspace,
-  normalizeWorkspaceRoot
+  normalizeWorkspaceRoot,
+  workspaceRootIdentityKey
 } from '../lib/workspace-path'
 import { readBrowserStorageItem, writeBrowserStorageItem } from '../lib/browser-storage'
 
-const COMPOSER_MODEL_STORAGE_KEY = 'deepseekgui.composerModel'
-const TURN_MODEL_STORAGE_KEY = 'deepseekgui.turnModelLabel'
-const CODE_WORKSPACE_ROOTS_STORAGE_KEY = 'deepseekgui.codeWorkspaceRoots.v1'
+const COMPOSER_MODEL_STORAGE_KEY = 'kun.composerModel'
+const COMPOSER_PROVIDER_STORAGE_KEY = 'kun.composerProviderId'
+const THREAD_COMPOSER_SELECTION_STORAGE_KEY = 'kun.threadComposerSelection.v1'
+const TURN_MODEL_STORAGE_KEY = 'kun.turnModelLabel'
+const CODE_WORKSPACE_ROOTS_STORAGE_KEY = 'kun.codeWorkspaceRoots.v1'
 export const MAX_CODE_WORKSPACE_ROOTS = 30
+export const MAX_THREAD_COMPOSER_SELECTIONS = 500
 export const MAX_TURN_MODEL_LABELS = 500
+export const DEFAULT_COMPOSER_CONTEXT_WINDOW_TOKENS = 128_000
+
+export type ThreadComposerSelection = {
+  model: string
+  providerId: string
+}
 
 export const CLAW_COMPOSER_MODEL_IDS = [...CLAW_MODEL_IDS]
 
@@ -37,6 +51,181 @@ export function persistComposerModel(model: string): void {
   writeBrowserStorageItem(COMPOSER_MODEL_STORAGE_KEY, model)
 }
 
+export function readStoredComposerProviderId(
+  modelGroups: readonly ModelProviderModelGroup[],
+  modelId: string
+): string {
+  const raw = readBrowserStorageItem(COMPOSER_PROVIDER_STORAGE_KEY)
+  const providerId = raw?.trim() ?? ''
+  if (!providerId) return ''
+  const group = modelGroups.find((item) => item.providerId === providerId)
+  if (!group) return ''
+  const model = modelId.trim()
+  if (!model) return providerId
+  return modelGroupHasModel(group, model) ? providerId : ''
+}
+
+export function persistComposerProviderId(providerId: string): void {
+  const normalized = providerId.trim()
+  if (normalized) {
+    writeBrowserStorageItem(COMPOSER_PROVIDER_STORAGE_KEY, normalized)
+  } else {
+    writeBrowserStorageItem(COMPOSER_PROVIDER_STORAGE_KEY, '')
+  }
+}
+
+export function readThreadComposerSelection(threadId: string): ThreadComposerSelection | null {
+  const thread = threadId.trim()
+  if (!thread) return null
+  return loadThreadComposerSelectionMap()[thread] ?? null
+}
+
+export function rememberThreadComposerSelection(
+  threadId: string,
+  model: string,
+  providerId = ''
+): void {
+  const thread = threadId.trim()
+  const nextModel = model.trim()
+  if (!thread || !nextModel) return
+  const map = loadThreadComposerSelectionMap()
+  delete map[thread]
+  map[thread] = {
+    model: nextModel,
+    providerId: providerId.trim()
+  }
+  saveThreadComposerSelectionMap(map)
+}
+
+export function normalizeThreadComposerSelectionMap(raw: unknown): Record<string, ThreadComposerSelection> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
+  const entries: Array<[string, ThreadComposerSelection]> = []
+  for (const [rawKey, rawValue] of Object.entries(raw as Record<string, unknown>)) {
+    const key = rawKey.trim()
+    if (!key || !rawValue || typeof rawValue !== 'object' || Array.isArray(rawValue)) continue
+    const value = rawValue as Record<string, unknown>
+    const model = typeof value.model === 'string' ? value.model.trim() : ''
+    const providerId = typeof value.providerId === 'string' ? value.providerId.trim() : ''
+    if (!model) continue
+    entries.push([key, { model, providerId }])
+  }
+  return Object.fromEntries(entries.slice(-MAX_THREAD_COMPOSER_SELECTIONS))
+}
+
+export function providerIdForComposerModel(
+  modelGroups: readonly ModelProviderModelGroup[],
+  modelId: string
+): string {
+  const model = modelId.trim()
+  if (!model) return ''
+  return modelGroups.find((group) => modelGroupHasModel(group, model))?.providerId ?? ''
+}
+
+export function resolveComposerContextWindowTokens(
+  modelGroups: readonly ModelProviderModelGroup[],
+  modelId: string,
+  providerId: string
+): number | undefined {
+  if (!modelId.trim()) return undefined
+  const profile = modelProfileForComposerSelection(modelGroups, modelId, providerId)
+  if (typeof profile?.contextWindowTokens === 'number' && profile.contextWindowTokens > 0) {
+    return profile.contextWindowTokens
+  }
+  return DEFAULT_COMPOSER_CONTEXT_WINDOW_TOKENS
+}
+
+export function canSwitchComposerModel(
+  lockVisionToTextSwitch: boolean,
+  modelGroups: readonly ModelProviderModelGroup[],
+  currentModelId: string,
+  currentProviderId: string,
+  nextModelId: string,
+  nextProviderId: string
+): boolean {
+  if (!lockVisionToTextSwitch) return true
+  const currentProfile = modelProfileForComposerSelection(modelGroups, currentModelId, currentProviderId)
+  if (!modelSupportsImageInput(currentProfile)) return true
+  const nextProfile = modelProfileForComposerSelection(modelGroups, nextModelId, nextProviderId)
+  return modelSupportsImageInput(nextProfile)
+}
+
+function modelProfileForComposerSelection(
+  modelGroups: readonly ModelProviderModelGroup[],
+  modelId: string,
+  providerId: string
+): ReturnType<typeof modelProfileForComposerModel> {
+  const selectedProviderId = providerId.trim()
+  const selectedGroup = selectedProviderId
+    ? modelGroups.find((group) => group.providerId === selectedProviderId)
+    : undefined
+  if (selectedGroup && modelGroupHasModel(selectedGroup, modelId)) {
+    return modelProfileForComposerModel(selectedGroup, modelId)
+  }
+  for (const group of modelGroups) {
+    if (!modelGroupHasModel(group, modelId)) continue
+    const profile = modelProfileForComposerModel(group, modelId)
+    if (profile) return profile
+  }
+  return undefined
+}
+
+function modelGroupHasModel(group: ModelProviderModelGroup, modelId: string): boolean {
+  const normalized = normalizeComposerModelId(modelId)
+  if (!normalized) return false
+  return group.modelIds.some((id) => normalizeComposerModelId(id) === normalized) ||
+    Boolean(modelProfileForComposerModel(group, modelId)?.aliases?.some(
+      (alias: string) => normalizeComposerModelId(alias) === normalized
+    ))
+}
+
+export function composerModelAllowed(pickList: readonly string[], modelId: string): boolean {
+  const normalized = normalizeComposerModelId(modelId)
+  if (!normalized) return false
+  return pickList.some((id) => normalizeComposerModelId(id) === normalized)
+}
+
+export function composerModelSelectable(
+  pickList: readonly string[],
+  modelGroups: readonly ModelProviderModelGroup[],
+  modelId: string
+): boolean {
+  if (!composerModelAllowed(pickList, modelId)) return false
+  if (!isComposerChatModelId(modelId)) return false
+  const group = modelGroups.find((item) => modelGroupHasModel(item, modelId))
+  if (!group) return true
+  return modelProfileSupportsTextChat(modelProfileForComposerModel(group, modelId))
+}
+
+export function providerIdMatchesComposerModel(
+  modelGroups: readonly ModelProviderModelGroup[],
+  providerId: string,
+  modelId: string
+): boolean {
+  const provider = providerId.trim()
+  if (!provider) return false
+  const group = modelGroups.find((item) => item.providerId === provider)
+  return group ? modelGroupHasModel(group, modelId) : false
+}
+
+function modelProfileForComposerModel(
+  group: Pick<ModelProviderModelGroup, 'modelProfiles'>,
+  modelId: string
+): NonNullable<ModelProviderModelGroup['modelProfiles']>[string] | undefined {
+  const model = modelId.trim()
+  const key = normalizeComposerModelId(model)
+  if (!key) return undefined
+  const profiles = group.modelProfiles ?? {}
+  const direct = profiles[key] ?? profiles[model]
+  if (direct) return direct
+  return Object.values(profiles).find((profile) =>
+    profile.aliases?.some((alias) => normalizeComposerModelId(alias) === key)
+  )
+}
+
+function normalizeComposerModelId(modelId: string): string {
+  return modelId.trim().toLowerCase()
+}
+
 export function compactCodeWorkspaceRoots(workspaceRoots: readonly (string | undefined | null)[]): string[] {
   const seen = new Set<string>()
   const out: string[] = []
@@ -46,12 +235,52 @@ export function compactCodeWorkspaceRoots(workspaceRoots: readonly (string | und
     if (isInternalTemporaryWorkspace(normalized)) continue
     if (isInternalDeepSeekGuiWorkspace(normalized)) continue
     if (isClawWorkspacePath(normalized)) continue
-    const key = normalized.toLowerCase()
+    const key = workspaceRootIdentityKey(normalized)
     if (seen.has(key)) continue
     seen.add(key)
     out.push(normalized)
   }
   return out.slice(0, MAX_CODE_WORKSPACE_ROOTS)
+}
+
+function workspaceIdentityKeySet(workspaceRoots: readonly (string | undefined | null)[]): Set<string> {
+  const keys = new Set<string>()
+  for (const workspaceRoot of workspaceRoots) {
+    const key = workspaceRootIdentityKey(normalizeWorkspaceRoot(workspaceRoot ?? ''))
+    if (key) keys.add(key)
+  }
+  return keys
+}
+
+export function reconcileCodeWorkspaceRoots(options: {
+  currentRoots: readonly (string | undefined | null)[]
+  codeThreadWorkspaceRoots: readonly (string | undefined | null)[]
+  writeWorkspaceRoots: readonly (string | undefined | null)[]
+  preservedWorkspaceRoots?: readonly (string | undefined | null)[]
+}): string[] {
+  const writeKeys = workspaceIdentityKeySet(options.writeWorkspaceRoots)
+  if (writeKeys.size === 0) {
+    return compactCodeWorkspaceRoots([
+      ...options.codeThreadWorkspaceRoots,
+      ...options.currentRoots,
+      ...(options.preservedWorkspaceRoots ?? [])
+    ])
+  }
+
+  const codeThreadKeys = workspaceIdentityKeySet(options.codeThreadWorkspaceRoots)
+  const preservedKeys = workspaceIdentityKeySet(options.preservedWorkspaceRoots ?? [])
+  const retainedCurrentRoots = options.currentRoots.filter((workspaceRoot) => {
+    const key = workspaceRootIdentityKey(normalizeWorkspaceRoot(workspaceRoot ?? ''))
+    if (!key) return false
+    if (!writeKeys.has(key)) return true
+    return codeThreadKeys.has(key) || preservedKeys.has(key)
+  })
+
+  return compactCodeWorkspaceRoots([
+    ...options.codeThreadWorkspaceRoots,
+    ...retainedCurrentRoots,
+    ...(options.preservedWorkspaceRoots ?? [])
+  ])
 }
 
 export function readCodeWorkspaceRoots(): string[] {
@@ -87,8 +316,9 @@ export function forgetCodeWorkspaceRoot(
   workspaceRoot: string
 ): string[] {
   const normalized = normalizeWorkspaceRoot(workspaceRoot)
+  const key = workspaceRootIdentityKey(normalized)
   const next = compactCodeWorkspaceRoots(
-    currentRoots.filter((root) => normalizeWorkspaceRoot(root).toLowerCase() !== normalized.toLowerCase())
+    currentRoots.filter((root) => workspaceRootIdentityKey(normalizeWorkspaceRoot(root)) !== key)
   )
   saveCodeWorkspaceRoots(next)
   return next
@@ -96,17 +326,23 @@ export function forgetCodeWorkspaceRoot(
 
 export function mergeComposerPickList(upstreamOk: boolean, upstreamIds: string[]): string[] {
   const ordered = new Set<string>()
-  ordered.add('auto')
   for (const id of DEFAULT_COMPOSER_MODEL_IDS) {
-    if (id !== 'auto') ordered.add(id)
+    ordered.add(id)
   }
   if (upstreamOk) {
     for (const id of upstreamIds) {
-      if (id.trim()) ordered.add(id.trim())
+      const trimmed = id.trim()
+      if (trimmed && trimmed !== 'auto') ordered.add(trimmed)
     }
   }
-  const tail = [...ordered].filter((id) => id !== 'auto').sort((a, b) => a.localeCompare(b))
-  return ['auto', ...tail]
+  return [...ordered].sort((a, b) => a.localeCompare(b))
+}
+
+export function fallbackComposerModel(pickList: readonly string[], runtimeDefault: string): string {
+  const allowed = new Set(pickList)
+  const preferred = runtimeDefault.trim()
+  if (preferred && preferred.toLowerCase() !== 'auto' && allowed.has(preferred)) return preferred
+  return DEFAULT_COMPOSER_MODEL_IDS.find((id) => allowed.has(id)) ?? pickList[0] ?? ''
 }
 
 export function newClawChannel(
@@ -251,4 +487,21 @@ export function normalizeTurnModelMap(raw: unknown): Record<string, string> {
 
 function saveTurnModelMap(map: Record<string, string>): void {
   writeBrowserStorageItem(TURN_MODEL_STORAGE_KEY, JSON.stringify(normalizeTurnModelMap(map)))
+}
+
+function loadThreadComposerSelectionMap(): Record<string, ThreadComposerSelection> {
+  try {
+    const raw = readBrowserStorageItem(THREAD_COMPOSER_SELECTION_STORAGE_KEY)
+    if (!raw) return {}
+    return normalizeThreadComposerSelectionMap(JSON.parse(raw))
+  } catch {
+    return {}
+  }
+}
+
+function saveThreadComposerSelectionMap(map: Record<string, ThreadComposerSelection>): void {
+  writeBrowserStorageItem(
+    THREAD_COMPOSER_SELECTION_STORAGE_KEY,
+    JSON.stringify(normalizeThreadComposerSelectionMap(map))
+  )
 }

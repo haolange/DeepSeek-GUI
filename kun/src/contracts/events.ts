@@ -2,6 +2,9 @@ import { z } from 'zod'
 import { TurnItem } from './items.js'
 import { ThreadGoalSchema, ThreadTodoListSchema } from './threads.js'
 import { UsageSnapshotSchema } from './usage.js'
+import { RuntimeErrorSeverity } from './errors.js'
+import { ApprovalPolicySchema, SandboxModeSchema } from './policy.js'
+import { SubagentToolPolicy } from './capabilities.js'
 
 /**
  * Persisted runtime events. Every event has a per-thread `seq` so the
@@ -70,7 +73,22 @@ const RuntimeEventBase = z.object({
     childId: z.string().min(1),
     childLabel: z.string().optional(),
     childStatus: z.enum(['queued', 'running', 'completed', 'failed', 'aborted']),
-    childSeq: z.number().int().nonnegative()
+    childSeq: z.number().int().nonnegative(),
+    // Observability metrics carried alongside the child lifecycle event so
+    // the GUI can show prefix reuse, tool fan-out, timing, and cost per
+    // subagent without a separate diagnostics fetch.
+    childModel: z.string().optional(),
+    childProfile: z.string().optional(),
+    childToolPolicy: SubagentToolPolicy.optional(),
+    prefixReused: z.boolean().optional(),
+    inheritedHistoryItems: z.number().int().nonnegative().optional(),
+    toolInvocations: z.number().int().nonnegative().optional(),
+    durationMs: z.number().int().nonnegative().optional(),
+    queuedMs: z.number().int().nonnegative().optional(),
+    totalTokens: z.number().int().nonnegative().optional(),
+    cacheHitRate: z.number().min(0).max(1).nullable().optional(),
+    costUsd: z.number().nonnegative().optional(),
+    costCny: z.number().nonnegative().optional()
   }).optional()
 })
 
@@ -105,7 +123,10 @@ export const TurnLifecycleEvent = RuntimeEventBase.extend({
   ]),
   status: z.string().optional(),
   text: z.string().optional(),
-  message: z.string().optional()
+  message: z.string().optional(),
+  code: z.string().optional(),
+  details: z.unknown().optional(),
+  severity: RuntimeErrorSeverity.optional()
 })
 export type TurnLifecycleEvent = z.infer<typeof TurnLifecycleEvent>
 
@@ -114,6 +135,8 @@ export const ApprovalEvent = RuntimeEventBase.extend({
   approvalId: z.string().min(1),
   toolName: z.string().min(1),
   status: z.enum(['pending', 'allowed', 'denied', 'expired']),
+  approvalPolicy: ApprovalPolicySchema.optional(),
+  sandboxMode: SandboxModeSchema.optional(),
   summary: z.string().optional()
 })
 export type ApprovalEvent = z.infer<typeof ApprovalEvent>
@@ -176,6 +199,10 @@ export const CompactionEvent = RuntimeEventBase.extend({
   kind: z.enum(['compaction_started', 'compaction_completed']),
   summary: z.string().optional(),
   replacedTokens: z.number().int().nonnegative().optional(),
+  // Whether the compaction was triggered automatically by the loop
+  // (context threshold) or explicitly requested by the user via the
+  // `/compact` command. Absent on legacy/auto events (treated as auto).
+  auto: z.boolean().optional(),
   pinnedConstraints: z.array(z.string()).optional(),
   sourceDigest: z.string().min(1).optional(),
   digestMarker: z.string().min(1).optional(),
@@ -215,7 +242,9 @@ export type PipelineStageEvent = z.infer<typeof PipelineStageEvent>
 export const ErrorEvent = RuntimeEventBase.extend({
   kind: z.literal('error'),
   message: z.string(),
-  code: z.string().optional()
+  code: z.string().optional(),
+  details: z.unknown().optional(),
+  severity: RuntimeErrorSeverity.optional()
 })
 export type ErrorEvent = z.infer<typeof ErrorEvent>
 

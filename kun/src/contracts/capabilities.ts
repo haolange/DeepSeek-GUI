@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { MODEL_ENDPOINT_FORMATS } from './model-endpoint-format.js'
 
 export const RUNTIME_CAPABILITY_CONTRACT_VERSION = 1
 
@@ -21,6 +22,28 @@ export type ModelInputModality = z.infer<typeof ModelInputModality>
 export const ModelMessagePartSupport = z.enum(['text', 'image_url', 'input_image'])
 export type ModelMessagePartSupport = z.infer<typeof ModelMessagePartSupport>
 
+export const ModelReasoningEffort = z.enum(['auto', 'off', 'low', 'medium', 'high', 'max'])
+export type ModelReasoningEffort = z.infer<typeof ModelReasoningEffort>
+
+export const ModelReasoningRequestProtocol = z.enum([
+  'none',
+  'deepseek-chat-completions',
+  'glm-chat-completions',
+  'mimo-chat-completions',
+  'openai-responses',
+  'anthropic-thinking'
+])
+export type ModelReasoningRequestProtocol = z.infer<typeof ModelReasoningRequestProtocol>
+
+export const ModelReasoningCapabilityMetadata = z
+  .object({
+    supportedEfforts: z.array(ModelReasoningEffort).min(1),
+    defaultEffort: ModelReasoningEffort,
+    requestProtocol: ModelReasoningRequestProtocol
+  })
+  .strict()
+export type ModelReasoningCapabilityMetadata = z.infer<typeof ModelReasoningCapabilityMetadata>
+
 export const ModelCapabilityMetadata = z
   .object({
     id: z.string().min(1),
@@ -28,7 +51,12 @@ export const ModelCapabilityMetadata = z
     outputModalities: z.array(ModelInputModality).min(1),
     supportsToolCalling: z.boolean(),
     contextWindowTokens: z.number().int().positive().optional(),
-    messageParts: z.array(ModelMessagePartSupport).min(1)
+    messageParts: z.array(ModelMessagePartSupport).min(1),
+    reasoning: ModelReasoningCapabilityMetadata.optional(),
+    // Per-model wire-format override. Lets one provider route some models to
+    // chat completions and others to Anthropic Messages / OpenAI Responses
+    // (e.g. OpenCode Go). Absent means "inherit the provider/runtime format".
+    endpointFormat: z.enum(MODEL_ENDPOINT_FORMATS).optional()
   })
   .strict()
 export type ModelCapabilityMetadata = z.infer<typeof ModelCapabilityMetadata>
@@ -146,7 +174,9 @@ export const WebCapabilityConfig = CapabilityToggleConfig.extend({
   searchEnabled: z.boolean().default(false),
   provider: z.string().min(1).optional(),
   allowDomains: z.array(z.string().min(1)).default([]),
-  denyDomains: z.array(z.string().min(1)).default([])
+  denyDomains: z.array(z.string().min(1)).default([]),
+  /** Upper bound for web_fetch body bytes; fetched pages truncate here. */
+  maxFetchBytes: z.number().int().positive().default(1_000_000)
 }).strict()
 export type WebCapabilityConfig = z.infer<typeof WebCapabilityConfig>
 
@@ -156,13 +186,54 @@ export const SkillsCapabilityConfig = CapabilityToggleConfig.extend({
 }).strict()
 export type SkillsCapabilityConfig = z.infer<typeof SkillsCapabilityConfig>
 
+export const SubagentToolPolicy = z.enum(['readOnly', 'inherit'])
+export type SubagentToolPolicy = z.infer<typeof SubagentToolPolicy>
+
+/**
+ * Tools a `readOnly` subagent may call. The list is enforced twice: the
+ * child loop advertises only these names (schema filter) and the
+ * capability registry re-checks them at execute time (backstop). Keep it
+ * to side-effect-free investigation tools — no bash/edit/write, and no
+ * nested `delegate_task`.
+ */
+export const SUBAGENT_READ_ONLY_TOOL_NAMES = ['read', 'grep', 'find', 'ls'] as const
+
+export const SubagentProfileConfig = z
+  .object({
+    /** Overrides the child model for this role (falls back to the server default). */
+    model: z.string().min(1).optional(),
+    /** Short instruction prepended to the delegated task prompt. */
+    promptPreamble: z.string().min(1).optional(),
+    /** Whether the child is restricted to read-only tools or inherits the full set. */
+    toolPolicy: SubagentToolPolicy.default('readOnly')
+  })
+  .strict()
+export type SubagentProfileConfig = z.infer<typeof SubagentProfileConfig>
+
 export const SubagentsCapabilityConfig = CapabilityToggleConfig.extend({
+  /** Max children running at once; extra spawns queue instead of erroring. */
   maxParallel: z.number().int().nonnegative().default(0),
+  /** Hard cap on total children per parent thread. */
   maxChildRuns: z.number().int().nonnegative().default(0),
+  /** Tool policy applied to children that do not resolve a profile. */
+  defaultToolPolicy: SubagentToolPolicy.default('readOnly'),
+  /** Profile chosen when `delegate_task` omits an explicit profile. */
+  defaultProfile: z.string().min(1).optional(),
+  /** Named subagent roles (e.g. researcher/reviewer/verifier). */
+  profiles: z.record(z.string().min(1), SubagentProfileConfig).default({}),
   // Accept the removed legacy field so old configs keep loading, but ignore it.
   defaultStepLimit: z.number().int().positive().optional()
 })
   .strict()
+  .superRefine((config, ctx) => {
+    if (config.defaultProfile && !(config.defaultProfile in config.profiles)) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['defaultProfile'],
+        message: `defaultProfile "${config.defaultProfile}" is not defined in profiles`
+      })
+    }
+  })
   .transform(({ defaultStepLimit: _legacyDefaultStepLimit, ...config }) => config)
 export type SubagentsCapabilityConfig = z.output<typeof SubagentsCapabilityConfig>
 
@@ -186,6 +257,80 @@ export const MemoryCapabilityConfig = CapabilityToggleConfig.extend({
 }).strict()
 export type MemoryCapabilityConfig = z.infer<typeof MemoryCapabilityConfig>
 
+export const ImageGenerationProtocol = z.enum(['openai-images', 'minimax-image'])
+export type ImageGenerationProtocol = z.infer<typeof ImageGenerationProtocol>
+
+export const ImageGenCapabilityConfig = CapabilityToggleConfig.extend({
+  protocol: ImageGenerationProtocol.default('openai-images'),
+  baseUrl: z.string().min(1).optional(),
+  apiKey: z.string().min(1).optional(),
+  model: z.string().min(1).optional(),
+  defaultSize: z.string().min(1).optional(),
+  timeoutMs: z.number().int().positive().default(180_000),
+  maxReferenceImages: z.number().int().positive().max(8).default(4)
+}).strict()
+export type ImageGenCapabilityConfig = z.infer<typeof ImageGenCapabilityConfig>
+
+export const TextToSpeechProtocol = z.enum(['openai-speech', 'minimax-t2a', 'mimo-tts'])
+export type TextToSpeechProtocol = z.infer<typeof TextToSpeechProtocol>
+
+export const SpeechGenCapabilityConfig = CapabilityToggleConfig.extend({
+  protocol: TextToSpeechProtocol.default('openai-speech'),
+  baseUrl: z.string().min(1).optional(),
+  apiKey: z.string().min(1).optional(),
+  model: z.string().min(1).optional(),
+  voice: z.string().min(1).optional(),
+  format: z.string().min(1).default('mp3'),
+  timeoutMs: z.number().int().positive().default(120_000)
+}).strict()
+export type SpeechGenCapabilityConfig = z.infer<typeof SpeechGenCapabilityConfig>
+
+export const MusicGenerationProtocol = z.enum(['minimax-music'])
+export type MusicGenerationProtocol = z.infer<typeof MusicGenerationProtocol>
+
+export const MusicGenCapabilityConfig = CapabilityToggleConfig.extend({
+  protocol: MusicGenerationProtocol.default('minimax-music'),
+  baseUrl: z.string().min(1).optional(),
+  apiKey: z.string().min(1).optional(),
+  model: z.string().min(1).optional(),
+  format: z.string().min(1).default('mp3'),
+  timeoutMs: z.number().int().positive().default(300_000)
+}).strict()
+export type MusicGenCapabilityConfig = z.infer<typeof MusicGenCapabilityConfig>
+
+export const VideoGenerationProtocol = z.enum(['minimax-video'])
+export type VideoGenerationProtocol = z.infer<typeof VideoGenerationProtocol>
+
+export const VideoGenCapabilityConfig = CapabilityToggleConfig.extend({
+  protocol: VideoGenerationProtocol.default('minimax-video'),
+  baseUrl: z.string().min(1).optional(),
+  apiKey: z.string().min(1).optional(),
+  model: z.string().min(1).optional(),
+  defaultDuration: z.number().int().positive().default(6),
+  defaultResolution: z.string().min(1).default('1080P'),
+  timeoutMs: z.number().int().positive().default(900_000),
+  pollIntervalMs: z.number().int().positive().default(10_000)
+}).strict()
+export type VideoGenCapabilityConfig = z.infer<typeof VideoGenCapabilityConfig>
+
+/**
+ * Host computer-use mode. `auto` advertises the tool only when the active
+ * model accepts image input (a vision model decides for itself); `always`
+ * advertises whenever the host backend + permissions allow regardless of
+ * modality; `off` never advertises it.
+ */
+export const ComputerUseMode = z.enum(['auto', 'always', 'off'])
+export type ComputerUseMode = z.infer<typeof ComputerUseMode>
+
+export const ComputerUseCapabilityConfig = CapabilityToggleConfig.extend({
+  mode: ComputerUseMode.default('auto'),
+  /** Longest screenshot edge in pixels; larger captures are downscaled for grounding. */
+  maxImageDimension: z.number().int().positive().default(1280),
+  /** Hard cap on computer_use actions per turn, as a runaway backstop. */
+  maxActionsPerTurn: z.number().int().positive().default(40)
+}).strict()
+export type ComputerUseCapabilityConfig = z.infer<typeof ComputerUseCapabilityConfig>
+
 export const KunCapabilitiesConfig = z
   .object({
     mcp: McpCapabilityConfig.default(() => McpCapabilityConfig.parse({})),
@@ -193,7 +338,12 @@ export const KunCapabilitiesConfig = z
     skills: SkillsCapabilityConfig.default(() => SkillsCapabilityConfig.parse({})),
     subagents: SubagentsCapabilityConfig.default(() => SubagentsCapabilityConfig.parse({})),
     attachments: AttachmentsCapabilityConfig.default(() => AttachmentsCapabilityConfig.parse({})),
-    memory: MemoryCapabilityConfig.default(() => MemoryCapabilityConfig.parse({}))
+    memory: MemoryCapabilityConfig.default(() => MemoryCapabilityConfig.parse({})),
+    imageGen: ImageGenCapabilityConfig.default(() => ImageGenCapabilityConfig.parse({})),
+    speechGen: SpeechGenCapabilityConfig.default(() => SpeechGenCapabilityConfig.parse({})),
+    musicGen: MusicGenCapabilityConfig.default(() => MusicGenCapabilityConfig.parse({})),
+    videoGen: VideoGenCapabilityConfig.default(() => VideoGenCapabilityConfig.parse({})),
+    computerUse: ComputerUseCapabilityConfig.default(() => ComputerUseCapabilityConfig.parse({}))
   })
   .strict()
 export type KunCapabilitiesConfig = z.infer<typeof KunCapabilitiesConfig>
@@ -237,7 +387,20 @@ export const RuntimeCapabilityManifest = z
     }).strict(),
     subagents: RuntimeCapabilityState.extend({
       maxParallel: z.number().int().nonnegative(),
-      maxChildRuns: z.number().int().nonnegative()
+      maxChildRuns: z.number().int().nonnegative(),
+      defaultToolPolicy: SubagentToolPolicy,
+      defaultProfile: z.string().optional(),
+      profiles: z
+        .array(
+          z
+            .object({
+              name: z.string().min(1),
+              model: z.string().optional(),
+              toolPolicy: SubagentToolPolicy
+            })
+            .strict()
+        )
+        .default([])
     }).strict(),
     attachments: RuntimeCapabilityState.extend({
       maxImageBytes: z.number().int().positive(),
@@ -250,6 +413,21 @@ export const RuntimeCapabilityManifest = z
     memory: RuntimeCapabilityState.extend({
       scopes: z.array(z.enum(['user', 'workspace', 'project'])),
       maxInjectedRecords: z.number().int().positive()
+    }).strict(),
+    imageGen: RuntimeCapabilityState.extend({
+      model: z.string().optional()
+    }).strict(),
+    speechGen: RuntimeCapabilityState.extend({
+      model: z.string().optional()
+    }).strict(),
+    musicGen: RuntimeCapabilityState.extend({
+      model: z.string().optional()
+    }).strict(),
+    videoGen: RuntimeCapabilityState.extend({
+      model: z.string().optional()
+    }).strict(),
+    computerUse: RuntimeCapabilityState.extend({
+      mode: ComputerUseMode
     }).strict()
   })
   .strict()
@@ -289,6 +467,26 @@ export function buildRuntimeCapabilityManifest(input: {
     reason?: string
   }
   subagents?: {
+    available?: boolean
+    reason?: string
+  }
+  imageGen?: {
+    available?: boolean
+    reason?: string
+  }
+  speechGen?: {
+    available?: boolean
+    reason?: string
+  }
+  musicGen?: {
+    available?: boolean
+    reason?: string
+  }
+  videoGen?: {
+    available?: boolean
+    reason?: string
+  }
+  computerUse?: {
     available?: boolean
     reason?: string
   }
@@ -355,7 +553,14 @@ export function buildRuntimeCapabilityManifest(input: {
         input.subagents?.reason ?? 'subagent runtime is unavailable'
       ),
       maxParallel: config.subagents.maxParallel,
-      maxChildRuns: config.subagents.maxChildRuns
+      maxChildRuns: config.subagents.maxChildRuns,
+      defaultToolPolicy: config.subagents.defaultToolPolicy,
+      ...(config.subagents.defaultProfile ? { defaultProfile: config.subagents.defaultProfile } : {}),
+      profiles: Object.entries(config.subagents.profiles).map(([name, profile]) => ({
+        name,
+        ...(profile.model ? { model: profile.model } : {}),
+        toolPolicy: profile.toolPolicy
+      }))
     },
     attachments: {
       ...providerCapabilityState(
@@ -380,6 +585,51 @@ export function buildRuntimeCapabilityManifest(input: {
       ),
       scopes: config.memory.scopes,
       maxInjectedRecords: config.memory.maxInjectedRecords
+    },
+    imageGen: {
+      ...providerCapabilityState(
+        config.imageGen.enabled,
+        'image generation is disabled by config',
+        input.imageGen?.available === true,
+        input.imageGen?.reason ?? 'image generation provider is not configured'
+      ),
+      ...(config.imageGen.model ? { model: config.imageGen.model } : {})
+    },
+    speechGen: {
+      ...providerCapabilityState(
+        config.speechGen.enabled,
+        'speech generation is disabled by config',
+        input.speechGen?.available === true,
+        input.speechGen?.reason ?? 'speech generation provider is not configured'
+      ),
+      ...(config.speechGen.model ? { model: config.speechGen.model } : {})
+    },
+    musicGen: {
+      ...providerCapabilityState(
+        config.musicGen.enabled,
+        'music generation is disabled by config',
+        input.musicGen?.available === true,
+        input.musicGen?.reason ?? 'music generation provider is not configured'
+      ),
+      ...(config.musicGen.model ? { model: config.musicGen.model } : {})
+    },
+    videoGen: {
+      ...providerCapabilityState(
+        config.videoGen.enabled,
+        'video generation is disabled by config',
+        input.videoGen?.available === true,
+        input.videoGen?.reason ?? 'video generation provider is not configured'
+      ),
+      ...(config.videoGen.model ? { model: config.videoGen.model } : {})
+    },
+    computerUse: {
+      ...providerCapabilityState(
+        config.computerUse.enabled && config.computerUse.mode !== 'off',
+        'computer use is disabled by config',
+        input.computerUse?.available === true,
+        input.computerUse?.reason ?? 'computer-use backend is unavailable on this platform'
+      ),
+      mode: config.computerUse.mode
     }
   })
 }
