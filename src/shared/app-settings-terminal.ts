@@ -7,7 +7,9 @@ import type {
 
 export type { TerminalColorMode, TerminalColorSettingsV1, TerminalSettingsPatchV1, TerminalSettingsV1 }
 
-const HEX_COLOR_RE = /^#[0-9a-fA-F]{3}([0-9a-fA-F]{3})?$/
+// Accepts #rgb, #rrggbb, and #rrggbbaa (8-digit form carries an alpha byte,
+// used by e.g. the default selection background #264f78aa).
+const HEX_COLOR_RE = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/
 
 const TERMINAL_ANSI_COLOR_KEYS = [
   'black',
@@ -182,6 +184,13 @@ type TerminalTheme = {
   brightMagenta: string
   brightCyan: string
   brightWhite: string
+  /**
+   * xterm.js extended palette (ANSI colors 16-255). Only populated in
+   * monochrome mode, where every entry is the foreground color so 256-color
+   * (ESC[38;5;Nm) sequences are neutralized just like the base 16. Omitted in
+   * custom mode so xterm.js keeps its default 256-color palette.
+   */
+  extendedAnsi?: string[]
 }
 
 /**
@@ -254,6 +263,10 @@ export function resolveTerminalTheme(
     brightBlue: foreground,
     brightMagenta: foreground,
     brightCyan: foreground,
-    brightWhite: foreground
+    brightWhite: foreground,
+    // Neutralize the 256-color palette (indices 16-255) too: 8-bit color
+    // sequences (ESC[38;5;Nm) bypass the 16 named ANSI colors above, so map
+    // every extended slot to the foreground to keep monochrome truly mono.
+    extendedAnsi: Array.from({ length: 240 }, () => foreground)
   }
 }

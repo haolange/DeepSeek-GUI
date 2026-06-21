@@ -1,6 +1,7 @@
 import {
   DEFAULT_LOG_RETENTION_DAYS,
   DEFAULT_GUI_UPDATE_CHANNEL,
+  MIN_KUN_LOCAL_PORT,
   defaultKunRuntimeSettings,
   applyKunRuntimePatch,
   getKunRuntimeSettings,
@@ -15,6 +16,7 @@ import {
   mergeTerminalSettings,
   normalizeAppBehaviorSettings,
   normalizeClawSettings,
+  normalizeCursorSpotlightColor,
   normalizeGuiUpdateChannel,
   normalizeKeyboardShortcuts,
   normalizeModelProviderSettings,
@@ -45,7 +47,7 @@ export function listSettingsText(values: string[]): string {
 
 export function hasValidPort(settings: AppSettingsV1): boolean {
   const port = getKunRuntimeSettings(settings).port
-  return Number.isFinite(port) && port >= 1 && port <= 65535
+  return Number.isFinite(port) && port >= MIN_KUN_LOCAL_PORT && port <= 65535
 }
 
 export function mergeSettings(current: AppSettingsV1, patch: SettingsPatch): AppSettingsV1 {
@@ -98,6 +100,7 @@ export function coerceRendererSettings(settings: AppSettingsV1): AppSettingsV1 {
     theme,
     uiFontScale,
     cursorSpotlight: raw.cursorSpotlight !== false,
+    cursorSpotlightColor: normalizeCursorSpotlightColor(raw.cursorSpotlightColor),
     provider: normalizeModelProviderSettings(raw.provider),
     agents: kunSettingsEnvelope(mergeKunRuntimeSettings(defaultKunRuntimeSettings(), getKunRuntimeSettings(settings))),
     workspaceRoot: typeof raw.workspaceRoot === 'string' ? raw.workspaceRoot : DEFAULT_WORKSPACE_ROOT,

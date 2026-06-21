@@ -93,15 +93,6 @@ export function SettingsSidebar({
         <button
           type="button"
           data-cursor-spotlight-target
-          className={catCls('permissions')}
-          onClick={() => setCategory('permissions')}
-        >
-          <ShieldCheck className="h-4 w-4 shrink-0 opacity-70" strokeWidth={1.75} />
-          {t('permissions')}
-        </button>
-        <button
-          type="button"
-          data-cursor-spotlight-target
           className={catCls('archives')}
           onClick={() => setCategory('archives')}
         >

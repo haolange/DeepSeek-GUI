@@ -6,6 +6,7 @@ import {
   applyKunRuntimePatch,
   kunSettingsEnvelope,
   DEFAULT_GUI_UPDATE_CHANNEL,
+  DEFAULT_CURSOR_SPOTLIGHT_COLOR,
   DEFAULT_LOG_RETENTION_DAYS,
   DEFAULT_WRITE_WORKSPACE_ROOT,
   defaultClawSettings,
@@ -202,6 +203,7 @@ const defaultSettings = (): AppSettingsV1 => ({
   theme: 'system',
   uiFontScale: 'small',
   cursorSpotlight: true,
+  cursorSpotlightColor: DEFAULT_CURSOR_SPOTLIGHT_COLOR,
   provider: defaultModelProviderSettings(),
   agents: {
     kun: defaultKunRuntimeSettings()
