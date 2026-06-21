@@ -278,18 +278,22 @@
 }
 
 [data-theme='dark'] .write-rich-editor .sdd-req-pill-planned {
+  background: color-mix(in srgb, #93c5fd 18%, transparent);
   color: #93c5fd;
 }
 
 [data-theme='dark'] .write-rich-editor .sdd-req-pill-building {
+  background: color-mix(in srgb, #fcd34d 20%, transparent);
   color: #fcd34d;
 }
 
 [data-theme='dark'] .write-rich-editor .sdd-req-pill-done {
+  background: color-mix(in srgb, #86efac 20%, transparent);
   color: #86efac;
 }
 
 [data-theme='dark'] .write-rich-editor .sdd-req-pill-verified {
+  background: color-mix(in srgb, #5eead4 20%, transparent);
   color: #5eead4;
 }
 
@@ -323,6 +327,22 @@
 
 .sdd-req-progress-seg-planned {
   background: #3b82f6;
+}
+
+[data-theme='dark'] .sdd-req-progress-seg-verified {
+  background: #2dd4bf;
+}
+
+[data-theme='dark'] .sdd-req-progress-seg-done {
+  background: #4ade80;
+}
+
+[data-theme='dark'] .sdd-req-progress-seg-building {
+  background: #fbbf24;
+}
+
+[data-theme='dark'] .sdd-req-progress-seg-planned {
+  background: #60a5fa;
 }
 
 /* Inline AI: ghost text suggestion (Phase 3) */
