@@ -719,10 +719,8 @@ export function AgentsSettingsSection({ ctx }: { ctx: Record<string, any> }): Re
 
               <div className="mt-6">
                 <SettingsCard title={t('computerUseTitle')}>
-                  <div className="px-3 py-4">
+                  <div className="space-y-4 px-3 py-4">
                     <InlineNoticeView notice={{ tone: 'info', message: t('computerUseHint') }} />
-                  </div>
-                  <div className="px-3 pb-4">
                     <div className="rounded-lg border border-amber-400/30 bg-amber-500/10 px-3 py-2 text-[12px] leading-5 text-amber-700 dark:text-amber-200">
                       <div className="font-semibold">{t('computerUseModelQualityTitle')}</div>
                       <div className="mt-1">{t('computerUseModelQualityBody')}</div>
