@@ -24,9 +24,9 @@ export function FloatingComposerAgentPicker({ compact = false, disabled }: Props
   const rootRef = useRef<HTMLDivElement | null>(null)
   const loadedRef = useRef(false)
 
-  const loadAgents = useCallback(async (): Promise<void> => {
+  const loadAgents = useCallback(async (force = false): Promise<void> => {
     try {
-      const settings = await rendererRuntimeClient.getSettings({ forceRefresh: false })
+      const settings = await rendererRuntimeClient.getSettings({ forceRefresh: force })
       const profiles = settings.agents?.kun?.subagents?.profiles ?? []
       setAgents(profiles.filter(isAvailableForPrimary))
       loadedRef.current = true
@@ -37,9 +37,11 @@ export function FloatingComposerAgentPicker({ compact = false, disabled }: Props
 
   useEffect(() => { void loadAgents() }, [loadAgents])
 
-  // Reload when the menu opens to pick up edits made in SubagentsView mid-session.
+  // Reload when the menu opens to pick up edits made in SubagentsView
+  // mid-session. Force a refresh so a just-created agent shows immediately
+  // rather than waiting out the settings cache.
   useEffect(() => {
-    if (open && loadedRef.current) void loadAgents()
+    if (open && loadedRef.current) void loadAgents(true)
   }, [open, loadAgents])
 
   // Close on outside click.
