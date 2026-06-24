@@ -3,8 +3,8 @@ import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { useTranslation } from 'react-i18next'
-import { Check, ChevronDown, ChevronRight, Copy, Download, File, FileEdit, GitFork, ImageIcon, Loader2, MessageSquareQuote, PencilLine, RotateCcw, Terminal, Video, Wrench } from 'lucide-react'
-import type { AttachmentReference, ChatBlock, GeneratedFileReference, RuntimeDisclosureMetadata, ToolBlock, UserFileReference, UserInputAnswer, UserInputQuestion } from '../../agent/types'
+import { ArrowDown, Check, ChevronDown, ChevronRight, Copy, Download, File, FileEdit, GitFork, ImageIcon, Loader2, MessageSquareQuote, PencilLine, RotateCcw, Terminal, Video, Wrench } from 'lucide-react'
+import type { AttachmentReference, ChatBlock, GeneratedFileReference, RuntimeDisclosureMetadata, ToolBlock, UserFileReference, UserInputAnswer } from '../../agent/types'
 import { extractUnifiedDiffText } from '../../lib/diff-stats'
 import { useChatStore } from '../../store/chat-store'
 import { getProvider } from '../../agent/registry'
@@ -16,6 +16,7 @@ import { AssistantMarkdown } from './AssistantMarkdown'
 import { ImagePreviewLightbox } from './ImagePreviewLightbox'
 import { ModelMetaTag, WritePromptMetaDisclosure } from './message-timeline-cards'
 import { readNumber, formatDuration, formatToolTitle } from './message-timeline-tools'
+import { answersByQuestionId, shouldShowQuestionHeader } from './user-input-panel-logic'
 
 const COPY_FEEDBACK_RESET_MS = 1600
 
@@ -233,9 +234,6 @@ function ClawInboundMessageCard({
     </div>
   )
 }
-
-const USER_INPUT_OTHER_LABEL = 'Other'
-const USER_INPUT_FREEFORM_LABEL = 'Answer'
 
 function metaStringArray(meta: Record<string, unknown> | undefined, key: string): string[] {
   const value = meta?.[key]
@@ -1013,28 +1011,9 @@ function UserInputBubble({
     setAnswers(answersByQuestionId(block.answers))
   }, [block.id, block.answers])
 
-  const chooseOption = (question: UserInputQuestion, label: string, value = label): void => {
-    setAnswers((prev) => ({
-      ...prev,
-      [question.id]: { id: question.id, label, value }
-    }))
-  }
-
-  const canSubmit = block.questions.every((question) => {
-    const answer = answers[question.id]
-    if (!answer) return false
-    if (question.options.length === 0 || answer.label === USER_INPUT_OTHER_LABEL) {
-      return answer.value.trim().length > 0
-    }
-    return true
-  })
-
-  const submit = (): void => {
-    if (!canSubmit || !pending) return
-    const ordered = block.questions.map((question) => answers[question.id]).filter(Boolean)
-    void resolveUserInput(block.id, { kind: 'submit', answers: ordered })
-  }
-
+  // Answering moved to the composer-docked panel (FloatingComposerUserInputPanel);
+  // this bubble is now the read-only record of what was asked and answered. It
+  // keeps only the cancel affordance while pending.
   const cancel = (): void => {
     if (!pending) return
     void resolveUserInput(block.id, { kind: 'cancel' })
@@ -1130,13 +1109,9 @@ function UserInputBubble({
         {block.questions.map((question, index) => {
           const answer = answers[question.id]
           const hasOptions = question.options.length > 0
-          const otherSelected = answer?.label === USER_INPUT_OTHER_LABEL
           const submittedAnswer = done ? (answer?.value || answer?.label || '') : ''
           const showProgress = questionCount > 1
-          const showHeader =
-            typeof question.header === 'string' &&
-            question.header.trim().length > 0 &&
-            !(questionCount === 1 && question.header.trim().toLowerCase() === 'input')
+          const showHeader = shouldShowQuestionHeader(question, questionCount)
           return (
             <div
               key={question.id}
@@ -1187,114 +1162,18 @@ function UserInputBubble({
                   {statusLabel}
                 </div>
               ) : hasOptions ? (
-                <div className="mt-3 grid gap-2">
-                  {question.options.map((option) => {
-                    const selected = answer?.label === option.label && answer.value === option.label
-                    return (
-                      <button
-                        key={option.label}
-                        type="button"
-                        disabled={done}
-                        onClick={() => chooseOption(question, option.label)}
-                        className={`group flex min-w-0 gap-2.5 rounded-[10px] border px-3 py-2.5 text-left transition disabled:cursor-default ${
-                          selected
-                            ? 'border-accent/35 bg-accent/10 text-ds-ink ring-1 ring-accent/10'
-                            : 'border-ds-border-muted bg-ds-card/78 text-ds-muted hover:border-ds-border hover:bg-ds-card hover:text-ds-ink'
-                        }`}
-                      >
-                        <span
-                          className={`mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border transition ${
-                            selected
-                              ? 'border-accent bg-accent/10'
-                              : 'border-ds-border bg-transparent group-hover:border-ds-muted'
-                          }`}
-                        >
-                          {selected ? <span className="h-2 w-2 rounded-full bg-accent" /> : null}
-                        </span>
-                        <span className="min-w-0">
-                          <span className="block break-words text-[13px] font-semibold [overflow-wrap:anywhere]">
-                            {option.label}
-                          </span>
-                          {option.description ? (
-                            <span className="mt-0.5 block break-words text-[12px] leading-5 text-ds-faint [overflow-wrap:anywhere]">
-                              {option.description}
-                            </span>
-                          ) : null}
-                        </span>
-                      </button>
-                    )
-                  })}
-                  <button
-                    type="button"
-                    disabled={done}
-                    onClick={() =>
-                      chooseOption(
-                        question,
-                        USER_INPUT_OTHER_LABEL,
-                        answer?.label === USER_INPUT_OTHER_LABEL ? answer.value : ''
-                      )
-                    }
-                    className={`group flex min-w-0 gap-2.5 rounded-[10px] border px-3 py-2.5 text-left transition disabled:cursor-default ${
-                      otherSelected
-                        ? 'border-accent/35 bg-accent/10 text-ds-ink ring-1 ring-accent/10'
-                        : 'border-ds-border-muted bg-ds-card/78 text-ds-muted hover:border-ds-border hover:bg-ds-card hover:text-ds-ink'
-                    }`}
-                  >
+                <div className="mt-2.5 flex flex-wrap gap-1.5">
+                  {question.options.map((option) => (
                     <span
-                      className={`mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border transition ${
-                        otherSelected
-                          ? 'border-accent bg-accent/10'
-                          : 'border-ds-border bg-transparent group-hover:border-ds-muted'
-                      }`}
+                      key={option.label}
+                      title={option.description || undefined}
+                      className="inline-flex min-w-0 max-w-full items-center rounded-full border border-ds-border-muted bg-ds-card/70 px-2.5 py-1 text-[12px] text-ds-muted"
                     >
-                      {otherSelected ? <span className="h-2 w-2 rounded-full bg-accent" /> : null}
+                      <span className="truncate">{option.label}</span>
                     </span>
-                    <span className="min-w-0">
-                      <span className="block text-[13px] font-semibold">{t('userInputOther')}</span>
-                      <span className="mt-0.5 block text-[12px] leading-5 text-ds-faint">
-                        {t('userInputOtherDescription')}
-                      </span>
-                    </span>
-                  </button>
-                  {otherSelected ? (
-                    <textarea
-                      rows={2}
-                      disabled={done}
-                      value={answer?.value ?? ''}
-                      onChange={(e) =>
-                        chooseOption(question, USER_INPUT_OTHER_LABEL, e.target.value)
-                      }
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-                          e.preventDefault()
-                          submit()
-                        }
-                      }}
-                      placeholder={t('userInputCustomPlaceholder')}
-                      className="min-h-20 resize-y rounded-[10px] border border-ds-border-muted bg-ds-card/90 px-3 py-2 text-[13px] leading-5 text-ds-ink outline-none transition placeholder:text-ds-faint focus:border-accent/45 focus:ring-2 focus:ring-accent/10 disabled:cursor-default disabled:opacity-80"
-                    />
-                  ) : null}
+                  ))}
                 </div>
-              ) : (
-                <div className="mt-3">
-                  <textarea
-                    rows={3}
-                    disabled={done}
-                    value={answer?.value ?? ''}
-                    onChange={(e) =>
-                      chooseOption(question, USER_INPUT_FREEFORM_LABEL, e.target.value)
-                    }
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-                        e.preventDefault()
-                        submit()
-                      }
-                      }}
-                      placeholder={t('userInputCustomPlaceholder')}
-                    className="min-h-24 w-full resize-y rounded-[10px] border border-ds-border-muted bg-ds-card/90 px-3 py-2.5 text-[13px] leading-5 text-ds-ink outline-none transition placeholder:text-ds-faint focus:border-accent/45 focus:ring-2 focus:ring-accent/10 disabled:cursor-default disabled:opacity-80"
-                  />
-                </div>
-              )}
+              ) : null}
             </div>
           )
         })}
@@ -1305,16 +1184,11 @@ function UserInputBubble({
       ) : null}
 
       {pending ? (
-        <div className="mt-3 flex flex-wrap gap-2 border-t border-ds-border-muted pt-3">
-          <button
-            type="button"
-            disabled={!canSubmit}
-            className="inline-flex min-h-8 items-center gap-1.5 rounded-[9px] bg-ds-ink px-3 py-1.5 text-[13px] font-semibold text-white shadow-sm transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-45 dark:text-black"
-            onClick={submit}
-          >
-            <Check className="h-3.5 w-3.5" strokeWidth={2} />
-            {t('userInputSubmit')}
-          </button>
+        <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-ds-border-muted pt-3">
+          <span className="inline-flex min-w-0 items-center gap-1.5 text-[12px] font-medium text-accent">
+            <ArrowDown className="h-3.5 w-3.5 shrink-0" strokeWidth={2} />
+            <span className="min-w-0">{t('userInputAnswerBelowHint')}</span>
+          </span>
           <button
             type="button"
             className="min-h-8 rounded-[9px] border border-ds-border-muted bg-ds-card/80 px-3 py-1.5 text-[13px] font-medium text-ds-muted transition hover:bg-ds-hover hover:text-ds-ink"
@@ -1326,16 +1200,6 @@ function UserInputBubble({
       ) : null}
     </div>
   )
-}
-
-function answersByQuestionId(
-  answers: UserInputAnswer[] | undefined
-): Record<string, UserInputAnswer> {
-  const out: Record<string, UserInputAnswer> = {}
-  for (const answer of answers ?? []) {
-    out[answer.id] = answer
-  }
-  return out
 }
 
 function formatMessageDateTime(input: string, locale: string): string {

@@ -92,6 +92,8 @@ import {
   type ComposerReasoningEffort
 } from './FloatingComposerModelPicker'
 import { FloatingComposerAgentPicker } from './FloatingComposerAgentPicker'
+import { FloatingComposerUserInputPanel } from './FloatingComposerUserInputPanel'
+import { useComposerUserInput, type PendingUserInputBlock } from './use-composer-user-input'
 import {
   FloatingComposerQueuedMessages,
   type QueuedComposerMessage
@@ -527,7 +529,22 @@ export function FloatingComposer({
   const clearActiveThreadGoal = useChatStore((s) => s.clearActiveThreadGoal)
   const clawChannels = useChatStore((s) => s.clawChannels)
   const activeClawChannelId = useChatStore((s) => s.activeClawChannelId)
+  const blocks = useChatStore((s) => s.blocks)
+  const resolveUserInput = useChatStore((s) => s.resolveUserInput)
   const compact = variant === 'compact'
+  // The pending ask-user request for the active thread, surfaced as a panel
+  // docked above this composer. Only the main chat composer hosts it: `blocks`
+  // is the active thread's, so a compact side composer would otherwise mirror
+  // it. The timeline bubble remains the record in every surface.
+  const pendingUserInputBlock = useMemo<PendingUserInputBlock | null>(() => {
+    if (compact || route !== 'chat') return null
+    for (let i = blocks.length - 1; i >= 0; i -= 1) {
+      const block = blocks[i]
+      if (block.kind === 'user_input' && block.status === 'pending') return block
+    }
+    return null
+  }, [blocks, compact, route])
+  const userInput = useComposerUserInput(pendingUserInputBlock, resolveUserInput)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const speechToTextSettings = useSpeechToTextSettings()
   const dictationInputRef = useRef(input)
@@ -728,6 +745,8 @@ export function FloatingComposer({
   const goalRuntimeStartedAtRef = useRef<number | null>(null)
   const placeholder = !runtimeReady
     ? t('runtimeActionNeedsConnection')
+    : pendingUserInputBlock
+      ? t('userInputComposerPlaceholder')
     : !hasActiveThread && !effectiveWorkspaceRoot
       ? t('workspaceRequiredToCreateThread')
       : goalPanelOpen && route !== 'claw'
@@ -1318,6 +1337,21 @@ export function FloatingComposer({
   }
 
   const handlePrimaryAction = (): void => {
+    // While an ask-user request is pending, a plain text reply answers the
+    // current question instead of being sent/queued as a chat message. Routing
+    // through resolveUserInput (not onSend) bypasses the busy-turn queue. Slash
+    // commands (input starting with "/") fall through so they stay escape
+    // hatches; an empty composer is a no-op (chips still work via the panel).
+    if (userInput.active) {
+      const trimmed = input.trim()
+      if (!trimmed.startsWith('/')) {
+        if (trimmed && userInput.submitTypedText(input)) {
+          setInput('')
+          draft.focusComposer()
+        }
+        return
+      }
+    }
     if (highlightedSlashCommand) {
       if (highlightedSlashCommand.disabled) return
       applySlashCommand(highlightedSlashCommand.id)
@@ -1376,6 +1410,14 @@ export function FloatingComposer({
         return
       }
     }
+    // Trailing fallback for a pending ask: text that began with "/" but matched
+    // no real command (e.g. a free-form answer like "/usr/local/bin") still
+    // answers the current question instead of leaking into chat via onSend.
+    if (userInput.active && input.trim() && userInput.submitTypedText(input)) {
+      setInput('')
+      draft.focusComposer()
+      return
+    }
     onSend()
   }
   dictationPrimaryActionRef.current = primaryActionDisabled ? null : handlePrimaryAction
@@ -1429,6 +1471,15 @@ export function FloatingComposer({
         setInput('')
         return
       }
+    }
+
+    // Esc cancels a pending ask-user request. (Option picking is click-only:
+    // a bare-digit accelerator would hijack the first character of a
+    // digit-leading custom answer, which the type-to-answer design must allow.)
+    if (!composing && userInput.active && event.key === 'Escape') {
+      event.preventDefault()
+      userInput.cancel()
+      return
     }
 
     if (!sendByEnter || composing) return
@@ -1562,7 +1613,7 @@ export function FloatingComposer({
       />
 
       <div className="relative">
-        {showGoalFloater && activeThreadGoal ? (
+        {showGoalFloater && activeThreadGoal && !pendingUserInputBlock ? (
           <div className="pointer-events-none absolute inset-x-3 bottom-full z-20 mb-2 flex justify-center">
             <div className="pointer-events-auto flex min-h-11 w-full max-w-[46rem] items-center gap-2 rounded-full border border-ds-border bg-ds-card/95 px-3 py-1.5 text-ds-muted shadow-[0_12px_34px_rgba(20,47,95,0.10)] backdrop-blur-xl dark:bg-ds-card/90">
               <Target className="h-3.5 w-3.5 shrink-0 text-ds-faint" strokeWidth={1.9} />
@@ -1844,7 +1895,7 @@ export function FloatingComposer({
           </div>
         ) : null}
 
-        {goalPanelOpen && slashQuery == null ? (
+        {goalPanelOpen && slashQuery == null && !pendingUserInputBlock ? (
           <div
             ref={goalPanelRef}
             className="absolute inset-x-2 bottom-full z-30 mb-3 overflow-hidden rounded-[26px] border border-ds-border bg-ds-card/95 p-3 shadow-[0_18px_52px_rgba(20,47,95,0.14)] backdrop-blur-xl dark:bg-ds-card/90"
@@ -1928,6 +1979,10 @@ export function FloatingComposer({
               </button>
             </div>
           </div>
+        ) : null}
+
+        {userInput.active ? (
+          <FloatingComposerUserInputPanel controller={userInput} t={t} />
         ) : null}
 
         <div

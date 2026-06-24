@@ -952,7 +952,15 @@ export function createMaintenanceActions(
           : {}),
         blocks: s.blocks.map((b) =>
           b.id === blockId && b.kind === 'user_input'
-            ? { ...b, status: 'error' as const, errorMessage: msg }
+            ? {
+                ...b,
+                status: 'error' as const,
+                errorMessage: msg,
+                // Keep the chosen answers on the record so the read-only bubble
+                // still echoes what the user picked when a submit RPC fails,
+                // mirroring the success / interrupt-fallback paths above.
+                ...(action.kind === 'submit' ? { answers: action.answers } : {})
+              }
             : b
         )
       }))
