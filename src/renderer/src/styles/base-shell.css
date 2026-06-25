@@ -547,6 +547,16 @@ html {
   background: var(--ds-bg-main);
 }
 
+/*
+ * Full-window `fixed inset-0` overlays (e.g. the workflow/Loop editor) must not
+ * cover the real DOM titlebar that AppShell draws on Windows/Linux. The titlebar
+ * height var is only set on those platforms, so this collapses to `top: 0` on
+ * macOS (native traffic-light overlay) — issue #570.
+ */
+.ds-titlebar-fixed-overlay {
+  top: var(--ds-windows-titlebar-height, 0px);
+}
+
 .ds-windows-titlebar {
   position: relative;
   z-index: 80;
