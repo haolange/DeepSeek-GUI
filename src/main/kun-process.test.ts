@@ -13,6 +13,7 @@ import {
   defaultScheduleSettings,
   defaultWorkflowSettings,
   defaultWriteSettings,
+  defaultTerminalSettings,
   type AppSettingsV1
 } from '../shared/app-settings'
 import { KunConfigSchema } from '../../kun/src/config/kun-config.js'
@@ -32,17 +33,18 @@ function createSettings(binaryPath: string): AppSettingsV1 {
     version: 1,
     locale: 'en',
     theme: 'system',
-    uiFontScale: 'small',
+    uiFontScale: 0.82,
     provider: defaultModelProviderSettings(),
     agents: {
       kun: {
-        ...defaultKunRuntimeSettings(8899),
+        ...defaultKunRuntimeSettings(18899),
         binaryPath,
         autoStart: true
       }
     },
     workspaceRoot: '/tmp/workspace',
     log: { enabled: false, retentionDays: 7 },
+    checkpointCleanup: { enabled: false, intervalDays: 3 },
     notifications: { turnComplete: true },
     appBehavior: { openAtLogin: false, startMinimized: false, closeToTray: false },
     keyboardShortcuts: defaultKeyboardShortcuts(),
@@ -50,6 +52,7 @@ function createSettings(binaryPath: string): AppSettingsV1 {
     claw: defaultClawSettings(),
     schedule: defaultScheduleSettings(),
     workflow: defaultWorkflowSettings(),
+    terminal: defaultTerminalSettings(),
     guiUpdate: { channel: 'stable' },
     codePromptPrefix: '',
     disabledSkillIds: []
@@ -111,9 +114,17 @@ describe('startKunChild', () => {
     const script = writeScript(
       'ready-child.js',
       [
-        "setTimeout(() => {",
-        "  process.stdout.write('KUN_READY ' + JSON.stringify({ service: 'kun', mode: 'serve', port: 8899 }) + '\\n')",
-        "}, 50)",
+        "const http = require('node:http')",
+        "const port = 18899",
+        "const server = http.createServer((req, res) => {",
+        "  res.setHeader('content-type', 'application/json')",
+        "  res.end(JSON.stringify({ service: 'kun', mode: 'serve', status: 'ok' }))",
+        "})",
+        "server.listen(port, '127.0.0.1', () => {",
+        "  setTimeout(() => {",
+        "    process.stdout.write('KUN_READY ' + JSON.stringify({ service: 'kun', mode: 'serve', port }) + '\\n')",
+        "  }, 50)",
+        "})",
         "setInterval(() => {}, 1_000)"
       ].join('\n')
     )
@@ -123,7 +134,54 @@ describe('startKunChild', () => {
     await module.stopKunChildAndWait()
     const logText = await readKunLog()
     expect(logText).toContain('KUN_READY')
-    expect(logText).toContain('ready marker received on port 8899')
+    expect(logText).toContain('ready marker received on port 18899')
+  })
+
+  it('does not settle on the ready marker until the /health endpoint responds', async () => {
+    if (!tempRoot) throw new Error('temp root not initialized')
+    const healthSignalPath = join(tempRoot, 'allow-health')
+    const script = writeScript(
+      'marker-without-health-child.js',
+      [
+        "const http = require('node:http')",
+        "const { existsSync } = require('node:fs')",
+        `const healthSignalPath = ${JSON.stringify(healthSignalPath)}`,
+        "const port = 18899",
+        // Emit the ready marker right away but serve no /health yet: the
+        // marker alone must NOT be enough to settle the launch.
+        "process.stdout.write('KUN_READY ' + JSON.stringify({ service: 'kun', mode: 'serve', port }) + '\\n')",
+        'let served = false',
+        'setInterval(() => {',
+        '  if (served || !existsSync(healthSignalPath)) return',
+        '  served = true',
+        "  const server = http.createServer((req, res) => {",
+        "    res.setHeader('content-type', 'application/json')",
+        "    res.end(JSON.stringify({ service: 'kun', mode: 'serve', status: 'ok' }))",
+        "  })",
+        "  server.listen(port, '127.0.0.1')",
+        '}, 10)',
+        'setInterval(() => {}, 1_000)'
+      ].join('\n')
+    )
+    const module = await import('./kun-process')
+    let resolved = false
+    const start = module.startKunChild(createSettings(script)).then(() => {
+      resolved = true
+    })
+
+    // The marker has been emitted but /health is not up yet. The child is
+    // spawned and alive, yet the launch must stay PENDING for the whole
+    // window (the startup timeout is far larger, so it cannot mask this).
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    expect(resolved).toBe(false)
+
+    // Bring /health online; the parallel probe now settles the launch.
+    writeFileSync(healthSignalPath, 'ok', 'utf8')
+    await start
+    expect(resolved).toBe(true)
+    expect(module.isKunChildRunning()).toBe(true)
+
+    await module.stopKunChildAndWait()
   })
 
   it('shares the startup promise while Kun is spawned but not ready', async () => {
@@ -132,13 +190,23 @@ describe('startKunChild', () => {
     const script = writeScript(
       'delayed-ready-child.js',
       [
+        "const http = require('node:http')",
         "const { existsSync } = require('node:fs')",
         `const readySignalPath = ${JSON.stringify(readySignalPath)}`,
+        "const port = 18899",
         'let sentReady = false',
+        // Only stand up the /health server once the signal exists so the
+        // parallel health probe cannot settle the launch before then.
         'setInterval(() => {',
         '  if (sentReady || !existsSync(readySignalPath)) return',
         '  sentReady = true',
-        "  process.stdout.write('KUN_READY ' + JSON.stringify({ service: 'kun', mode: 'serve', port: 8899 }) + '\\n')",
+        "  const server = http.createServer((req, res) => {",
+        "    res.setHeader('content-type', 'application/json')",
+        "    res.end(JSON.stringify({ service: 'kun', mode: 'serve', status: 'ok' }))",
+        "  })",
+        "  server.listen(port, '127.0.0.1', () => {",
+        "    process.stdout.write('KUN_READY ' + JSON.stringify({ service: 'kun', mode: 'serve', port }) + '\\n')",
+        "  })",
         '}, 10)',
         'setInterval(() => {}, 1_000)'
       ].join('\n')
@@ -170,19 +238,112 @@ describe('startKunChild', () => {
     const script = writeScript(
       'exit-child.js',
       [
-        "process.stderr.write('bind failed on port 8899\\n')",
+        "process.stderr.write('bind failed on port 18899\\n')",
         'setTimeout(() => process.exit(23), 20)'
       ].join('\n')
     )
     const module = await import('./kun-process')
     await expect(module.startKunChild(createSettings(script))).rejects.toThrow(
-      /Kun exited during startup with code 23[\s\S]*bind failed on port 8899/
+      /Kun exited during startup with code 23[\s\S]*bind failed on port 18899/
     )
     expect(module.isKunChildRunning()).toBe(false)
     await module.stopKunChildAndWait()
     const logText = await readKunLog()
-    expect(logText).toContain('bind failed on port 8899')
+    expect(logText).toContain('bind failed on port 18899')
     expect(logText).toContain('exited with code 23')
+  })
+})
+
+describe('resolveKunStartupTimeoutMs', () => {
+  it('gives Windows the larger default and other platforms a smaller one', async () => {
+    const { resolveKunStartupTimeoutMs } = await import('./kun-process')
+    expect(resolveKunStartupTimeoutMs('win32', {})).toBe(90_000)
+    expect(resolveKunStartupTimeoutMs('darwin', {})).toBe(60_000)
+    expect(resolveKunStartupTimeoutMs('linux', {})).toBe(60_000)
+  })
+
+  it('honors a valid KUN_STARTUP_TIMEOUT_MS override on every platform', async () => {
+    const { resolveKunStartupTimeoutMs } = await import('./kun-process')
+    expect(resolveKunStartupTimeoutMs('win32', { KUN_STARTUP_TIMEOUT_MS: '120000' })).toBe(120_000)
+    expect(resolveKunStartupTimeoutMs('linux', { KUN_STARTUP_TIMEOUT_MS: ' 30000 ' })).toBe(30_000)
+  })
+
+  it('clamps an out-of-range override to the 15s–10min bounds', async () => {
+    const { resolveKunStartupTimeoutMs } = await import('./kun-process')
+    expect(resolveKunStartupTimeoutMs('linux', { KUN_STARTUP_TIMEOUT_MS: '1000' })).toBe(15_000)
+    expect(resolveKunStartupTimeoutMs('linux', { KUN_STARTUP_TIMEOUT_MS: '99999999' })).toBe(600_000)
+  })
+
+  it('falls back to the platform default when the override is not a finite number', async () => {
+    const { resolveKunStartupTimeoutMs } = await import('./kun-process')
+    expect(resolveKunStartupTimeoutMs('win32', { KUN_STARTUP_TIMEOUT_MS: 'soon' })).toBe(90_000)
+    expect(resolveKunStartupTimeoutMs('darwin', { KUN_STARTUP_TIMEOUT_MS: '' })).toBe(60_000)
+    expect(resolveKunStartupTimeoutMs('darwin', { KUN_STARTUP_TIMEOUT_MS: '   ' })).toBe(60_000)
+  })
+})
+
+describe('waitForKunStartupSettled', () => {
+  it('resolves immediately when no launch is in flight', async () => {
+    const module = await import('./kun-process')
+    let resolved = false
+    await Promise.race([
+      module.waitForKunStartupSettled().then(() => {
+        resolved = true
+      }),
+      new Promise((resolve) => setTimeout(resolve, 50))
+    ])
+    expect(resolved).toBe(true)
+  })
+
+  it('does not resolve until an in-flight launch settles', async () => {
+    if (!tempRoot) throw new Error('temp root not initialized')
+    const readySignalPath = join(tempRoot, 'allow-ready-settled')
+    const script = writeScript(
+      'settled-delayed-child.js',
+      [
+        "const http = require('node:http')",
+        "const { existsSync } = require('node:fs')",
+        `const readySignalPath = ${JSON.stringify(readySignalPath)}`,
+        "const port = 18899",
+        'let sentReady = false',
+        // Only stand up the /health server once the signal exists so the
+        // parallel health probe cannot settle the launch before then.
+        'setInterval(() => {',
+        '  if (sentReady || !existsSync(readySignalPath)) return',
+        '  sentReady = true',
+        "  const server = http.createServer((req, res) => {",
+        "    res.setHeader('content-type', 'application/json')",
+        "    res.end(JSON.stringify({ service: 'kun', mode: 'serve', status: 'ok' }))",
+        "  })",
+        "  server.listen(port, '127.0.0.1', () => {",
+        "    process.stdout.write('KUN_READY ' + JSON.stringify({ service: 'kun', mode: 'serve', port }) + '\\n')",
+        "  })",
+        '}, 10)',
+        'setInterval(() => {}, 1_000)'
+      ].join('\n')
+    )
+    const module = await import('./kun-process')
+    const settings = createSettings(script)
+    const start = module.startKunChild(settings)
+
+    for (let attempt = 0; attempt < 100 && !module.isKunChildRunning(); attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    expect(module.isKunChildRunning()).toBe(true)
+
+    let settled = false
+    const settledPromise = module.waitForKunStartupSettled().then(() => {
+      settled = true
+    })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(settled).toBe(false)
+
+    writeFileSync(readySignalPath, 'ready', 'utf8')
+    await start
+    await settledPromise
+    expect(settled).toBe(true)
+
+    await module.stopKunChildAndWait()
   })
 })
 
@@ -247,6 +408,43 @@ describe('reclaimKunPort', () => {
       await new Promise<void>((resolve) => server.close(() => resolve()))
     }
   })
+
+  it('does not kill the currently managed Kun child while resolving an occupied port', async () => {
+    const probe = createServer()
+    await new Promise<void>((resolve, reject) => {
+      probe.once('error', reject)
+      probe.listen(0, '127.0.0.1', () => resolve())
+    })
+    const preferredPort = (probe.address() as AddressInfo).port
+    await new Promise<void>((resolve) => probe.close(() => resolve()))
+
+    const script = writeScript(
+      'serve-entry-current-child.js',
+      [
+        "const http = require('node:http')",
+        `const port = ${preferredPort}`,
+        "const server = http.createServer((req, res) => {",
+        "  res.setHeader('content-type', 'application/json')",
+        "  res.end(JSON.stringify({ service: 'kun', mode: 'serve', status: 'ok' }))",
+        "})",
+        "server.listen(port, '127.0.0.1', () => {",
+        "  process.stdout.write('KUN_READY ' + JSON.stringify({ service: 'kun', mode: 'serve', port }) + '\\n')",
+        "})",
+        'setInterval(() => {}, 1_000)'
+      ].join('\n')
+    )
+    const module = await import('./kun-process')
+    const settings = createSettings(script)
+    settings.agents.kun.port = preferredPort
+
+    await module.startKunChild(settings)
+    const resolved = await module.resolveAvailableKunPort(preferredPort)
+
+    expect(resolved.changed).toBe(true)
+    expect(resolved.port).not.toBe(preferredPort)
+    expect(module.isKunChildRunning()).toBe(true)
+    expect(await readKunLog()).not.toContain(`killing stale kun process holding port ${preferredPort}`)
+  })
 })
 
 describe('resolveKunDataDir', () => {
@@ -266,29 +464,31 @@ describe('resolveKunDataDir', () => {
 describe('parseListeningPidsFromNetstat', () => {
   it('extracts the listening TCP PIDs for the port across IPv4/IPv6, ignoring everything else', async () => {
     const { parseListeningPidsFromNetstat } = await import('./kun-process')
+    const targetPort = 18899
+    const otherPort = targetPort + 1
     const output = [
       '',
       'Active Connections',
       '',
       '  Proto  Local Address          Foreign Address        State           PID',
       '  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1010',
-      '  TCP    127.0.0.1:8899         0.0.0.0:0              LISTENING       6789',
-      '  TCP    [::1]:8899             [::]:0                 LISTENING       6789',
-      '  TCP    127.0.0.1:8899         127.0.0.1:51000        ESTABLISHED     7000',
-      '  TCP    127.0.0.1:18899        0.0.0.0:0              LISTENING       8000',
-      '  UDP    0.0.0.0:8899           *:*                                    9000',
-      `  TCP    127.0.0.1:8899         0.0.0.0:0              LISTENING       ${process.pid}`,
+      `  TCP    127.0.0.1:${targetPort}         0.0.0.0:0              LISTENING       6789`,
+      `  TCP    [::1]:${targetPort}             [::]:0                 LISTENING       6789`,
+      `  TCP    127.0.0.1:${targetPort}         127.0.0.1:51000        ESTABLISHED     7000`,
+      `  TCP    127.0.0.1:${otherPort}         0.0.0.0:0              LISTENING       8000`,
+      `  UDP    0.0.0.0:${targetPort}           *:*                                    9000`,
+      `  TCP    127.0.0.1:${targetPort}         0.0.0.0:0              LISTENING       ${process.pid}`,
       ''
     ].join('\r\n')
 
     // Dedups IPv4+IPv6 rows for the same PID; excludes the :135 listener, the
-    // ESTABLISHED row, the :18899 suffix collision, the UDP row, and our own PID.
-    expect(parseListeningPidsFromNetstat(output, 8899)).toEqual([6789])
+    // ESTABLISHED row, the different TCP port, the UDP row, and our own PID.
+    expect(parseListeningPidsFromNetstat(output, targetPort)).toEqual([6789])
   })
 
   it('returns no PIDs when nothing listens on the port', async () => {
     const { parseListeningPidsFromNetstat } = await import('./kun-process')
-    const output = '  TCP    127.0.0.1:8899         0.0.0.0:0              LISTENING       6789'
+    const output = '  TCP    127.0.0.1:18899         0.0.0.0:0              LISTENING       6789'
 
     expect(parseListeningPidsFromNetstat(output, 9999)).toEqual([])
   })
@@ -343,6 +543,10 @@ describe('syncGuiManagedKunConfig', () => {
     expect(parsed.runtime.toolArgumentRepair).toMatchObject({ maxStringBytes: 524288 })
     expect(parsed.capabilities.attachments).toMatchObject({ enabled: true })
     expect(parsed.capabilities.memory).toMatchObject({ enabled: false })
+    // Subagents have no GUI enable toggle: they default ON so delegate_task + the
+    // built-in profiles are always offered. maxParallel/maxChildRuns must be >=1 or
+    // DelegationRuntime can never run a child. This locks the default against regressions.
+    expect(parsed.capabilities.subagents).toMatchObject({ enabled: true, maxParallel: 3, maxChildRuns: 12 })
     expect(parsed.capabilities.web).toMatchObject({ enabled: true, fetchEnabled: true })
     expect(parsed.capabilities.mcp.search).toMatchObject({ enabled: false, mode: 'auto' })
     expect(parsed.capabilities.imageGen).toEqual({
@@ -546,7 +750,7 @@ describe('syncGuiManagedKunConfig', () => {
     const configPath = join(tempRoot, 'config.json')
     const module = await import('./kun-process')
     const settings = createSettings('/tmp/fake-kun-child.js')
-    settings.schedule.internal.port = 9788
+    settings.schedule.internal.port = 19788
     settings.schedule.internal.secret = 'top-secret'
 
     await module.syncGuiManagedKunConfig(tempRoot, defaultKunRuntimeSettings(), {
@@ -570,11 +774,11 @@ describe('syncGuiManagedKunConfig', () => {
         '/tmp/deepseek-gui-test-app/out/main/claw-schedule-mcp-node-entry.js',
         '--gui-schedule-mcp-server',
         '--base-url',
-        'http://127.0.0.1:9788',
+        'http://127.0.0.1:19788',
         '--secret',
         'top-secret',
         '--workflow-base-url',
-        'http://127.0.0.1:8799'
+        'http://127.0.0.1:18799'
       ],
       env: {
         ELECTRON_RUN_AS_NODE: '1'
@@ -642,6 +846,43 @@ describe('syncGuiManagedKunConfig', () => {
     ]))
   })
 
+  it('drops stale Codex plugin cache roots but keeps hand-added manual roots', async () => {
+    if (!tempRoot) throw new Error('temp root not initialized')
+    const configPath = join(tempRoot, 'config.json')
+    // A version directory left behind by a plugin upgrade and a root a user
+    // added by hand to the Kun config file.
+    const staleRoot = join(homedir(), '.codex', 'plugins', 'cache', 'gmail', '0.0.0-stale', 'skills')
+    const manualRoot = join(tempRoot, 'manual', 'skills')
+    writeFileSync(configPath, JSON.stringify({
+      capabilities: { skills: { enabled: true, roots: [staleRoot, manualRoot], legacySkillMd: true } }
+    }), 'utf8')
+    const module = await import('./kun-process')
+
+    await module.syncGuiManagedKunConfig(tempRoot, defaultKunRuntimeSettings())
+
+    const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as any
+    expect(parsed.capabilities.skills.roots).not.toContain(staleRoot)
+    expect(parsed.capabilities.skills.roots).toContain(manualRoot)
+  })
+
+  it('forwards GUI disabledSkillIds into the runtime skills capability', async () => {
+    if (!tempRoot) throw new Error('temp root not initialized')
+    const configPath = join(tempRoot, 'config.json')
+    const module = await import('./kun-process')
+    const settings = createSettings('/tmp/fake-kun-child.js')
+    settings.disabledSkillIds = ['gmail', 'vercel-agent']
+
+    await module.syncGuiManagedKunConfig(tempRoot, defaultKunRuntimeSettings(), {
+      scheduleMcp: {
+        settings,
+        launch: { appPath: '/tmp/deepseek-gui-test-app', execPath: '/tmp/electron', isPackaged: false }
+      }
+    })
+
+    const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as any
+    expect(parsed.capabilities.skills.disabledIds).toEqual(['gmail', 'vercel-agent'])
+  })
+
   it('writes GUI-managed MCP search settings without removing existing servers', async () => {
     if (!tempRoot) throw new Error('temp root not initialized')
     const configPath = join(tempRoot, 'config.json')
@@ -703,54 +944,58 @@ describe('syncGuiManagedKunConfig', () => {
     }), 'utf8')
     const module = await import('./kun-process')
 
-    await module.syncGuiManagedKunConfig(tempRoot, {
-      ...defaultKunRuntimeSettings(),
-      storage: {
-        backend: 'hybrid',
-        sqlitePath: '/tmp/kun-index.sqlite3'
-      },
-      contextCompaction: {
-        defaultSoftThreshold: 32000,
-        defaultHardThreshold: 64000,
-        summaryMode: 'model',
-        summaryTimeoutMs: 30000,
-        summaryMaxTokens: 1600,
-        summaryInputMaxBytes: 131072
-      },
-      runtimeTuning: {
-        streamIdleTimeoutMs: 120000,
-        toolStorm: {
-          enabled: false,
-          windowSize: 12,
-          threshold: 4
+    await module.syncGuiManagedKunConfig(
+      tempRoot,
+      {
+        ...defaultKunRuntimeSettings(),
+        storage: {
+          backend: 'hybrid',
+          sqlitePath: '/tmp/kun-index.sqlite3'
         },
-        toolArgumentRepair: {
-          maxStringBytes: 262144
+        contextCompaction: {
+          defaultSoftThreshold: 32000,
+          defaultHardThreshold: 64000,
+          summaryMode: 'model',
+          summaryTimeoutMs: 30000,
+          summaryMaxTokens: 1600,
+          summaryInputMaxBytes: 131072
+        },
+        runtimeTuning: {
+          streamIdleTimeoutMs: 120000,
+          toolStorm: {
+            enabled: false,
+            windowSize: 12,
+            threshold: 4
+          },
+          toolArgumentRepair: {
+            maxStringBytes: 262144
+          }
+        },
+        mcpSearch: {
+          enabled: true,
+          mode: 'search',
+          autoThresholdToolCount: 12,
+          topKDefault: 4,
+          topKMax: 9,
+          minScore: 0.2
+        },
+        tokenEconomy: {
+          enabled: true,
+          compressToolDescriptions: false,
+          compressToolResults: true,
+          conciseResponses: false,
+          historyHygiene: {
+            maxToolResultLines: 100,
+            maxToolResultBytes: 16384,
+            maxToolResultTokens: 4000,
+            maxToolArgumentStringBytes: 4096,
+            maxToolArgumentStringTokens: 1000,
+            maxArrayItems: 40
+          }
         }
       },
-      mcpSearch: {
-        enabled: true,
-        mode: 'search',
-        autoThresholdToolCount: 12,
-        topKDefault: 4,
-        topKMax: 9,
-        minScore: 0.2
-      },
-      tokenEconomy: {
-        enabled: true,
-        compressToolDescriptions: false,
-        compressToolResults: true,
-        conciseResponses: false,
-        historyHygiene: {
-          maxToolResultLines: 100,
-          maxToolResultBytes: 16384,
-          maxToolResultTokens: 4000,
-          maxToolArgumentStringBytes: 4096,
-          maxToolArgumentStringTokens: 1000,
-          maxArrayItems: 40
-        }
-      }
-    })
+      { mcpConfigPath: join(tempRoot, 'missing-mcp.json') }
+    )
 
     const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as any
     expect(KunConfigSchema.safeParse(parsed).success).toBe(true)
@@ -830,6 +1075,7 @@ describe('syncGuiManagedKunConfig', () => {
       servers: {
         'stata-mcp': {
           command: 'uvx',
+          cwd: 'D:\\Workspace\\stata-project',
           args: ['stata-mcp'],
           env: {
             STATA_CLI: 'D:\\stata\\StataMP-64.exe'
@@ -857,6 +1103,7 @@ describe('syncGuiManagedKunConfig', () => {
       enabled: true,
       transport: 'stdio',
       command: 'uvx',
+      cwd: 'D:\\Workspace\\stata-project',
       args: ['stata-mcp'],
       env: {
         STATA_CLI: 'D:\\stata\\StataMP-64.exe'
@@ -918,9 +1165,9 @@ describe('syncGuiManagedKunConfig', () => {
         '/tmp/deepseek-gui-test-app/out/main/claw-schedule-mcp-node-entry.js',
         '--gui-schedule-mcp-server',
         '--base-url',
-        'http://127.0.0.1:8788',
+        'http://127.0.0.1:18788',
         '--workflow-base-url',
-        'http://127.0.0.1:8799'
+        'http://127.0.0.1:18799'
       ],
       env: {
         ELECTRON_RUN_AS_NODE: '1'
@@ -974,5 +1221,45 @@ describe('syncGuiManagedKunConfig', () => {
       searchEnabled: true,
       provider: 'custom-search'
     })
+  })
+})
+
+describe('subagentProfilesForRuntime', () => {
+  it('drops blank optional fields so the runtime config still parses', async () => {
+    const module = await import('./kun-process')
+    // Built-in profiles store an empty `name` (the GUI localizes the label) and
+    // the user picked a model on one of them. The runtime schema marks every
+    // optional string `.min(1)`, so a forwarded empty string used to throw and
+    // strand the runtime at "无法连接到本地运行时".
+    const config = module.subagentProfilesForRuntime({
+      enabled: true,
+      profiles: [
+        {
+          id: 'general',
+          enabled: true,
+          name: '',
+          mode: 'subagent',
+          toolPolicy: 'inherit',
+          model: 'deepseek-v4',
+          description: '   '
+        }
+      ]
+    })
+
+    expect(config.profiles.general).toBeDefined()
+    expect('name' in config.profiles.general).toBe(false)
+    expect('description' in config.profiles.general).toBe(false)
+    expect(config.profiles.general.model).toBe('deepseek-v4')
+  })
+
+  it('keeps a non-empty name', async () => {
+    const module = await import('./kun-process')
+    const config = module.subagentProfilesForRuntime({
+      enabled: true,
+      profiles: [
+        { id: 'custom', enabled: true, name: '我的代理', mode: 'subagent', toolPolicy: 'inherit' }
+      ]
+    })
+    expect(config.profiles.custom.name).toBe('我的代理')
   })
 })

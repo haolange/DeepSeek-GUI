@@ -10,9 +10,15 @@ import {
   defaultScheduleSettings,
   defaultWorkflowSettings,
   defaultWriteSettings,
+  defaultTerminalSettings,
   type AppSettingsV1
 } from '../../shared/app-settings'
-import { guiSkillRootsForRuntime, listGuiSkillRoots, listGuiSkills } from './skill-service'
+import {
+  guiSkillRootsForRuntime,
+  isCodexPluginCacheRoot,
+  listGuiSkillRoots,
+  listGuiSkills
+} from './skill-service'
 
 vi.mock('node:os', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:os')>()
@@ -209,6 +215,71 @@ describe('skill-service', () => {
       .not.toContain(comparable(pluginRoot))
   })
 
+  it('stops scanning Codex plugin caches when global-codex is disabled', async () => {
+    const workspaceRoot = join(tempRoot, 'ws-plugin-global')
+    const pluginRoot = join(tempRoot, '.codex', 'plugins', 'cache', 'gmail', '1.0', 'skills')
+    await mkdir(join(pluginRoot, 'gmail'), { recursive: true })
+    await writeFile(join(pluginRoot, 'gmail', 'SKILL.md'), ['---', 'name: gmail', '---'].join('\n'), 'utf8')
+
+    const settings = createSettings(workspaceRoot)
+    // Plugin caches are on by default...
+    expect((await guiSkillRootsForRuntime(settings, workspaceRoot)).map((root) => comparable(root.path)))
+      .toContain(comparable(pluginRoot))
+
+    // ...and disabling the Codex global root toggle takes them all down with it.
+    settings.claw.skills.disabledDirs = ['global-codex']
+    expect((await guiSkillRootsForRuntime(settings, workspaceRoot)).map((root) => comparable(root.path)))
+      .not.toContain(comparable(pluginRoot))
+  })
+
+  it('recognizes roots under ~/.codex/plugins/cache as Codex plugin caches', () => {
+    expect(isCodexPluginCacheRoot(join(tempRoot, '.codex', 'plugins', 'cache', 'vercel', '2.1', 'skills'))).toBe(true)
+    expect(isCodexPluginCacheRoot(join(tempRoot, '.codex', 'skills'))).toBe(false)
+    expect(isCodexPluginCacheRoot(join(tempRoot, '.kun', 'skills'))).toBe(false)
+  })
+
+  it('rejects a skill.json whose entry escapes the package directory (path traversal)', async () => {
+    const workspaceRoot = join(tempRoot, 'ws-traversal')
+    const skillRoot = join(workspaceRoot, '.claude', 'skills', 'evil')
+    await mkdir(skillRoot, { recursive: true })
+    await writeFile(
+      join(skillRoot, 'skill.json'),
+      JSON.stringify({ id: 'evil', name: 'Evil', entry: '../../../../etc/passwd' }),
+      'utf8'
+    )
+
+    const result = await listGuiSkills(createSettings(workspaceRoot), workspaceRoot)
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    // The crafted skill is skipped, not surfaced.
+    expect(result.skills.some((skill) => skill.id === 'evil')).toBe(false)
+    // ...and the violation is recorded as a validation error against its root.
+    expect(result.validationErrors.some((error) => comparable(error.root) === comparable(skillRoot))).toBe(true)
+  })
+
+  it('imports a skill.json with a plain entry filename', async () => {
+    const workspaceRoot = join(tempRoot, 'ws-entry-ok')
+    const skillRoot = join(workspaceRoot, '.claude', 'skills', 'reader')
+    await mkdir(skillRoot, { recursive: true })
+    await writeFile(
+      join(skillRoot, 'skill.json'),
+      JSON.stringify({ id: 'reader', name: 'Reader', entry: 'GUIDE.md' }),
+      'utf8'
+    )
+    await writeFile(join(skillRoot, 'GUIDE.md'), '# Reader', 'utf8')
+
+    const result = await listGuiSkills(createSettings(workspaceRoot), workspaceRoot)
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.skills).toContainEqual(expect.objectContaining({
+      id: 'reader',
+      name: 'Reader',
+      entryPath: join(skillRoot, 'GUIDE.md')
+    }))
+  })
+
   function comparable(path: string): string {
     return path.replace(/\\/g, '/').replace(/\/+$/g, '').toLowerCase()
   }
@@ -218,11 +289,12 @@ describe('skill-service', () => {
       version: 1,
       locale: 'en',
       theme: 'system',
-      uiFontScale: 'small',
+      uiFontScale: 0.82,
       provider: defaultModelProviderSettings(),
       agents: { kun: defaultKunRuntimeSettings() },
       workspaceRoot,
       log: { enabled: false, retentionDays: 7 },
+      checkpointCleanup: { enabled: false, intervalDays: 3 },
       notifications: { turnComplete: true },
       appBehavior: { openAtLogin: false, startMinimized: false, closeToTray: false },
       keyboardShortcuts: defaultKeyboardShortcuts(),
@@ -230,6 +302,7 @@ describe('skill-service', () => {
       claw: defaultClawSettings(),
       schedule: defaultScheduleSettings(),
       workflow: defaultWorkflowSettings(),
+      terminal: defaultTerminalSettings(),
       guiUpdate: { channel: 'stable' },
       codePromptPrefix: '',
       disabledSkillIds: []

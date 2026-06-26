@@ -36,7 +36,7 @@ export function SidebarTitlebarToggleButton({
       aria-label={ariaLabel ?? title}
       className={cx('ds-titlebar-sidebar-toggle ds-no-drag', className)}
     >
-      {children ?? <PanelLeft className="h-[13px] w-[13px]" strokeWidth={1.55} />}
+      {children ?? <PanelLeft className="h-4 w-4" strokeWidth={1.75} />}
     </button>
   )
 }
@@ -275,6 +275,9 @@ type SidebarTreeRowProps = {
   title?: string
   ariaLabel?: string
   onContextMenu?: (event: ReactMouseEvent<HTMLDivElement>) => void
+  onMouseEnter?: (event: ReactMouseEvent<HTMLDivElement>) => void
+  onMouseMove?: (event: ReactMouseEvent<HTMLDivElement>) => void
+  onMouseLeave?: (event: ReactMouseEvent<HTMLDivElement>) => void
   disabled?: boolean
   active?: boolean
   activeVariant?: 'rail' | 'outline'
@@ -293,6 +296,9 @@ export function SidebarTreeRow({
   title,
   ariaLabel,
   onContextMenu,
+  onMouseEnter,
+  onMouseMove,
+  onMouseLeave,
   disabled,
   active = false,
   activeVariant = 'rail',
@@ -335,6 +341,9 @@ export function SidebarTreeRow({
       )}
       title={title}
       onContextMenu={onContextMenu}
+      onMouseEnter={onMouseEnter}
+      onMouseMove={onMouseMove}
+      onMouseLeave={onMouseLeave}
     >
       {rail ? (
         <span

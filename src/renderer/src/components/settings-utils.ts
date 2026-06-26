@@ -1,6 +1,8 @@
 import {
+  DEFAULT_CHECKPOINT_CLEANUP_INTERVAL_DAYS,
   DEFAULT_LOG_RETENTION_DAYS,
   DEFAULT_GUI_UPDATE_CHANNEL,
+  MIN_KUN_LOCAL_PORT,
   defaultKunRuntimeSettings,
   applyKunRuntimePatch,
   getKunRuntimeSettings,
@@ -12,14 +14,19 @@ import {
   mergeScheduleSettings,
   mergeWorkflowSettings,
   mergeWriteSettings,
+  mergeTerminalSettings,
   normalizeAppBehaviorSettings,
   normalizeClawSettings,
+  normalizeCheckpointCleanupSettings,
+  normalizeCursorSpotlightColor,
   normalizeGuiUpdateChannel,
   normalizeKeyboardShortcuts,
   normalizeModelProviderSettings,
   normalizeScheduleSettings,
   normalizeWorkflowSettings,
   normalizeWriteSettings,
+  normalizeTerminalSettings,
+  normalizeUiFontScale,
   type AppSettingsPatch,
   type AppSettingsV1
 } from '@shared/app-settings'
@@ -43,7 +50,7 @@ export function listSettingsText(values: string[]): string {
 
 export function hasValidPort(settings: AppSettingsV1): boolean {
   const port = getKunRuntimeSettings(settings).port
-  return Number.isFinite(port) && port >= 1 && port <= 65535
+  return Number.isFinite(port) && port >= MIN_KUN_LOCAL_PORT && port <= 65535
 }
 
 export function mergeSettings(current: AppSettingsV1, patch: SettingsPatch): AppSettingsV1 {
@@ -57,6 +64,10 @@ export function mergeSettings(current: AppSettingsV1, patch: SettingsPatch): App
       ...safeCurrent.log,
       ...(patch.log ?? {})
     },
+    checkpointCleanup: normalizeCheckpointCleanupSettings({
+      ...safeCurrent.checkpointCleanup,
+      ...(patch.checkpointCleanup ?? {})
+    }),
     notifications: {
       ...safeCurrent.notifications,
       ...(patch.notifications ?? {})
@@ -72,6 +83,7 @@ export function mergeSettings(current: AppSettingsV1, patch: SettingsPatch): App
     claw: mergeClawSettings(safeCurrent.claw, patch.claw),
     schedule: mergeScheduleSettings(safeCurrent.schedule, patch.schedule),
     workflow: mergeWorkflowSettings(safeCurrent.workflow, patch.workflow),
+    terminal: mergeTerminalSettings(safeCurrent.terminal, patch.terminal),
     guiUpdate: {
       ...safeCurrent.guiUpdate,
       ...(patch.guiUpdate ?? {})
@@ -85,16 +97,14 @@ export function coerceRendererSettings(settings: AppSettingsV1): AppSettingsV1 {
     raw.theme === 'system' || raw.theme === 'light' || raw.theme === 'dark'
       ? raw.theme
       : 'system'
-  const uiFontScale =
-    raw.uiFontScale === 'small' || raw.uiFontScale === 'medium' || raw.uiFontScale === 'large'
-      ? raw.uiFontScale
-      : 'medium'
+  const uiFontScale = normalizeUiFontScale(raw.uiFontScale)
   return {
     version: 1,
     locale: raw.locale === 'zh' ? 'zh' : 'en',
     theme,
     uiFontScale,
     cursorSpotlight: raw.cursorSpotlight !== false,
+    cursorSpotlightColor: normalizeCursorSpotlightColor(raw.cursorSpotlightColor),
     provider: normalizeModelProviderSettings(raw.provider),
     agents: kunSettingsEnvelope(mergeKunRuntimeSettings(defaultKunRuntimeSettings(), getKunRuntimeSettings(settings))),
     workspaceRoot: typeof raw.workspaceRoot === 'string' ? raw.workspaceRoot : DEFAULT_WORKSPACE_ROOT,
@@ -104,6 +114,9 @@ export function coerceRendererSettings(settings: AppSettingsV1): AppSettingsV1 {
         ? raw.log.retentionDays
         : DEFAULT_LOG_RETENTION_DAYS
     },
+    checkpointCleanup: normalizeCheckpointCleanupSettings(
+      raw.checkpointCleanup ?? { intervalDays: DEFAULT_CHECKPOINT_CLEANUP_INTERVAL_DAYS }
+    ),
     notifications: {
       turnComplete: raw.notifications?.turnComplete !== false
     },
@@ -113,6 +126,7 @@ export function coerceRendererSettings(settings: AppSettingsV1): AppSettingsV1 {
     claw: normalizeClawSettings(raw.claw),
     schedule: normalizeScheduleSettings(raw.schedule),
     workflow: normalizeWorkflowSettings(raw.workflow),
+    terminal: normalizeTerminalSettings(raw.terminal),
     guiUpdate: {
       channel: normalizeGuiUpdateChannel(raw.guiUpdate?.channel ?? DEFAULT_GUI_UPDATE_CHANNEL)
     },

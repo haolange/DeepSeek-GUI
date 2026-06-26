@@ -4,7 +4,9 @@ import type { ChatState, ChatStoreGet, ChatStoreSet } from './chat-store-types'
 import {
   fallbackComposerModel,
   mergeComposerPickList,
+  persistComposerMode,
   persistComposerModel,
+  rememberThreadComposerMode,
   readStoredComposerModel
 } from './chat-store-helpers'
 import { createAppActions } from './chat-store-app-actions'
@@ -12,6 +14,8 @@ import { createAppActions } from './chat-store-app-actions'
 const COMPOSER_MODEL_STORAGE_KEY = 'kun.composerModel'
 const COMPOSER_PROVIDER_STORAGE_KEY = 'kun.composerProviderId'
 const THREAD_COMPOSER_SELECTION_STORAGE_KEY = 'kun.threadComposerSelection.v1'
+const THREAD_COMPOSER_MODE_STORAGE_KEY = 'kun.threadComposerMode.v1'
+const COMPOSER_MODE_STORAGE_KEY = 'kun.composerMode'
 
 function createMemoryStorage(): Storage {
   const items = new Map<string, string>()
@@ -42,6 +46,7 @@ function buildHarness(fetchModelsResult: FetchModelsResult): {
   let state = {
     activeThreadId: null,
     threads: [],
+    composerMode: 'agent',
     composerModel: '',
     composerProviderId: '',
     composerPickList: mergeComposerPickList(false, []),
@@ -68,6 +73,8 @@ function buildHarness(fetchModelsResult: FetchModelsResult): {
       get,
       i18n: { t: (key: string) => key, changeLanguage: vi.fn(async () => undefined) } as unknown as typeof i18next,
       persistComposerModel,
+      persistComposerMode,
+      rememberThreadComposerMode,
       readStoredComposerModel,
       mergeComposerPickList,
       fallbackComposerModel,
@@ -78,6 +85,7 @@ function buildHarness(fetchModelsResult: FetchModelsResult): {
       applyTheme: () => undefined,
       applyUiFontScale: () => undefined,
       applyCursorSpotlight: () => undefined,
+      applyCursorSpotlightColor: () => undefined,
       applyWriteTypography: () => undefined,
       applyDocumentLocale: () => undefined,
       workspaceLabelFromPath: (workspaceRoot) => workspaceRoot,
@@ -140,6 +148,24 @@ describe('chat-store app actions composer model loading', () => {
     expect(localStorage.getItem(COMPOSER_PROVIDER_STORAGE_KEY)).toBe('minimax')
     expect(window.kunGui.saveSettingsSilent).toHaveBeenCalledWith({
       agents: { kun: { model: 'MiniMax-M2' } }
+    })
+  })
+
+  it('keeps active-thread plan mode changes out of the global composer default', () => {
+    const { actions, state } = buildHarness({
+      ok: true,
+      modelIds: ['MiniMax-M2'],
+      defaultModelId: 'deepseek-v4-pro',
+      modelGroups: []
+    })
+    state.activeThreadId = 'thread-a'
+
+    actions.setComposerMode('plan')
+
+    expect(state.composerMode).toBe('plan')
+    expect(localStorage.getItem(COMPOSER_MODE_STORAGE_KEY)).toBeNull()
+    expect(JSON.parse(localStorage.getItem(THREAD_COMPOSER_MODE_STORAGE_KEY) ?? '{}')).toEqual({
+      'thread-a': 'plan'
     })
   })
 
@@ -256,7 +282,7 @@ describe('chat-store app actions composer model loading', () => {
     expect(state.composerProviderId).toBe('')
   })
 
-  it('blocks switching an active chat with user messages from vision to text-only', () => {
+  it('blocks switching a chat with image attachments from vision to text-only', () => {
     const { actions, state } = buildHarness({
       ok: true,
       modelIds: ['vision-model', 'text-model'],
@@ -264,7 +290,12 @@ describe('chat-store app actions composer model loading', () => {
       modelGroups: []
     })
     state.route = 'chat'
-    state.blocks = [{ kind: 'user', id: 'user-1', text: 'hello' }] as ChatState['blocks']
+    state.blocks = [{
+      kind: 'user',
+      id: 'user-1',
+      text: 'describe this',
+      meta: { attachments: [{ id: 'att-1', kind: 'image' }] }
+    }] as ChatState['blocks']
     state.activeThreadId = 'thread-a'
     state.threads = [{
       id: 'thread-a',
@@ -303,6 +334,89 @@ describe('chat-store app actions composer model loading', () => {
     expect(state.composerProviderId).toBe('test-provider')
     expect(localStorage.getItem(THREAD_COMPOSER_SELECTION_STORAGE_KEY)).toBeNull()
     expect(window.kunGui.saveSettingsSilent).not.toHaveBeenCalled()
+  })
+
+  it('allows switching a text-only chat from vision to text-only (issue #579)', () => {
+    const { actions, state } = buildHarness({
+      ok: true,
+      modelIds: ['vision-model', 'text-model'],
+      defaultModelId: 'vision-model',
+      modelGroups: []
+    })
+    state.route = 'chat'
+    // A plain text conversation must not pin the picker to vision models.
+    state.blocks = [
+      { kind: 'user', id: 'user-1', text: 'hello' },
+      { kind: 'assistant', id: 'assistant-1', text: 'hi there' }
+    ] as ChatState['blocks']
+    state.composerModel = 'vision-model'
+    state.composerProviderId = 'test-provider'
+    state.composerModelGroups = [{
+      providerId: 'test-provider',
+      label: 'Test',
+      modelIds: ['vision-model', 'text-model'],
+      modelProfiles: {
+        'vision-model': {
+          inputModalities: ['text', 'image'],
+          outputModalities: ['text'],
+          supportsToolCalling: true,
+          messageParts: ['text', 'image_url']
+        },
+        'text-model': {
+          inputModalities: ['text'],
+          outputModalities: ['text'],
+          supportsToolCalling: true,
+          messageParts: ['text']
+        }
+      }
+    }]
+
+    actions.setComposerModel('text-model', 'test-provider')
+
+    expect(state.composerModel).toBe('text-model')
+    expect(state.composerProviderId).toBe('test-provider')
+  })
+
+  it('allows switching a document-only chat from vision to text-only', () => {
+    const { actions, state } = buildHarness({
+      ok: true,
+      modelIds: ['vision-model', 'text-model'],
+      defaultModelId: 'vision-model',
+      modelGroups: []
+    })
+    state.route = 'chat'
+    // Documents are text-extracted, so they don't require a vision model.
+    state.blocks = [{
+      kind: 'user',
+      id: 'user-1',
+      text: 'summarize',
+      meta: { attachments: [{ id: 'doc-1', kind: 'document' }] }
+    }] as ChatState['blocks']
+    state.composerModel = 'vision-model'
+    state.composerProviderId = 'test-provider'
+    state.composerModelGroups = [{
+      providerId: 'test-provider',
+      label: 'Test',
+      modelIds: ['vision-model', 'text-model'],
+      modelProfiles: {
+        'vision-model': {
+          inputModalities: ['text', 'image'],
+          outputModalities: ['text'],
+          supportsToolCalling: true,
+          messageParts: ['text', 'image_url']
+        },
+        'text-model': {
+          inputModalities: ['text'],
+          outputModalities: ['text'],
+          supportsToolCalling: true,
+          messageParts: ['text']
+        }
+      }
+    }]
+
+    actions.setComposerModel('text-model', 'test-provider')
+
+    expect(state.composerModel).toBe('text-model')
   })
 
   it('allows switching an empty chat from vision to text-only', () => {

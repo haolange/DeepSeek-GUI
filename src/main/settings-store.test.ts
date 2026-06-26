@@ -2,7 +2,12 @@ import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { DEFAULT_APPROVAL_POLICY, defaultKunRuntimeSettings, defaultModelProviderSettings } from '../shared/app-settings'
+import {
+  DEFAULT_APPROVAL_POLICY,
+  DEFAULT_CHECKPOINT_CLEANUP_INTERVAL_DAYS,
+  defaultKunRuntimeSettings,
+  defaultModelProviderSettings
+} from '../shared/app-settings'
 import { DEFAULT_GUI_UPDATE_CHANNEL } from '../shared/gui-update'
 import { JsonSettingsStore } from './settings-store'
 
@@ -15,12 +20,28 @@ describe('JsonSettingsStore', () => {
 
     expect(loaded.guiUpdate.channel).toBe(DEFAULT_GUI_UPDATE_CHANNEL)
     expect(loaded.agents.kun.approvalPolicy).toBe(DEFAULT_APPROVAL_POLICY)
+    expect(loaded.checkpointCleanup.intervalDays).toBe(DEFAULT_CHECKPOINT_CLEANUP_INTERVAL_DAYS)
+    // Checkpoint cleanup deletes data, so it must be opt-in (disabled by default).
+    expect(loaded.checkpointCleanup.enabled).toBe(false)
     expect(loaded.appBehavior).toEqual({
       openAtLogin: false,
       startMinimized: false,
       closeAction: 'ask',
       closeToTray: false
     })
+  })
+
+  it('patches and normalizes checkpoint cleanup settings', async () => {
+    const userDataDir = await mkdtemp(join(tmpdir(), 'ds-gui-settings-'))
+
+    const store = new JsonSettingsStore(userDataDir)
+    const patched = await store.patch({ checkpointCleanup: { intervalDays: 5 } })
+    expect(patched.checkpointCleanup.intervalDays).toBe(5)
+
+    const clamped = await store.patch({
+      checkpointCleanup: { intervalDays: 99 as unknown as typeof patched.checkpointCleanup.intervalDays }
+    })
+    expect(clamped.checkpointCleanup.intervalDays).toBe(10)
   })
 
   it('creates a default write workspace with welcome.md', async () => {
@@ -279,7 +300,7 @@ describe('JsonSettingsStore', () => {
       JSON.stringify({
         version: 1,
         agentProvider: 'deepseek-runtime',
-        deepseek: { port: 8787 }
+        deepseek: { port: 18787 }
       }),
       'utf8'
     )
@@ -287,7 +308,7 @@ describe('JsonSettingsStore', () => {
     const store = new JsonSettingsStore(userDataDir)
     const loaded = await store.load()
 
-    expect(loaded.agents.kun.port).toBe(8787)
+    expect(loaded.agents.kun.port).toBe(18787)
   })
 
   it('backs up invalid JSON and replaces it with defaults', async () => {

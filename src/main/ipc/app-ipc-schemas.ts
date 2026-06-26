@@ -36,6 +36,7 @@ import {
   MODEL_PROVIDER_MESSAGE_PARTS,
   MODEL_REASONING_EFFORTS,
   MODEL_REASONING_REQUEST_PROTOCOLS,
+  MIN_KUN_LOCAL_PORT,
   SCHEDULE_MODEL_IDS,
   SCHEDULE_REASONING_EFFORT_IDS,
   SPEECH_TO_TEXT_PROTOCOLS,
@@ -45,11 +46,13 @@ import {
 } from '../../shared/app-settings'
 import { DESKTOP_COMMANDS } from '../../shared/kun-gui-api'
 import { GUI_UPDATE_CHANNELS } from '../../shared/gui-update'
-import { WINDOW_CLOSE_ACTIONS } from '../../shared/app-settings'
+import { WINDOW_CLOSE_ACTIONS, UI_FONT_SCALE_MIN, UI_FONT_SCALE_MAX } from '../../shared/app-settings'
 import { KEYBOARD_SHORTCUT_COMMANDS } from '../../shared/keyboard-shortcuts'
 import { WRITE_EXPORT_FORMATS } from '../../shared/write-export'
 import { WRITE_INFOGRAPHIC_MAX_TEXT_CHARS } from '../../shared/write-infographic'
 import { SPEECH_TRANSCRIPTION_MAX_BASE64_CHARS, SPEECH_TRANSCRIPTION_MAX_DURATION_MS } from '../../shared/speech-to-text'
+import { LOCAL_WHISPER_DOWNLOAD_SOURCES, LOCAL_WHISPER_MODELS } from '../../shared/local-whisper'
+import type { LocalWhisperDownloadSourceId } from '../../shared/local-whisper'
 import {
   TERMINAL_DEFAULT_COLS,
   TERMINAL_DEFAULT_ROWS,
@@ -64,6 +67,8 @@ const MAX_BODY_BYTES = 2_000_000
 const MAX_PATH_LENGTH = 4_096
 const MAX_URL_LENGTH = 4_096
 const MAX_ID_LENGTH = 256
+// Provider catalogs can expose routed model ids longer than local object ids.
+const MAX_MODEL_ID_LENGTH = 512
 const MAX_BRANCH_LENGTH = 255
 const MAX_EDITOR_ID_LENGTH = 64
 const MAX_NOTIFICATION_TITLE_LENGTH = 200
@@ -202,8 +207,12 @@ export const runtimeRequestPayloadSchema = z
 
 const localeSchema = z.enum(['en', 'zh'])
 const themeSchema = z.enum(['system', 'light', 'dark'])
-const uiFontScaleSchema = z.enum(['small', 'medium', 'large'])
-const approvalPolicySchema = z.enum(['on-request', 'untrusted', 'never', 'auto', 'suggest'])
+const uiFontScaleSchema = z.union([
+  z.number().min(UI_FONT_SCALE_MIN).max(UI_FONT_SCALE_MAX),
+  z.enum(['small', 'medium', 'large'])
+])
+const hexColorSchema = z.string().trim().regex(/^#[0-9a-fA-F]{6}$/)
+const approvalPolicySchema = z.enum(['always', 'on-request', 'untrusted', 'never', 'auto', 'suggest'])
 const sandboxModeSchema = z.enum(['read-only', 'workspace-write', 'danger-full-access', 'external-sandbox'])
 const mcpSearchModeSchema = z.enum(['direct', 'search', 'auto'])
 const kunStorageBackendSchema = z.enum(['hybrid', 'file'])
@@ -211,15 +220,25 @@ const kunCompactionSummaryModeSchema = z.enum(['heuristic', 'model'])
 const clawRunModeSchema = z.enum(['agent', 'plan'])
 const clawImProviderSchema = z.enum(['feishu', 'weixin', 'telegram'])
 const clawScheduleKindSchema = z.enum(['manual', 'interval', 'daily', 'at'])
-const clawTaskStatusSchema = z.enum(['idle', 'running', 'success', 'error'])
+const clawTaskStatusSchema = z.enum(['idle', 'queued', 'running', 'success', 'error'])
 const scheduleReasoningEffortSchema = z.enum(SCHEDULE_REASONING_EFFORT_IDS)
+const modelIdSchema = z.string().trim().min(1).max(MAX_MODEL_ID_LENGTH)
+const optionalModelIdSchema = z.string().trim().max(MAX_MODEL_ID_LENGTH).optional()
 const writeInlineCompletionModelSchema = z.union([
   z.enum(WRITE_INLINE_COMPLETION_MODEL_IDS),
-  trimmedString(128)
+  modelIdSchema
 ])
 const modelEndpointFormatSchema = z.enum(MODEL_ENDPOINT_FORMATS)
 const imageGenerationProtocolSchema = z.enum(IMAGE_GENERATION_PROTOCOLS)
 const speechToTextProtocolSchema = z.enum(SPEECH_TO_TEXT_PROTOCOLS)
+const localWhisperModelIdSchema = z.enum(LOCAL_WHISPER_MODELS.map((model) => model.id) as [string, ...string[]])
+const localWhisperDownloadSourceIds = LOCAL_WHISPER_DOWNLOAD_SOURCES.map((source) => source.id) as [
+  LocalWhisperDownloadSourceId,
+  ...LocalWhisperDownloadSourceId[]
+]
+const localWhisperDownloadSourceSchema = z.enum(
+  localWhisperDownloadSourceIds
+)
 const textToSpeechProtocolSchema = z.enum(TEXT_TO_SPEECH_PROTOCOLS)
 const musicGenerationProtocolSchema = z.enum(MUSIC_GENERATION_PROTOCOLS)
 const videoGenerationProtocolSchema = z.enum(VIDEO_GENERATION_PROTOCOLS)
@@ -229,7 +248,8 @@ const speechToTextSettingsSchema = z.object({
   protocol: speechToTextProtocolSchema,
   baseUrl: z.string().trim().max(MAX_URL_LENGTH),
   apiKey: z.string().max(MAX_BODY_BYTES),
-  model: z.string().trim().max(128),
+  model: z.string().trim().max(MAX_MODEL_ID_LENGTH),
+  localWhisperDownloadSource: localWhisperDownloadSourceSchema,
   language: z.string().trim().max(16),
   timeoutMs: z.number().int().positive().max(600_000)
 }).strict()
@@ -238,7 +258,7 @@ const modelProviderMessagePartSchema = z.enum(MODEL_PROVIDER_MESSAGE_PARTS)
 const modelReasoningEffortSchema = z.enum(MODEL_REASONING_EFFORTS)
 const modelReasoningRequestProtocolSchema = z.enum(MODEL_REASONING_REQUEST_PROTOCOLS)
 const modelProfilePatchSchema = z.object({
-  aliases: z.array(z.string().trim().min(1).max(128)).max(50).optional(),
+  aliases: z.array(modelIdSchema).max(50).optional(),
   contextWindowTokens: z.number().int().positive().max(10_000_000).optional(),
   inputModalities: z.array(modelProviderInputModalitySchema).max(8).optional(),
   outputModalities: z.array(modelProviderInputModalitySchema).max(8).optional(),
@@ -269,44 +289,80 @@ const modelProviderPatchSchema = z.object({
     // models in a single /v1/models response. The previous 200/50 caps caused
     // settings:set to silently fail with no toast (#397). Raised to leave
     // plenty of headroom while still bounding pathological payloads.
-    models: z.array(z.string().trim().min(1).max(128)).max(2000).optional(),
+    models: z.array(modelIdSchema).max(2000).optional(),
     // 兼容旧版保存的视觉识别能力字段。当前能力已经迁移到 modelProfiles 的 inputModalities/messageParts。
     imageRecognition: z.unknown().optional(),
     modelProfiles: z.record(
-      z.string().trim().min(1).max(128),
+      modelIdSchema,
       modelProfilePatchSchema.nullable()
     ).optional(),
     image: z.object({
       protocol: imageGenerationProtocolSchema.optional(),
       baseUrl: z.string().trim().max(MAX_URL_LENGTH).optional(),
-      models: z.array(z.string().trim().min(1).max(128)).max(500).optional()
+      models: z.array(modelIdSchema).max(500).optional()
     }).strict().nullable().optional(),
     speech: z.object({
       protocol: speechToTextProtocolSchema.optional(),
       baseUrl: z.string().trim().max(MAX_URL_LENGTH).optional(),
-      models: z.array(z.string().trim().min(1).max(128)).max(500).optional()
+      models: z.array(modelIdSchema).max(500).optional()
     }).strict().nullable().optional(),
     textToSpeech: z.object({
       protocol: textToSpeechProtocolSchema.optional(),
       baseUrl: z.string().trim().max(MAX_URL_LENGTH).optional(),
-      models: z.array(z.string().trim().min(1).max(128)).max(500).optional()
+      models: z.array(modelIdSchema).max(500).optional()
     }).strict().nullable().optional(),
     music: z.object({
       protocol: musicGenerationProtocolSchema.optional(),
       baseUrl: z.string().trim().max(MAX_URL_LENGTH).optional(),
-      models: z.array(z.string().trim().min(1).max(128)).max(500).optional()
+      models: z.array(modelIdSchema).max(500).optional()
     }).strict().nullable().optional(),
     video: z.object({
       protocol: videoGenerationProtocolSchema.optional(),
       baseUrl: z.string().trim().max(MAX_URL_LENGTH).optional(),
-      models: z.array(z.string().trim().min(1).max(128)).max(500).optional()
+      models: z.array(modelIdSchema).max(500).optional()
     }).strict().nullable().optional()
   }).strict()).max(50).optional()
 }).strict()
 
+// Subagent profile patch. `.passthrough()` so a field the GUI adds later is
+// preserved through the strict parent instead of being dropped (which would
+// silently lose a configured model/reasoning on round-trip).
+const subagentProfilePatchSchema = z
+  .object({
+    id: z.string().min(1).max(128),
+    enabled: z.boolean(),
+    name: z.string().max(200),
+    description: z.string().max(2000).optional(),
+    color: z.string().max(32).optional(),
+    mode: z.enum(['subagent', 'primary', 'all']),
+    model: z.string().max(256).optional(),
+    providerId: z.string().trim().max(64).optional(),
+    systemPrompt: z.string().max(MAX_BODY_BYTES).optional(),
+    promptPreamble: z.string().max(MAX_BODY_BYTES).optional(),
+    toolPolicy: z.enum(['readOnly', 'inherit']),
+    allowedTools: z.array(z.string().max(128)).max(200).optional(),
+    blockedTools: z.array(z.string().max(128)).max(200).optional(),
+    blockedMcpServers: z.array(z.string().max(128)).max(200).optional(),
+    blockedSkills: z.array(z.string().max(128)).max(200).optional(),
+    reasoningEffort: modelReasoningEffortSchema.optional(),
+    builtin: z.boolean().optional()
+  })
+  .passthrough()
+
+const subagentsPatchSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    maxParallel: z.number().int().nonnegative().max(64).optional(),
+    maxChildRuns: z.number().int().nonnegative().max(10_000).optional(),
+    defaultToolPolicy: z.enum(['readOnly', 'inherit']).optional(),
+    defaultProfile: z.string().max(128).optional(),
+    profiles: z.array(subagentProfilePatchSchema).max(200).optional()
+  })
+  .passthrough()
+
 const kunRuntimePatchSchema = z.object({
   binaryPath: defaultPathSchema,
-  port: z.number().int().min(1).max(65_535).optional(),
+  port: z.number().int().min(MIN_KUN_LOCAL_PORT).max(65_535).optional(),
   autoStart: z.boolean().optional(),
   apiKey: z.string().max(MAX_BODY_BYTES).optional(),
   baseUrl: z.string().trim().max(MAX_URL_LENGTH).optional(),
@@ -314,7 +370,7 @@ const kunRuntimePatchSchema = z.object({
   endpointFormat: modelEndpointFormatSchema.optional(),
   runtimeToken: z.string().max(MAX_BODY_BYTES).optional(),
   dataDir: defaultPathSchema,
-  model: z.string().trim().min(1).max(128).optional(),
+  model: modelIdSchema.optional(),
   approvalPolicy: approvalPolicySchema.optional(),
   sandboxMode: sandboxModeSchema.optional(),
   tokenEconomyMode: z.boolean().optional(),
@@ -351,7 +407,9 @@ const kunRuntimePatchSchema = z.object({
     summaryMode: kunCompactionSummaryModeSchema.optional(),
     summaryTimeoutMs: z.number().int().positive().max(120_000).optional(),
     summaryMaxTokens: z.number().int().positive().max(16_000).optional(),
-    summaryInputMaxBytes: z.number().int().positive().max(8 * 1024 * 1024).optional()
+    summaryInputMaxBytes: z.number().int().positive().max(8 * 1024 * 1024).optional(),
+    summaryModel: optionalModelIdSchema,
+    summaryProviderId: z.string().trim().max(64).optional()
   }).strict().optional(),
   runtimeTuning: z.object({
     streamIdleTimeoutMs: z.number().int().min(0).max(3_600_000).optional(),
@@ -377,7 +435,7 @@ const kunRuntimePatchSchema = z.object({
     protocol: imageGenerationProtocolSchema.optional(),
     baseUrl: z.string().trim().max(MAX_URL_LENGTH).optional(),
     apiKey: z.string().max(MAX_BODY_BYTES).optional(),
-    model: z.string().trim().max(128).optional(),
+    model: optionalModelIdSchema,
     defaultSize: z.string().trim().max(16).optional(),
     timeoutMs: z.number().int().positive().max(600_000).optional()
   }).strict().optional(),
@@ -387,7 +445,8 @@ const kunRuntimePatchSchema = z.object({
     protocol: speechToTextProtocolSchema.optional(),
     baseUrl: z.string().trim().max(MAX_URL_LENGTH).optional(),
     apiKey: z.string().max(MAX_BODY_BYTES).optional(),
-    model: z.string().trim().max(128).optional(),
+    model: optionalModelIdSchema,
+    localWhisperDownloadSource: localWhisperDownloadSourceSchema.optional(),
     language: z.string().trim().max(16).optional(),
     timeoutMs: z.number().int().positive().max(600_000).optional()
   }).strict().optional(),
@@ -397,7 +456,7 @@ const kunRuntimePatchSchema = z.object({
     protocol: textToSpeechProtocolSchema.optional(),
     baseUrl: z.string().trim().max(MAX_URL_LENGTH).optional(),
     apiKey: z.string().max(MAX_BODY_BYTES).optional(),
-    model: z.string().trim().max(128).optional(),
+    model: optionalModelIdSchema,
     voice: z.string().trim().max(128).optional(),
     format: z.string().trim().max(16).optional(),
     timeoutMs: z.number().int().positive().max(900_000).optional()
@@ -408,7 +467,7 @@ const kunRuntimePatchSchema = z.object({
     protocol: musicGenerationProtocolSchema.optional(),
     baseUrl: z.string().trim().max(MAX_URL_LENGTH).optional(),
     apiKey: z.string().max(MAX_BODY_BYTES).optional(),
-    model: z.string().trim().max(128).optional(),
+    model: optionalModelIdSchema,
     format: z.string().trim().max(16).optional(),
     timeoutMs: z.number().int().positive().max(1_800_000).optional()
   }).strict().optional(),
@@ -418,7 +477,7 @@ const kunRuntimePatchSchema = z.object({
     protocol: videoGenerationProtocolSchema.optional(),
     baseUrl: z.string().trim().max(MAX_URL_LENGTH).optional(),
     apiKey: z.string().max(MAX_BODY_BYTES).optional(),
-    model: z.string().trim().max(128).optional(),
+    model: optionalModelIdSchema,
     defaultDuration: z.number().int().positive().max(30).optional(),
     defaultResolution: z.string().trim().max(32).optional(),
     timeoutMs: z.number().int().positive().max(3_600_000).optional(),
@@ -433,15 +492,41 @@ const kunRuntimePatchSchema = z.object({
   // 兼容旧版保存的独立视觉识别设置。当前能力已经迁移到 provider modelProfiles。
   imageRecognition: z.unknown().optional(),
   modelProfiles: z.record(
-    z.string().trim().min(1).max(128),
+    modelIdSchema,
     modelProfilePatchSchema.nullable()
   ).optional(),
-  memoryEnabled: z.boolean().optional()
+  memoryEnabled: z.boolean().optional(),
+  // Global small-model slot + per-role internal-LLM model overrides (agents.kun.*).
+  // Title & Summary default to smallModel, then the main conversation model.
+  smallModel: optionalModelIdSchema,
+  smallModelProviderId: z.string().trim().max(64).optional(),
+  titleModel: optionalModelIdSchema,
+  titleProviderId: z.string().trim().max(64).optional(),
+  summaryModel: optionalModelIdSchema,
+  summaryProviderId: z.string().trim().max(64).optional(),
+  codeReviewModel: optionalModelIdSchema,
+  codeReviewProviderId: z.string().trim().max(64).optional(),
+  // Per-role reasoning depth. Default 'off' is omitted by the normalizer.
+  titleReasoningEffort: modelReasoningEffortSchema.optional(),
+  summaryReasoningEffort: modelReasoningEffortSchema.optional(),
+  codeReviewReasoningEffort: modelReasoningEffortSchema.optional(),
+  subagents: subagentsPatchSchema.optional()
 }).strict()
 
 const logPatchSchema = z.object({
   enabled: z.boolean().optional(),
   retentionDays: z.number().int().min(1).max(365).optional()
+}).strict()
+
+const checkpointCleanupPatchSchema = z.object({
+  enabled: z.boolean().optional(),
+  intervalDays: z.union([
+    z.literal(1),
+    z.literal(2),
+    z.literal(3),
+    z.literal(5),
+    z.literal(10)
+  ]).optional()
 }).strict()
 
 const notificationsPatchSchema = z.object({
@@ -523,6 +608,34 @@ const writeSettingsPatchSchema = z.object({
   agentPresets: z.array(writeAgentPresetSchema).max(24).optional()
 }).strict()
 
+const terminalColorPatchSchema = z.object({
+  colorMode: z.enum(['native', 'none', 'custom']).optional(),
+  foreground: z.string().max(64).optional(),
+  background: z.string().max(64).optional(),
+  cursor: z.string().max(64).optional(),
+  selectionBackground: z.string().max(64).optional(),
+  black: z.string().max(64).optional(),
+  red: z.string().max(64).optional(),
+  green: z.string().max(64).optional(),
+  yellow: z.string().max(64).optional(),
+  blue: z.string().max(64).optional(),
+  magenta: z.string().max(64).optional(),
+  cyan: z.string().max(64).optional(),
+  white: z.string().max(64).optional(),
+  brightBlack: z.string().max(64).optional(),
+  brightRed: z.string().max(64).optional(),
+  brightGreen: z.string().max(64).optional(),
+  brightYellow: z.string().max(64).optional(),
+  brightBlue: z.string().max(64).optional(),
+  brightMagenta: z.string().max(64).optional(),
+  brightCyan: z.string().max(64).optional(),
+  brightWhite: z.string().max(64).optional()
+}).strict()
+
+const terminalSettingsPatchSchema = z.object({
+  colors: terminalColorPatchSchema.optional()
+}).strict()
+
 const clawSkillPatchSchema = z.object({
   defaultNames: z.array(trimmedString(128)).max(128).optional(),
   extraDirs: z.array(trimmedString(MAX_PATH_LENGTH)).max(128).optional(),
@@ -533,14 +646,14 @@ const clawSkillPatchSchema = z.object({
 const clawImPatchSchema = z.object({
   enabled: z.boolean().optional(),
   provider: clawImProviderSchema.optional(),
-  port: z.number().int().min(1024).max(65_535).optional(),
+  port: z.number().int().min(MIN_KUN_LOCAL_PORT).max(65_535).optional(),
   path: trimmedString(MAX_PATH_LENGTH).optional(),
   secret: z.string().max(MAX_BODY_BYTES).optional(),
   weixinBridgeUrl: z.string().trim().max(MAX_URL_LENGTH).optional(),
   openClawGatewayUrl: z.string().trim().max(MAX_URL_LENGTH).optional(),
   workspaceRoot: defaultPathSchema,
   providerId: z.string().trim().max(64).optional(),
-  model: z.string().trim().min(1).max(128).optional(),
+  model: modelIdSchema.optional(),
   mode: clawRunModeSchema.optional(),
   responseTimeoutMs: z.number().int().min(5_000).max(600_000).optional()
 }).strict()
@@ -605,7 +718,7 @@ const clawImChannelPatchSchema = z.object({
   label: z.string().max(512).optional(),
   enabled: z.boolean().optional(),
   providerId: z.string().trim().max(64).optional(),
-  model: z.string().trim().min(1).max(128).optional(),
+  model: modelIdSchema.optional(),
   threadId: z.string().max(MAX_ID_LENGTH).optional(),
   workspaceRoot: defaultPathSchema,
   agentProfile: clawImAgentProfilePatchSchema.optional(),
@@ -633,7 +746,7 @@ const clawTaskPatchSchema = z.object({
   workspaceRoot: defaultPathSchema,
   clawChannelId: z.string().trim().max(MAX_ID_LENGTH).optional(),
   providerId: z.string().trim().max(64).optional(),
-  model: z.string().trim().min(1).max(128).optional(),
+  model: modelIdSchema.optional(),
   reasoningEffort: scheduleReasoningEffortSchema.optional(),
   mode: clawRunModeSchema.optional(),
   schedule: clawTaskSchedulePatchSchema.optional(),
@@ -661,7 +774,7 @@ const scheduleSkillPatchSchema = z.object({
 }).strict()
 
 const scheduleInternalPatchSchema = z.object({
-  port: z.number().int().min(1024).max(65_535).optional(),
+  port: z.number().int().min(MIN_KUN_LOCAL_PORT).max(65_535).optional(),
   secret: z.string().max(MAX_BODY_BYTES).optional()
 }).strict()
 
@@ -680,9 +793,12 @@ const scheduledTaskPatchSchema = z.object({
   workspaceRoot: defaultPathSchema,
   clawChannelId: z.string().trim().max(MAX_ID_LENGTH).optional(),
   providerId: z.string().trim().max(64).optional(),
-  model: z.string().trim().min(1).max(128).optional(),
+  model: modelIdSchema.optional(),
   reasoningEffort: scheduleReasoningEffortSchema.optional(),
   mode: clawRunModeSchema.optional(),
+  priority: z.number().int().min(0).max(100).optional(),
+  dependsOn: z.array(z.string().trim().min(1).max(MAX_ID_LENGTH)).max(32).optional(),
+  useWorktree: z.boolean().optional(),
   schedule: scheduledTaskSchedulePatchSchema.optional(),
   createdAt: z.string().max(128).optional(),
   updatedAt: z.string().max(128).optional(),
@@ -697,7 +813,7 @@ const scheduleSettingsPatchSchema = z.object({
   enabled: z.boolean().optional(),
   defaultWorkspaceRoot: defaultPathSchema,
   providerId: z.string().trim().max(64).optional(),
-  model: z.union([z.enum(SCHEDULE_MODEL_IDS), trimmedString(128)]).optional(),
+  model: z.union([z.enum(SCHEDULE_MODEL_IDS), modelIdSchema]).optional(),
   mode: clawRunModeSchema.optional(),
   promptPrefix: z.string().max(MAX_CHANNEL_TEXT_LENGTH).optional(),
   skills: scheduleSkillPatchSchema.optional(),
@@ -745,7 +861,7 @@ const workflowAiAgentConfigSchema = z
     prompt: z.string().max(MAX_CHANNEL_TEXT_LENGTH).optional(),
     workspaceRoot: defaultPathSchema,
     providerId: z.string().trim().max(64).optional(),
-    model: optionalTrimmedString(128),
+    model: optionalModelIdSchema,
     reasoningEffort: scheduleReasoningEffortSchema.optional(),
     mode: clawRunModeSchema.optional()
   })
@@ -755,7 +871,7 @@ const workflowGenerateImageConfigSchema = z
   .object({
     prompt: z.string().max(MAX_CHANNEL_TEXT_LENGTH).optional(),
     providerId: z.string().max(MAX_ID_LENGTH).optional(),
-    model: z.string().max(256).optional(),
+    model: optionalModelIdSchema,
     size: z.string().max(32).optional(),
     outputDir: z.string().max(1024).optional()
   })
@@ -957,7 +1073,7 @@ const workflowParameterExtractorConfigSchema = z
     instruction: z.string().max(MAX_BODY_BYTES).optional(),
     fields: z.array(workflowInputFieldSchema).max(50).optional(),
     providerId: z.string().trim().max(64).optional(),
-    model: optionalTrimmedString(128),
+    model: optionalModelIdSchema,
     reasoningEffort: scheduleReasoningEffortSchema.optional()
   })
   .strict()
@@ -971,7 +1087,7 @@ const workflowQuestionClassifierConfigSchema = z
       .max(20)
       .optional(),
     providerId: z.string().trim().max(64).optional(),
-    model: optionalTrimmedString(128),
+    model: optionalModelIdSchema,
     reasoningEffort: scheduleReasoningEffortSchema.optional()
   })
   .strict()
@@ -1147,10 +1263,10 @@ const workflowSettingsPatchSchema = z
     enabled: z.boolean().optional(),
     defaultWorkspaceRoot: defaultPathSchema,
     providerId: z.string().trim().max(64).optional(),
-    model: optionalTrimmedString(128),
+    model: optionalModelIdSchema,
     mode: clawRunModeSchema.optional(),
     keepAwake: z.boolean().optional(),
-    webhookPort: z.number().int().min(1024).max(65_535).optional(),
+    webhookPort: z.number().int().min(MIN_KUN_LOCAL_PORT).max(65_535).optional(),
     webhookSecret: z.string().max(MAX_BODY_BYTES).optional(),
     workflows: z.array(workflowPatchSchema).max(200).optional(),
     presets: z.array(workflowNodePresetSchema).max(100).optional(),
@@ -1230,12 +1346,14 @@ const settingsPatchObjectSchema = z.object({
   theme: themeSchema.optional(),
   uiFontScale: uiFontScaleSchema.optional(),
   cursorSpotlight: z.boolean().optional(),
+  cursorSpotlightColor: hexColorSchema.optional(),
   provider: modelProviderPatchSchema.optional(),
   agents: z.object({
     kun: kunRuntimePatchSchema.optional()
   }).strict().optional(),
   workspaceRoot: defaultPathSchema,
   log: logPatchSchema.optional(),
+  checkpointCleanup: checkpointCleanupPatchSchema.optional(),
   notifications: notificationsPatchSchema.optional(),
   appBehavior: appBehaviorPatchSchema.optional(),
   keyboardShortcuts: keyboardShortcutsPatchSchema.optional(),
@@ -1243,6 +1361,7 @@ const settingsPatchObjectSchema = z.object({
   claw: clawSettingsPatchSchema.optional(),
   schedule: scheduleSettingsPatchSchema.optional(),
   workflow: workflowSettingsPatchSchema.optional(),
+  terminal: terminalSettingsPatchSchema.optional(),
   guiUpdate: z.object({
     channel: z.enum(GUI_UPDATE_CHANNELS).optional()
   }).strict().optional(),
@@ -1256,7 +1375,27 @@ export const skillSaveFilePayloadSchema = z
   .object({
     rootPath: trimmedString(MAX_PATH_LENGTH),
     skillName: trimmedString(128),
-    content: z.string().max(MAX_SKILL_FILE_BYTES)
+    content: z.string().max(MAX_SKILL_FILE_BYTES),
+    manifestContent: z.string().max(MAX_SKILL_FILE_BYTES).optional()
+  })
+  .strict()
+
+export const skillGithubImportPayloadSchema = z
+  .object({
+    rootPath: trimmedString(MAX_PATH_LENGTH),
+    // Defense-in-depth: reject any explicit non-https scheme at the IPC
+    // boundary (http/file/javascript/data/etc.). Scheme-less input is allowed
+    // because the importer normalizes it to https before parsing; only the
+    // host-check inside `importSkillsFromGitHub` is authoritative, but barring
+    // dangerous schemes here narrows what ever reaches the importer.
+    url: z
+      .string()
+      .trim()
+      .min(1)
+      .max(MAX_URL_LENGTH)
+      .refine((value) => !/^[a-z][a-z0-9+.-]*:/i.test(value) || /^https:\/\//i.test(value), {
+        message: 'GitHub skill import URL must use https.'
+      })
   })
   .strict()
 
@@ -1267,6 +1406,11 @@ export const skillListPayloadSchema = z
   .strict()
 
 export const rootPathSchema = trimmedString(MAX_PATH_LENGTH)
+export const localPdfTextTargetPayloadSchema = z
+  .object({
+    path: rootPathSchema
+  })
+  .strict()
 export const deepseekConfigContentSchema = z.string().max(MAX_CONFIG_FILE_BYTES)
 
 export const workspaceRootSchema = trimmedString(MAX_PATH_LENGTH)
@@ -1547,7 +1691,7 @@ export const writeInlineCompletionPayloadSchema = z
       .strict(),
     editCandidate: writeInlineCompletionEditCandidateSchema.optional(),
     recentEdits: z.array(writeInlineEditRecentEditSchema).max(12).optional(),
-    model: optionalTrimmedString(128)
+    model: optionalModelIdSchema
   })
   .strict()
 
@@ -1575,6 +1719,19 @@ export const speechTranscribePayloadSchema = z
     mimeType: trimmedString(64),
     durationMs: z.number().int().positive().max(SPEECH_TRANSCRIPTION_MAX_DURATION_MS).optional(),
     speechToText: speechToTextSettingsSchema.optional()
+  })
+  .strict()
+
+export const localWhisperModelIdPayloadSchema = localWhisperModelIdSchema.optional()
+export const localWhisperDownloadPayloadSchema = z
+  .object({
+    modelId: localWhisperModelIdSchema.optional(),
+    sourceId: localWhisperDownloadSourceSchema.optional()
+  })
+  .strict()
+export const localWhisperSourceStatusPayloadSchema = z
+  .object({
+    modelId: localWhisperModelIdSchema.optional()
   })
   .strict()
 
@@ -1619,7 +1776,7 @@ export const clawTaskFromTextPayloadSchema = z
     text: z.string().trim().min(1).max(MAX_CHANNEL_TEXT_LENGTH),
     channelId: z.string().trim().min(1).max(MAX_ID_LENGTH).nullable().optional(),
     providerId: z.string().trim().max(64).nullable().optional(),
-    modelHint: z.string().trim().min(1).max(128).nullable().optional(),
+    modelHint: modelIdSchema.nullable().optional(),
     reasoningEffort: scheduleReasoningEffortSchema.nullable().optional(),
     mode: z.enum(['agent', 'plan']).nullable().optional()
   })
@@ -1631,7 +1788,7 @@ export const scheduleTaskFromTextPayloadSchema = z
     workspaceRoot: defaultPathSchema,
     clawChannelId: z.string().trim().min(1).max(MAX_ID_LENGTH).nullable().optional(),
     providerId: z.string().trim().max(64).nullable().optional(),
-    modelHint: z.string().trim().min(1).max(128).nullable().optional(),
+    modelHint: modelIdSchema.nullable().optional(),
     reasoningEffort: scheduleReasoningEffortSchema.nullable().optional(),
     mode: z.enum(['agent', 'plan']).nullable().optional()
   })

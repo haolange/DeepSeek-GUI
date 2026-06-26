@@ -19,6 +19,15 @@ import {
   TERMINAL_DEFAULT_COLS,
   TERMINAL_DEFAULT_ROWS
 } from '@shared/terminal'
+import {
+  defaultTerminalColors,
+  resolveTerminalTheme as resolveTerminalThemeFromSettings,
+  TERMINAL_PRESET_DARK,
+  TERMINAL_PRESET_LIGHT,
+  type TerminalColorSettingsV1
+} from '@shared/app-settings'
+import { rendererRuntimeClient } from '../../agent/runtime-client'
+import { SETTINGS_CHANGED_EVENT } from '../../lib/keyboard-shortcut-settings'
 import { terminalSessionIdForWorkspace, terminalWorkspaceSessionKey } from './terminal-session'
 
 type Props = {
@@ -69,54 +78,6 @@ function initialTerminalTabState(): TerminalTabState {
     activeTabId: INITIAL_TAB_ID
   }
 }
-
-const DARK_THEME = {
-  background: '#151d31',
-  foreground: '#e6e9ef',
-  cursor: '#e6e9ef',
-  cursorAccent: '#151d31',
-  selectionBackground: '#264f78aa',
-  black: '#000000',
-  red: '#ff6b6b',
-  green: '#7ee787',
-  yellow: '#f0c674',
-  blue: '#6cb6ff',
-  magenta: '#d2a8ff',
-  cyan: '#56d4dd',
-  white: '#e6e9ef',
-  brightBlack: '#6b7280',
-  brightRed: '#ffa198',
-  brightGreen: '#9ee787',
-  brightYellow: '#f9d57e',
-  brightBlue: '#8cb6ff',
-  brightMagenta: '#e0b3ff',
-  brightCyan: '#7ce4ec',
-  brightWhite: '#ffffff'
-} as const
-
-const LIGHT_THEME = {
-  background: '#f3f5fc',
-  foreground: '#1f2328',
-  cursor: '#1f2328',
-  cursorAccent: '#f3f5fc',
-  selectionBackground: '#264f78aa',
-  black: '#1f2328',
-  red: '#cf222e',
-  green: '#1a7f37',
-  yellow: '#9a6700',
-  blue: '#0969da',
-  magenta: '#8250df',
-  cyan: '#1b7c83',
-  white: '#57606a',
-  brightBlack: '#6e7781',
-  brightRed: '#a40e26',
-  brightGreen: '#2da44e',
-  brightYellow: '#bf8700',
-  brightBlue: '#218bff',
-  brightMagenta: '#a475f9',
-  brightCyan: '#3192aa',
-  brightWhite: '#8c959f'
-} as const
 
 function resolveThemeMode(): 'dark' | 'light' {
   return document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark'
@@ -169,7 +130,7 @@ function resolveTerminalSurfaceColor(container: HTMLElement | null): string {
     if (color && color.a >= 1) break
     node = node.parentElement
   }
-  const fallback = parseCssColor(resolveThemeMode() === 'light' ? LIGHT_THEME.background : DARK_THEME.background) ?? {
+  const fallback = parseCssColor(resolveThemeMode() === 'light' ? TERMINAL_PRESET_LIGHT.background : TERMINAL_PRESET_DARK.background) ?? {
     r: 255,
     g: 255,
     b: 255,
@@ -179,18 +140,18 @@ function resolveTerminalSurfaceColor(container: HTMLElement | null): string {
   return toOpaqueRgb(resolved)
 }
 
-function resolveTerminalTheme(container: HTMLElement | null) {
+function resolveTerminalTheme(
+  container: HTMLElement | null,
+  colors: TerminalColorSettingsV1
+) {
   const surfaceColor = resolveTerminalSurfaceColor(container)
-  const baseTheme = resolveThemeMode() === 'light' ? LIGHT_THEME : DARK_THEME
-  return {
-    ...baseTheme,
-    background: surfaceColor,
-    cursorAccent: surfaceColor
-  }
+  const mode = resolveThemeMode()
+  return resolveTerminalThemeFromSettings(colors, mode, surfaceColor)
 }
 
 export function TerminalPanel({ className = '', workspaceRoot, onCollapse, height }: Props): ReactElement {
   const { t } = useTranslation('common')
+  const terminalBodyRef = useRef<HTMLDivElement | null>(null)
   const containerRef = useRef<HTMLDivElement | null>(null)
   const termRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
@@ -204,6 +165,7 @@ export function TerminalPanel({ className = '', workspaceRoot, onCollapse, heigh
   const [contextMenu, setContextMenu] = useState<TerminalTabContextMenu | null>(null)
   const [renamingTabId, setRenamingTabId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
+  const [terminalBackground, setTerminalBackground] = useState<string | null>(null)
   const renameInputRef = useRef<HTMLInputElement | null>(null)
   const tabButtonRefs = useRef<Record<string, HTMLButtonElement | null>>({})
   const workspaceTabStatesRef = useRef<Record<string, TerminalTabState>>({})
@@ -212,9 +174,49 @@ export function TerminalPanel({ className = '', workspaceRoot, onCollapse, heigh
   const activeTabIdRef = useRef(activeTabId)
   const workspaceKey = terminalWorkspaceSessionKey(workspaceRoot)
   const activeTab = tabs.find((tab) => tab.id === activeTabId) ?? tabs[0]
+  const [terminalColors, setTerminalColors] = useState<TerminalColorSettingsV1>(() => defaultTerminalColors())
+  const terminalColorsRef = useRef(terminalColors)
 
   tabsRef.current = tabs
   activeTabIdRef.current = activeTabId
+  terminalColorsRef.current = terminalColors
+
+  const resolvePanelTheme = useCallback((colors: TerminalColorSettingsV1) => {
+    const surfaceSource = terminalBodyRef.current?.parentElement ?? containerRef.current
+    return resolveTerminalTheme(surfaceSource, colors)
+  }, [])
+
+  // Load terminal color settings from the main process and keep them in
+  // sync when settings change while the panel is open. The ref lets
+  // attachTerminal and the MutationObserver read the latest colors without
+  // stale-closure issues.
+  useEffect(() => {
+    let cancelled = false
+    const apply = (settings: { terminal?: { colors: TerminalColorSettingsV1 } }): void => {
+      if (cancelled) return
+      const colors = settings?.terminal?.colors
+      if (colors) setTerminalColors(colors)
+    }
+    void rendererRuntimeClient.getSettings().then(apply).catch(() => undefined)
+    const onSettingsChanged = (event: Event): void => {
+      apply((event as CustomEvent<{ terminal?: { colors: TerminalColorSettingsV1 } }>).detail)
+    }
+    window.addEventListener(SETTINGS_CHANGED_EVENT, onSettingsChanged)
+    return () => {
+      cancelled = true
+      window.removeEventListener(SETTINGS_CHANGED_EVENT, onSettingsChanged)
+    }
+  }, [])
+
+  // Apply new colors to the live xterm instance without re-attaching.
+  useEffect(() => {
+    const term = termRef.current
+    if (!containerRef.current) return
+    const theme = resolvePanelTheme(terminalColors)
+    setTerminalBackground(theme.background)
+    if (!term) return
+    term.options.theme = theme
+  }, [resolvePanelTheme, terminalColors])
 
   const getTabTitle = useCallback((tab: TerminalTab): string => {
     return tab.title?.trim() || t('terminalTabTitle', { index: tab.index })
@@ -271,13 +273,16 @@ export function TerminalPanel({ className = '', workspaceRoot, onCollapse, heigh
     const cols = fitRef.current?.proposeDimensions()?.cols ?? TERMINAL_DEFAULT_COLS
     const rows = fitRef.current?.proposeDimensions()?.rows ?? TERMINAL_DEFAULT_ROWS
 
+    const theme = resolvePanelTheme(terminalColorsRef.current)
+    setTerminalBackground(theme.background)
+
     const term = new Terminal({
       fontFamily: TERMINAL_FONT_FAMILY,
       fontSize: TERMINAL_FONT_SIZE,
       cursorBlink: true,
       scrollback: TERMINAL_SCROLLBACK,
       allowProposedApi: true,
-      theme: resolveTerminalTheme(container),
+      theme,
       cols,
       rows
     })
@@ -379,7 +384,7 @@ export function TerminalPanel({ className = '', workspaceRoot, onCollapse, heigh
       resizeObserver.disconnect()
       if (resizeTimer) clearTimeout(resizeTimer)
     }
-  }, [sessionIdForTab, workspaceRoot])
+  }, [resolvePanelTheme, sessionIdForTab, workspaceRoot])
 
   useEffect(() => {
     aliveRef.current = true
@@ -395,12 +400,15 @@ export function TerminalPanel({ className = '', workspaceRoot, onCollapse, heigh
   useEffect(() => {
     const observer = new MutationObserver(() => {
       const term = termRef.current
+      if (!containerRef.current) return
+      const theme = resolvePanelTheme(terminalColorsRef.current)
+      setTerminalBackground(theme.background)
       if (!term) return
-      term.options.theme = resolveTerminalTheme(containerRef.current)
+      term.options.theme = theme
     })
     observer.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] })
     return () => observer.disconnect()
-  }, [])
+  }, [resolvePanelTheme])
 
   useEffect(() => {
     if (!contextMenu) return
@@ -582,7 +590,7 @@ export function TerminalPanel({ className = '', workspaceRoot, onCollapse, heigh
                         cancelRenameTab()
                       }
                     }}
-                    className="mx-2 min-w-0 flex-1 rounded-md border border-ds-border-muted bg-ds-card px-2 py-1 text-[12px] text-ds-ink outline-none focus:border-ds-accent"
+                    className="mx-2 min-w-0 flex-1 rounded-md border border-ds-border-muted bg-ds-card px-2 py-1 text-[12px] text-ds-ink outline-none focus:border-accent"
                     aria-label={t('terminalRenameTab')}
                   />
                 ) : (
@@ -665,7 +673,11 @@ export function TerminalPanel({ className = '', workspaceRoot, onCollapse, heigh
         ) : null}
       </div>
 
-      <div className="ds-surface-strong relative min-h-0 flex-1 overflow-hidden px-5 py-4 dark:bg-[rgba(21,29,49,0.98)]">
+      <div
+        ref={terminalBodyRef}
+        className="ds-surface-strong relative min-h-0 flex-1 overflow-hidden px-5 py-4 dark:bg-[rgba(21,29,49,0.98)]"
+        style={terminalBackground ? { backgroundColor: terminalBackground } : undefined}
+      >
         <div ref={containerRef} className="h-full w-full" key={activeTab?.id} />
         {error ? (
           <div className="absolute inset-0 flex items-center justify-center p-6 text-center">

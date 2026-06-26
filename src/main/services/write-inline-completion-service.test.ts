@@ -10,6 +10,7 @@ import {
   defaultScheduleSettings,
   defaultWorkflowSettings,
   defaultWriteSettings,
+  defaultTerminalSettings,
   type AppSettingsV1
 } from '../../shared/app-settings'
 import type { WriteInlineCompletionRequest } from '../../shared/write-inline-completion'
@@ -28,7 +29,7 @@ function createSettings(patch: Partial<AppSettingsV1['write']['inlineCompletion'
     version: 1,
     locale: 'en',
     theme: 'system',
-    uiFontScale: 'small',
+    uiFontScale: 0.82,
     provider: defaultModelProviderSettings(),
     agents: {
       kun: {
@@ -41,6 +42,7 @@ function createSettings(patch: Partial<AppSettingsV1['write']['inlineCompletion'
       enabled: true,
       retentionDays: 2
     },
+    checkpointCleanup: { enabled: false, intervalDays: 3 },
     notifications: {
       turnComplete: true
     },
@@ -55,6 +57,7 @@ function createSettings(patch: Partial<AppSettingsV1['write']['inlineCompletion'
     },
     schedule: defaultScheduleSettings(),
     workflow: defaultWorkflowSettings(),
+    terminal: defaultTerminalSettings(),
     guiUpdate: {
       channel: 'stable'
     },

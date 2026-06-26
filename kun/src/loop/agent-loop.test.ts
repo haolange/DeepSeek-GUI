@@ -1,5 +1,11 @@
+import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { resolvePlanModeToolSpecs } from './agent-loop.js'
+import {
+  buildRuntimeContextInstruction,
+  isStalePlanContext,
+  resolvePlanModeToolSpecs,
+  shouldInjectInitialRuntimeContext
+} from './agent-loop.js'
 import type { ModelToolSpec } from '../ports/model-client.js'
 
 function spec(name: string): ModelToolSpec {
@@ -29,6 +35,24 @@ const ALL_TOOLS: ModelToolSpec[] = [
 const READ_ONLY_TOOLS = new Set([
   'read', 'ls', 'find', 'grep', 'web_search', 'web_fetch'
 ])
+
+describe('isStalePlanContext', () => {
+  it('treats a workspace-mismatched plan context as stale (the fork bug)', () => {
+    // A fork keeps the source thread's workspace; a plan context pointing at a
+    // different workspace must be ignored, not passed to create_plan.
+    expect(isStalePlanContext({ workspaceRoot: '/work/a' }, '/work/b')).toBe(true)
+  })
+
+  it('keeps a matching plan context (normalizing trailing slash / case)', () => {
+    expect(isStalePlanContext({ workspaceRoot: '/work/a' }, '/work/a')).toBe(false)
+    expect(isStalePlanContext({ workspaceRoot: '/work/a/' }, '/work/a')).toBe(false)
+    expect(isStalePlanContext({ workspaceRoot: '/Work/A' }, '/work/a')).toBe(false)
+  })
+
+  it('is not stale when there is no plan context', () => {
+    expect(isStalePlanContext(undefined, '/work/a')).toBe(false)
+  })
+})
 
 describe('resolvePlanModeToolSpecs', () => {
   it('step 0: read-only tools + create_plan only', () => {
@@ -124,5 +148,127 @@ describe('resolvePlanModeToolSpecs', () => {
     expect(names).toContain('custom-plan')
     expect(names).not.toContain('write')
     expect(names).not.toContain('bash')
+  })
+
+  const WITH_INPUT_TOOLS: ModelToolSpec[] = [
+    spec('read'),
+    spec('write'),
+    spec('create_plan'),
+    spec('user_input'),
+    spec('request_user_input')
+  ]
+
+  it('step 0: allows the structured user-input tools (so plan turns can ask)', () => {
+    const result = resolvePlanModeToolSpecs(WITH_INPUT_TOOLS, {
+      planTurnActive: true,
+      createPlanSatisfied: false,
+      stepIndex: 0,
+      readOnlyToolNames: READ_ONLY_TOOLS
+    })
+    const names = result.map((t) => t.name)
+    expect(names).toContain('user_input')
+    expect(names).toContain('request_user_input')
+    expect(names).toContain('create_plan')
+    expect(names).not.toContain('write')
+  })
+
+  it('step > 0: drops the user-input tools, leaving only create_plan', () => {
+    const result = resolvePlanModeToolSpecs(WITH_INPUT_TOOLS, {
+      planTurnActive: true,
+      createPlanSatisfied: false,
+      stepIndex: 1,
+      readOnlyToolNames: READ_ONLY_TOOLS
+    })
+    expect(result.map((t) => t.name)).toEqual(['create_plan'])
+  })
+
+  it('custom interactiveToolNames overrides the default user-input set', () => {
+    const result = resolvePlanModeToolSpecs(WITH_INPUT_TOOLS, {
+      planTurnActive: true,
+      createPlanSatisfied: false,
+      stepIndex: 0,
+      readOnlyToolNames: READ_ONLY_TOOLS,
+      interactiveToolNames: new Set(['user_input'])
+    })
+    const names = result.map((t) => t.name)
+    expect(names).toContain('user_input')
+    expect(names).not.toContain('request_user_input')
+  })
+})
+
+describe('buildRuntimeContextInstruction', () => {
+  it('includes the opened project absolute path and formatted local time context', () => {
+    const instruction = buildRuntimeContextInstruction({
+      workspace: '/tmp/kun-test-project',
+      nowIso: '2000-01-02T03:04:05.000Z',
+      timeZone: 'UTC'
+    })
+
+    expect(instruction).toContain('Current opened project absolute path: `/tmp/kun-test-project`')
+    expect(instruction).toContain('Current user local time: 2000-01-02 03:04:05 Sunday (UTC')
+    expect(instruction).toContain('GMT')
+    expect(instruction).toContain('Treat this block as environment context')
+  })
+
+  it('normalizes relative workspace paths to absolute paths', () => {
+    const instruction = buildRuntimeContextInstruction({
+      workspace: 'relative-project',
+      nowIso: '2026-06-21T04:30:15.000Z',
+      timeZone: 'UTC'
+    })
+
+    expect(instruction).toContain(`Current opened project absolute path: \`${resolve('relative-project')}\``)
+  })
+})
+
+describe('shouldInjectInitialRuntimeContext', () => {
+  it('injects only for the first model step of the first thread turn', () => {
+    expect(shouldInjectInitialRuntimeContext({
+      stepIndex: 0,
+      turnId: 'turn_1',
+      historyItems: [
+        {
+          id: 'item_turn_1_user',
+          threadId: 'thread_1',
+          turnId: 'turn_1',
+          role: 'user',
+          kind: 'user_message',
+          text: 'hello',
+          status: 'completed',
+          createdAt: '2000-01-02T03:04:05.000Z'
+        }
+      ]
+    })).toBe(true)
+  })
+
+  it('does not inject for tool continuations or later turns', () => {
+    const currentTurnItem = {
+      id: 'item_turn_2_user',
+      threadId: 'thread_1',
+      turnId: 'turn_2',
+      role: 'user' as const,
+      kind: 'user_message' as const,
+      text: 'next',
+      status: 'completed' as const,
+      createdAt: '2000-01-02T03:04:05.000Z'
+    }
+    expect(shouldInjectInitialRuntimeContext({
+      stepIndex: 1,
+      turnId: 'turn_2',
+      historyItems: [currentTurnItem]
+    })).toBe(false)
+    expect(shouldInjectInitialRuntimeContext({
+      stepIndex: 0,
+      turnId: 'turn_2',
+      historyItems: [
+        {
+          ...currentTurnItem,
+          id: 'item_turn_1_user',
+          turnId: 'turn_1',
+          text: 'previous'
+        },
+        currentTurnItem
+      ]
+    })).toBe(false)
   })
 })

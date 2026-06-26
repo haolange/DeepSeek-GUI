@@ -35,6 +35,8 @@ import type {
 } from './gui-update'
 import type {
   ClipboardImageReadResult,
+  LocalPdfTextReadResult,
+  LocalPdfTextTarget,
   WorkspaceClipboardImageSavePayload,
   WorkspaceClipboardImageSaveResult,
   WorkspaceFileReadResult,
@@ -73,6 +75,15 @@ import type {
   SpeechTranscriptionRequest,
   SpeechTranscriptionResult
 } from './speech-to-text'
+import type {
+  LocalWhisperModelDeleteResult,
+  LocalWhisperDownloadSourceId,
+  LocalWhisperDownloadSourceStatusResult,
+  LocalWhisperModelDownloadResult,
+  LocalWhisperModelId,
+  LocalWhisperModelProgress,
+  LocalWhisperModelStatus
+} from './local-whisper'
 import type {
   UiPluginListItem,
   UiPluginManifestV1,
@@ -130,6 +141,9 @@ export const DESKTOP_COMMANDS = [
 ] as const
 export type DesktopCommand = typeof DESKTOP_COMMANDS[number]
 export type SkillSaveResult = { ok: true; path: string } | { ok: false; message: string }
+export type SkillGithubImportResult =
+  | { ok: true; count: number; names: string[]; paths: string[] }
+  | { ok: false; message: string }
 export type SkillListItem = {
   id: string
   name: string
@@ -314,7 +328,13 @@ export type KunGuiApi = {
   pickLegacySessionDir: () => Promise<WorkspacePickResult>
   listSkills: (workspaceRoot?: string) => Promise<SkillListResult>
   listSkillRoots: (workspaceRoot?: string) => Promise<SkillRootListResult>
-  saveSkillFile: (rootPath: string, skillName: string, content: string) => Promise<SkillSaveResult>
+  saveSkillFile: (
+    rootPath: string,
+    skillName: string,
+    content: string,
+    manifestContent?: string
+  ) => Promise<SkillSaveResult>
+  importSkillsFromGitHub: (rootPath: string, url: string) => Promise<SkillGithubImportResult>
   openSkillRoot: (rootPath: string) => Promise<PathOpenResult>
   listUiPlugins: () => Promise<UiPluginListIpcResult>
   installUiPlugin: () => Promise<UiPluginInstallIpcResult>
@@ -382,6 +402,7 @@ export type KunGuiApi = {
   readWorkspaceFile: (options: WorkspaceFileTarget) => Promise<WorkspaceFileReadResult>
   readWorkspaceImage: (options: WorkspaceFileTarget) => Promise<WorkspaceImageReadResult>
   readWorkspacePdf: (options: WorkspaceFileTarget) => Promise<WorkspacePdfReadResult>
+  readLocalPdfText: (options: LocalPdfTextTarget) => Promise<LocalPdfTextReadResult>
   saveWorkspaceFileAs: (payload: WorkspaceFileSaveAsPayload) => Promise<WorkspaceFileSaveAsResult>
   writeWorkspaceFile: (payload: WorkspaceFileWritePayload) => Promise<WorkspaceFileWriteResult>
   createWorkspaceFile: (payload: WorkspaceFileCreatePayload) => Promise<WorkspaceFileCreateResult>
@@ -424,6 +445,17 @@ export type KunGuiApi = {
   transcribeSpeech: (
     payload: SpeechTranscriptionRequest
   ) => Promise<SpeechTranscriptionResult>
+  getLocalWhisperModelStatus: (modelId?: LocalWhisperModelId) => Promise<LocalWhisperModelStatus>
+  downloadLocalWhisperModel: (payload?: {
+    modelId?: LocalWhisperModelId
+    sourceId?: LocalWhisperDownloadSourceId
+  }) => Promise<LocalWhisperModelDownloadResult>
+  cancelLocalWhisperModel: (modelId?: LocalWhisperModelId) => Promise<LocalWhisperModelDownloadResult>
+  checkLocalWhisperDownloadSources: (payload?: {
+    modelId?: LocalWhisperModelId
+  }) => Promise<LocalWhisperDownloadSourceStatusResult>
+  deleteLocalWhisperModel: (modelId?: LocalWhisperModelId) => Promise<LocalWhisperModelDeleteResult>
+  onLocalWhisperModelProgress: (handler: (payload: LocalWhisperModelProgress) => void) => () => void
   listWriteInlineCompletionDebugEntries: () => Promise<WriteInlineCompletionDebugEntry[]>
   clearWriteInlineCompletionDebugEntries: () => Promise<boolean>
   exportWriteDocument: (payload: WriteExportPayload) => Promise<WriteExportResult>

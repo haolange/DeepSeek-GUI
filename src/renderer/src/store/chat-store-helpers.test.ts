@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ClawImChannelV1 } from '@shared/app-settings'
+import type { ChatBlock } from '../agent/types'
 import type { ModelProviderModelGroup } from '@shared/kun-gui-api'
 import { CLAW_MANAGED_INSTRUCTIONS_HEADING } from '@shared/app-settings'
 import {
@@ -10,6 +11,7 @@ import {
   clawThreadIdsFromChannels,
   clawThreadTitleLooksManaged,
   compactCodeWorkspaceRoots,
+  conversationHasVisionAttachments,
   fallbackComposerModel,
   hydrateBlockModelLabels,
   isClawThread,
@@ -19,6 +21,9 @@ import {
   normalizeTurnModelMap,
   readThreadComposerSelection,
   reconcileCodeWorkspaceRoots,
+  composerModeForThread,
+  rememberThreadComposerMode,
+  readThreadComposerMode,
   rememberThreadComposerSelection,
   rememberTurnModel,
   resolveComposerContextWindowTokens
@@ -338,6 +343,24 @@ describe('chat-store Claw helpers', () => {
     expect(normalized['bad-number']).toBeUndefined()
   })
 
+  it('persists composer plan mode independently per thread', () => {
+    rememberThreadComposerMode('thread-a', 'plan')
+    rememberThreadComposerMode('thread-b', 'agent')
+
+    expect(readThreadComposerMode('thread-a')).toBe('plan')
+    expect(readThreadComposerMode('thread-b')).toBe('agent')
+  })
+
+  it('resolves composer mode from stored selection before thread metadata', () => {
+    rememberThreadComposerMode('thread-a', 'agent')
+
+    expect(
+      composerModeForThread({ id: 'thread-a', mode: 'plan' }, readThreadComposerMode('thread-a'))
+    ).toBe('agent')
+    expect(composerModeForThread({ id: 'thread-b', mode: 'plan' }, null)).toBe('plan')
+    expect(composerModeForThread({ id: 'thread-c', mode: 'agent' }, null)).toBe('agent')
+  })
+
   it('persists composer model selections independently per thread', () => {
     rememberThreadComposerSelection(' thread-a ', ' deepseek-v4-pro ', ' deepseek ')
     rememberThreadComposerSelection(' thread-b ', ' MiniMax-M2 ', ' minimax ')
@@ -354,5 +377,36 @@ describe('chat-store Claw helpers', () => {
       'thread-a': { model: 'deepseek-v4-pro', providerId: 'deepseek' },
       'thread-b': { model: 'MiniMax-M2', providerId: 'minimax' }
     })
+  })
+})
+
+describe('conversationHasVisionAttachments', () => {
+  it('returns false for text-only conversations (issue #579)', () => {
+    const blocks: ChatBlock[] = [
+      { kind: 'user', id: 'u1', text: 'hello' },
+      { kind: 'assistant', id: 'a1', text: 'hi' }
+    ]
+    expect(conversationHasVisionAttachments(blocks)).toBe(false)
+  })
+
+  it('returns true when a user message carries an image attachment', () => {
+    const blocks: ChatBlock[] = [
+      { kind: 'user', id: 'u1', text: 'look', meta: { attachments: [{ id: 'img-1', kind: 'image' }] } }
+    ]
+    expect(conversationHasVisionAttachments(blocks)).toBe(true)
+  })
+
+  it('returns false when attachments are documents only', () => {
+    const blocks: ChatBlock[] = [
+      { kind: 'user', id: 'u1', text: 'read', meta: { attachments: [{ id: 'doc-1', kind: 'document' }] } }
+    ]
+    expect(conversationHasVisionAttachments(blocks)).toBe(false)
+  })
+
+  it('treats unresolved attachmentIds (restored sessions) as vision content', () => {
+    const blocks: ChatBlock[] = [
+      { kind: 'user', id: 'u1', text: 'check', meta: { attachmentIds: ['att-1'] } }
+    ]
+    expect(conversationHasVisionAttachments(blocks)).toBe(true)
   })
 })

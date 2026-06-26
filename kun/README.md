@@ -59,7 +59,7 @@ Run from the `kun/` directory.
 | --- | --- | --- |
 | `--config` | JSON config file. If omitted, Kun reads `{--data-dir}/config.json` when present | optional |
 | `--host` | Bind address | `127.0.0.1` |
-| `--port` | HTTP port | `8899` |
+| `--port` | HTTP port | `18899` |
 | `--data-dir` | Root directory for threads, events, and usage | required |
 | `--runtime-token` | Bearer token for `/v1/*` requests | empty |
 | `--api-key` | DeepSeek-compatible API key | empty |
@@ -75,7 +75,7 @@ Example:
 kun serve \
   --config ~/.deepseekgui/kun/config.json \
   --host 127.0.0.1 \
-  --port 8899 \
+  --port 18899 \
   --data-dir ~/.deepseekgui/kun \
   --runtime-token dev-token \
   --api-key "$DEEPSEEK_API_KEY" \
@@ -139,7 +139,7 @@ Shape:
 {
   "serve": {
     "host": "127.0.0.1",
-    "port": 8899,
+    "port": 18899,
     "dataDir": "~/.deepseekgui/kun",
     "runtimeToken": "",
     "apiKey": "",
@@ -187,6 +187,7 @@ Shape:
           "enabled": true,
           "transport": "stdio",
           "command": "npx",
+          "cwd": "/path/to/workspace",
           "args": ["-y", "@modelcontextprotocol/server-github"],
           "env": { "GITHUB_TOKEN": "<github-token>" },
           "trustScope": "workspace",
@@ -453,7 +454,8 @@ stay local to one thread, leave it as a pinned constraint.
   server `enabled` flag, transport-specific fields (`command` for
   `stdio`, `url` for HTTP/SSE), `trustedWorkspaceRoots` for
   workspace-scoped servers, and `/v1/runtime/tools` for redacted
-  `lastError` diagnostics.
+  `lastError` diagnostics. Stdio servers can set `cwd`; if omitted,
+  workspace-scoped servers start in the first trusted workspace root.
 - Web tools are missing: `capabilities.web.enabled` must be true and
   at least one of `fetchEnabled` / `searchEnabled` must be true.
   Built-in fetch handles HTTP(S) pages; search may still be

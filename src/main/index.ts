@@ -27,10 +27,14 @@ import {
   mergeModelProviderSettings,
   mergeScheduleSettings,
   mergeWriteSettings,
+  mergeTerminalSettings,
+  MIN_KUN_LOCAL_PORT,
   normalizeAppSettings,
   normalizeAppBehaviorSettings,
+  normalizeCheckpointCleanupSettings,
   normalizeKeyboardShortcuts,
   resolveKunRuntimeSettings,
+  resolveTerminalColorMode,
   type AppBehaviorConfigV1,
   type AppSettingsPatch,
   type AppSettingsV1,
@@ -49,9 +53,15 @@ import {
   runtimeRequestViaHost
 } from './runtime/kun-adapter'
 import { waitForRuntimeTurnsIdle } from './runtime/managed-runtime-idle'
-import { setKunUnexpectedExitHandler, type KunUnexpectedExitInfo } from './kun-process'
+import {
+  resolveKunDataDir,
+  setKunUnexpectedExitHandler,
+  waitForKunStartupSettled,
+  type KunUnexpectedExitInfo
+} from './kun-process'
 import { RestartBudget, type KunRuntimeStatus } from './kun-runtime-supervisor'
 import { configureLogger, logError, logWarn, pruneOnStartup } from './logger'
+import { cleanupUnusedGitCheckpointsIfDue } from './services/git-checkpoint-service'
 import { createClawRuntime, type ClawRuntime } from './claw-runtime'
 import { createScheduleRuntime, type ScheduleRuntime } from './schedule-runtime'
 import { createWorkflowRuntime, type WorkflowRuntime } from './workflow-runtime'
@@ -213,6 +223,7 @@ let trayMenu: Menu | null = null
 let trayMenuOpenPromise: Promise<void> | null = null
 let isQuitting = false
 let closeWindowPromptOpen = false
+let checkpointCleanupTimer: ReturnType<typeof setInterval> | null = null
 
 type GuiUpdaterModule = typeof import('./gui-updater')
 
@@ -222,6 +233,50 @@ let guiUpdaterInitialized = false
 function emitClawChannelActivity(payload: { channelId: string; threadId: string }): void {
   if (!mainWindow || mainWindow.isDestroyed()) return
   mainWindow.webContents.send('claw:channel-activity', payload)
+}
+
+function stopCheckpointCleanupTimer(): void {
+  if (checkpointCleanupTimer) {
+    clearInterval(checkpointCleanupTimer)
+    checkpointCleanupTimer = null
+  }
+}
+
+async function runCheckpointCleanupIfDue(settings: AppSettingsV1): Promise<void> {
+  if (!settings.checkpointCleanup.enabled) return
+  const runtime = resolveKunRuntimeSettings(settings)
+  const dataDir = resolveKunDataDir(runtime)
+  const intervalDays = settings.checkpointCleanup.intervalDays
+  try {
+    const cleanup = await cleanupUnusedGitCheckpointsIfDue({ dataDir, intervalDays })
+    if (!cleanup.due) return
+    const { result } = cleanup
+    console.info(
+      `[kun-gui] git checkpoint cleanup scanned=${result.scanned} deleted=${result.deleted} kept=${result.kept} failed=${result.failed}`
+    )
+    if (result.failed > 0) {
+      logWarn('git-checkpoint-cleanup', 'failed to delete some unused checkpoints', {
+        failed: result.failed,
+        failedIds: result.failedIds
+      })
+    }
+  } catch (error) {
+    logWarn('git-checkpoint-cleanup', 'failed to clean unused checkpoints', {
+      message: error instanceof Error ? error.message : String(error)
+    })
+  }
+}
+
+function syncCheckpointCleanupTimer(settings: AppSettingsV1): void {
+  stopCheckpointCleanupTimer()
+  if (!settings.checkpointCleanup.enabled) return
+  const intervalMs = settings.checkpointCleanup.intervalDays * 24 * 60 * 60 * 1_000
+  const run = (): void => {
+    void runCheckpointCleanupIfDue(settings)
+  }
+  run()
+  checkpointCleanupTimer = setInterval(run, intervalMs)
+  checkpointCleanupTimer.unref?.()
 }
 
 async function stopManagedRuntimesForQuit(): Promise<void> {
@@ -629,6 +684,7 @@ async function probeThreadApi(settings: AppSettingsV1): Promise<
 async function waitForKunHealth(settings: AppSettingsV1, timeoutMs: number): Promise<boolean> {
   const base = getRuntimeBaseUrlForSettings(settings)
   const deadline = Date.now() + timeoutMs
+  let lastError = ''
 
   while (Date.now() <= deadline) {
     try {
@@ -638,12 +694,18 @@ async function waitForKunHealth(settings: AppSettingsV1, timeoutMs: number): Pro
         signal: AbortSignal.timeout(Math.max(250, Math.min(1_000, remaining)))
       })
       if (res.ok && isKunHealthResponseBody(await res.text())) return true
-    } catch {
-      /* retry until the deadline */
+      lastError = `unexpected status ${res.status}`
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      if (msg !== lastError) {
+        lastError = msg
+        logWarn('health-probe', `${base}/health: ${msg}`)
+      }
     }
     await sleep(150)
   }
 
+  logWarn('health-probe', `gave up after ${timeoutMs}ms, last error: ${lastError}`)
   return false
 }
 
@@ -1039,6 +1101,10 @@ async function restartRuntime(settings: AppSettingsV1): Promise<void> {
 
 async function restartRuntimeOnce(settings: AppSettingsV1): Promise<void> {
   await waitForQueuedRuntimeSettingsApply()
+  // Don't tear down a child that is still completing its startup; wait for it
+  // to settle so a restart trigger that races a boot doesn't reset the clock
+  // (#544). Resolves immediately when nothing is launching.
+  await waitForKunStartupSettled()
   const runtime = getKunRuntimeSettings(settings)
 
   if (!resolveConfiguredApiKey(settings)) {
@@ -1192,8 +1258,8 @@ function runtimeStartupConfigChanged(prev: AppSettingsV1, next: AppSettingsV1): 
  */
 function validateRuntimeSettingsForApply(next: AppSettingsV1): string | null {
   const runtime = resolveKunRuntimeSettings(next)
-  if (!Number.isInteger(runtime.port) || runtime.port < 1 || runtime.port > 65_535) {
-    return `Kun port must be an integer between 1 and 65535 (got ${String(runtime.port)})`
+  if (!Number.isInteger(runtime.port) || runtime.port < MIN_KUN_LOCAL_PORT || runtime.port > 65_535) {
+    return `Kun port must be an integer between ${MIN_KUN_LOCAL_PORT} and 65535 (got ${String(runtime.port)})`
   }
   const baseUrl = (runtime.baseUrl ?? '').trim()
   if (baseUrl) {
@@ -1214,6 +1280,13 @@ async function restartManagedRuntimeForSettingsChange(
   next: AppSettingsV1
 ): Promise<void> {
   if (!runtimeStartupConfigChanged(prev, next)) return
+
+  // Let any in-flight boot launch finish (or fail) before we read liveness
+  // and stop the child. Killing a kun that is still inside its startup window
+  // throws away the boot's progress and restarts the clock — the #544 restart
+  // storm. Once it settles, the child is either healthy (graceful restart
+  // below) or already gone (`wasRunning` is false and we return).
+  await waitForKunStartupSettled()
 
   const runtime = resolveKunRuntimeSettings(next)
   const adapter = kunRuntimeAdapter
@@ -1325,6 +1398,10 @@ async function rollbackRuntimeSettingsAfterFailedApply(
 }
 
 async function restartManagedRuntimeForMcpConfigChange(settings: AppSettingsV1): Promise<void> {
+  // See restartManagedRuntimeForSettingsChange: never interrupt an in-flight
+  // boot launch (#544 restart storm).
+  await waitForKunStartupSettled()
+
   const runtime = resolveKunRuntimeSettings(settings)
   const adapter = kunRuntimeAdapter
   const wasRunning = adapter.isChildRunning()
@@ -1428,6 +1505,7 @@ app.whenReady().then(async () => {
     retentionDays: initial.log.retentionDays
   })
   traceStartup('logger configured')
+  syncCheckpointCleanupTimer(initial)
   scheduleRuntime = createScheduleRuntime({ store, runtimeRequest, logError, powerSaveBlocker })
   scheduleRuntime.sync(initial)
   workflowRuntime = createWorkflowRuntime({ store, runtimeRequest, logError, powerSaveBlocker })
@@ -1477,6 +1555,10 @@ app.whenReady().then(async () => {
       ...restPatch,
       provider: mergeModelProviderSettings(prev.provider, providerPatch),
       log: { ...prev.log, ...(partial.log ?? {}) },
+      checkpointCleanup: normalizeCheckpointCleanupSettings({
+        ...prev.checkpointCleanup,
+        ...(partial.checkpointCleanup ?? {})
+      }),
       notifications: { ...prev.notifications, ...(partial.notifications ?? {}) },
       appBehavior: mergeAppBehaviorSettings(prev.appBehavior, partial.appBehavior),
       keyboardShortcuts: normalizeKeyboardShortcuts({
@@ -1489,6 +1571,7 @@ app.whenReady().then(async () => {
       claw: mergeClawSettings(prev.claw, partial.claw),
       schedule: mergeScheduleSettings(prev.schedule, partial.schedule),
       workflow: mergeWorkflowSettings(prev.workflow, partial.workflow),
+      terminal: mergeTerminalSettings(prev.terminal, partial.terminal),
       guiUpdate: { ...prev.guiUpdate, ...(partial.guiUpdate ?? {}) }
     })
     if (prev.log.enabled !== next.log.enabled || prev.log.retentionDays !== next.log.retentionDays) {
@@ -1518,6 +1601,7 @@ app.whenReady().then(async () => {
     syncWeixinBridgeRuntime(saved)
     syncLoginItemSettings(saved)
     syncTray(saved)
+    syncCheckpointCleanupTimer(saved)
     return saved
   }
 
@@ -1570,7 +1654,12 @@ app.whenReady().then(async () => {
   })
 
   registerRuntimeSseIpc({ ipcMain, store, ensureRuntime, logError })
-  registerTerminalPtyIpc({ ipcMain, getMainWindow: () => mainWindow, logError })
+  registerTerminalPtyIpc({
+    ipcMain,
+    getMainWindow: () => mainWindow,
+    logError,
+    getTerminalColorMode: async () => resolveTerminalColorMode(await store.load())
+  })
   traceStartup('ipc registration:done')
 
   createWindow({ suppressInitialShow: shouldStartHidden(initial) })
@@ -1621,6 +1710,7 @@ app.on('window-all-closed', () => {
 app.on('before-quit', (event) => {
   isQuitting = true
   stopRuntimeWatchdog()
+  stopCheckpointCleanupTimer()
   if (managedRuntimesStoppedForQuit) return
   event.preventDefault()
   void stopManagedRuntimesForQuit()

@@ -2,8 +2,12 @@ import { describe, expect, it } from 'vitest'
 import type { SkillRootListItem } from '@shared/kun-gui-api'
 import {
   buildMcpConfig,
+  buildRemoteMcpConfig,
   customMcpConfigFragment,
+  isAllowedDocsUrl,
+  isHttpsUrl,
   mcpConfigHasServer,
+  mcpConfigHasServers,
   mcpMarketplaceItemsFromConfigAndDiagnostics,
   mergeMcpJsonConfig,
   recommendedMarketplaceItemIds,
@@ -21,8 +25,53 @@ describe('PluginMarketplaceView MCP config helpers', () => {
     expect(recommendedMarketplaceItemIds()).toEqual(expect.arrayContaining([
       'sequential-thinking',
       'memory',
-      'brave-search'
+      'brave-search',
+      'vercel',
+      'google-workspace'
     ]))
+  })
+
+  it('builds remote OAuth MCP server config using Kun-supported transport fields', () => {
+    const config = buildRemoteMcpConfig({
+      vercel: 'https://mcp.vercel.com',
+      google_drive: 'https://drivemcp.googleapis.com/mcp/v1',
+      google_calendar: 'https://calendarmcp.googleapis.com/mcp/v1'
+    })
+
+    expect(config).toEqual({
+      servers: {
+        vercel: expect.objectContaining({
+          enabled: true,
+          transport: 'streamable-http',
+          url: 'https://mcp.vercel.com',
+          trustScope: 'user'
+        }),
+        google_drive: expect.objectContaining({
+          enabled: true,
+          transport: 'streamable-http',
+          url: 'https://drivemcp.googleapis.com/mcp/v1',
+          trustScope: 'user'
+        }),
+        google_calendar: expect.objectContaining({
+          enabled: true,
+          transport: 'streamable-http',
+          url: 'https://calendarmcp.googleapis.com/mcp/v1',
+          trustScope: 'user'
+        })
+      }
+    })
+  })
+
+  it('rejects non-https remote MCP server URLs', () => {
+    expect(() => buildRemoteMcpConfig({ evil: 'http://mcp.vercel.com' })).toThrow(/https/i)
+    expect(() => buildRemoteMcpConfig({ evil: 'file:///etc/passwd' })).toThrow(/https/i)
+    expect(() => buildRemoteMcpConfig({ evil: 'javascript:alert(1)' })).toThrow(/https/i)
+    expect(() => buildRemoteMcpConfig({ evil: 'not a url' })).toThrow(/https/i)
+    expect(() => buildRemoteMcpConfig({ evil: '' })).toThrow(/https/i)
+  })
+
+  it('still accepts valid https remote MCP server URLs', () => {
+    expect(() => buildRemoteMcpConfig({ vercel: 'https://mcp.vercel.com' })).not.toThrow()
   })
 
   it('merges recommended MCP servers into JSON config without dropping existing fields', () => {
@@ -106,6 +155,27 @@ describe('PluginMarketplaceView MCP config helpers', () => {
     })
 
     expect(mcpConfigHasServer(content, 'github')).toBe(true)
+  })
+
+  it('detects all servers required by a multi-server connector', () => {
+    const content = JSON.stringify({
+      servers: {
+        google_gmail: { transport: 'streamable-http', url: 'https://gmailmcp.googleapis.com/mcp/v1' },
+        google_drive: { transport: 'streamable-http', url: 'https://drivemcp.googleapis.com/mcp/v1' },
+        google_calendar: { transport: 'streamable-http', url: 'https://calendarmcp.googleapis.com/mcp/v1' },
+        google_people: { transport: 'streamable-http', url: 'https://people.googleapis.com/mcp/v1' },
+        google_chat: { transport: 'streamable-http', url: 'https://chatmcp.googleapis.com/mcp/v1' }
+      }
+    })
+
+    expect(mcpConfigHasServers(content, [
+      'google_gmail',
+      'google_drive',
+      'google_calendar',
+      'google_people',
+      'google_chat'
+    ])).toBe(true)
+    expect(mcpConfigHasServers(content, ['google_gmail', 'google_drive', 'google_tasks'])).toBe(false)
   })
 
   it('turns configured MCP servers into personal marketplace items', () => {
@@ -327,5 +397,93 @@ describe('skillRootOptionsFromRoots', () => {
 
   it('returns an empty list when the backend reports no roots', () => {
     expect(skillRootOptionsFromRoots([], (key) => key)).toEqual([])
+  })
+})
+
+describe('URL validation guards', () => {
+  it('accepts only well-formed https URLs', () => {
+    expect(isHttpsUrl('https://mcp.vercel.com')).toBe(true)
+    expect(isHttpsUrl('https://developers.google.com/workspace')).toBe(true)
+    expect(isHttpsUrl('http://mcp.vercel.com')).toBe(false)
+    expect(isHttpsUrl('file:///etc/passwd')).toBe(false)
+    expect(isHttpsUrl('javascript:alert(1)')).toBe(false)
+    expect(isHttpsUrl('ftp://example.com')).toBe(false)
+    expect(isHttpsUrl('not a url')).toBe(false)
+    expect(isHttpsUrl('')).toBe(false)
+    expect(isHttpsUrl(undefined)).toBe(false)
+    expect(isHttpsUrl(null)).toBe(false)
+    expect(isHttpsUrl(42)).toBe(false)
+  })
+
+  it('opens docs only for allowlisted https origins', () => {
+    expect(isAllowedDocsUrl('https://vercel.com/docs/agent-resources/vercel-mcp.md')).toBe(true)
+    expect(isAllowedDocsUrl('https://developers.google.com/workspace/guides/configure-mcp-servers')).toBe(true)
+    // Non-https schemes are rejected even on an allowlisted host.
+    expect(isAllowedDocsUrl('http://vercel.com/docs')).toBe(false)
+    // Off-allowlist origins are rejected even over https.
+    expect(isAllowedDocsUrl('https://evil.example.com/docs')).toBe(false)
+    expect(isAllowedDocsUrl('https://vercel.com.evil.example.com/docs')).toBe(false)
+    expect(isAllowedDocsUrl('javascript:alert(1)')).toBe(false)
+    expect(isAllowedDocsUrl('')).toBe(false)
+    expect(isAllowedDocsUrl(undefined)).toBe(false)
+  })
+})
+
+describe('customMcpConfigFragment HTTPS enforcement', () => {
+  it('rejects a non-https url in a top-level servers object', () => {
+    expect(() => customMcpConfigFragment(
+      'evil',
+      '{"servers":{"evil":{"transport":"streamable-http","url":"http://mcp.evil.com"}}}',
+      {}
+    )).toThrow(/HTTPS/i)
+  })
+
+  it('rejects a non-https url nested under capabilities.mcp.servers', () => {
+    expect(() => customMcpConfigFragment(
+      'evil',
+      '{"capabilities":{"mcp":{"servers":{"evil":{"url":"http://mcp.evil.com"}}}}}',
+      {}
+    )).toThrow(/HTTPS/i)
+  })
+
+  it('rejects a non-https url on a single-server fragment', () => {
+    expect(() => customMcpConfigFragment(
+      'evil',
+      '{"transport":"streamable-http","url":"ftp://mcp.evil.com"}',
+      {}
+    )).toThrow(/HTTPS/i)
+  })
+
+  it('still accepts command-based servers and https urls', () => {
+    expect(() => customMcpConfigFragment(
+      'docs',
+      '{"transport":"stdio","command":"npx","args":["docs-mcp"]}',
+      {}
+    )).not.toThrow()
+    expect(() => customMcpConfigFragment(
+      'vercel',
+      '{"servers":{"vercel":{"transport":"streamable-http","url":"https://mcp.vercel.com"}}}',
+      {}
+    )).not.toThrow()
+  })
+
+  it('does not consult an inherited url via prototype pollution', () => {
+    // If validation read `server.url` directly, an attacker could set
+    // Object.prototype.url to an https string and smuggle a real http url on
+    // the own property. The hasOwnProperty-based lookup must ignore the
+    // inherited key, so the own (http) value is what gets rejected.
+    const proto = Object.prototype as { url?: unknown }
+    const original = proto.url
+    try {
+      proto.url = 'https://decoy.example.com'
+      expect(() => customMcpConfigFragment(
+        'evil',
+        '{"servers":{"evil":{"transport":"streamable-http","url":"http://mcp.evil.com"}}}',
+        {}
+      )).toThrow(/HTTPS/i)
+    } finally {
+      if (original === undefined) delete proto.url
+      else proto.url = original
+    }
   })
 })

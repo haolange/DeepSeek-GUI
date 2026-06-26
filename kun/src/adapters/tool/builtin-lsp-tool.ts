@@ -1,8 +1,8 @@
 /**
  * `lsp` tool — exposes Language Server Protocol queries to the AI agent.
  *
- * Currently supports TypeScript / JavaScript via typescript-language-server.
- * The server binary must be installed (locally or on PATH); if missing the
+ * Supports the configured language servers in lsp-servers.ts.
+ * The matching server binary must be installed (locally or on PATH); if missing the
  * tool returns a helpful error instead of crashing.
  *
  * Operations: goToDefinition, findReferences, hover, documentSymbol,
@@ -19,6 +19,7 @@ import {
   acquireLspSession,
   lspCloseDocument,
   lspDefinition,
+  lspGetDiagnostics,
   lspDocumentSymbol,
   lspHover,
   lspImplementation,
@@ -28,6 +29,11 @@ import {
   lspWorkspaceSymbol,
   type LspSession
 } from './lsp-client.js'
+import {
+  findLanguageServerForFile,
+  languageIdForFile,
+  listLanguageServers
+} from './lsp-servers.js'
 
 type LspOperation =
   | 'goToDefinition'
@@ -36,6 +42,7 @@ type LspOperation =
   | 'documentSymbol'
   | 'workspaceSymbol'
   | 'goToImplementation'
+  | 'getDiagnostics'
 
 const OPERATIONS: LspOperation[] = [
   'goToDefinition',
@@ -43,7 +50,8 @@ const OPERATIONS: LspOperation[] = [
   'hover',
   'documentSymbol',
   'workspaceSymbol',
-  'goToImplementation'
+  'goToImplementation',
+  'getDiagnostics'
 ]
 
 const POSITION_REQUIRED: LspOperation[] = [
@@ -57,10 +65,11 @@ export function createLspLocalTool(): LocalTool {
   return LocalToolHost.defineTool({
     name: 'lsp',
     description:
-      'Query a language server (TypeScript/JavaScript via typescript-language-server). ' +
-      'Supports: goToDefinition, findReferences, hover, documentSymbol, workspaceSymbol, goToImplementation. ' +
+      'Query a language server for TypeScript/JavaScript, Python, Rust, Go, C/C++, JSON, and YAML. ' +
+      'Supports: goToDefinition, findReferences, hover, documentSymbol, workspaceSymbol, goToImplementation, getDiagnostics. ' +
       'Positions are 1-based (line/character as shown in editors). ' +
-      'Requires typescript-language-server to be installed.',
+      'Diagnostics are best-effort and use publishDiagnostics caches or pull diagnostics when supported. ' +
+      'Requires a matching language server to be installed.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -102,7 +111,27 @@ export function createLspLocalTool(): LocalTool {
           return { output: { error: `Unknown operation: ${operation}` }, isError: true }
         }
 
-        const { absolutePath, workspaceRoot } = resolveWorkspacePath(rawPath, context)
+        const { absolutePath, workspaceRoot } = await resolveWorkspacePath(rawPath, context)
+        const server = findLanguageServerForFile(absolutePath)
+        if (!server) {
+          const supported = listLanguageServers()
+            .map((item) => `${item.displayName} (${item.extensions.join(', ')})`)
+            .join('; ')
+          return {
+            output: {
+              error: `No language server is configured for file: ${absolutePath}`,
+              supported
+            },
+            isError: true
+          }
+        }
+        const documentLanguageId = languageIdForFile(absolutePath)
+        if (!documentLanguageId) {
+          return {
+            output: { error: `Could not determine language id for file: ${absolutePath}` },
+            isError: true
+          }
+        }
 
         const line = typeof args.line === 'number' ? args.line : 0
         const character = typeof args.character === 'number' ? args.character : 0
@@ -119,12 +148,11 @@ export function createLspLocalTool(): LocalTool {
 
         let session: LspSession
         try {
-          session = await acquireLspSession(workspaceRoot)
+          session = await acquireLspSession(workspaceRoot, server.key)
         } catch (err) {
           return {
             output: {
-              error: err instanceof Error ? err.message : String(err),
-              hint: 'Install with: npm install -g typescript-language-server typescript'
+              error: err instanceof Error ? err.message : String(err)
             },
             isError: true
           }
@@ -135,7 +163,7 @@ export function createLspLocalTool(): LocalTool {
         if (needsDocument) {
           try {
             const content = await readFile(absolutePath, 'utf-8')
-            await lspOpenDocument(session, absolutePath, content)
+            await lspOpenDocument(session, absolutePath, content, documentLanguageId)
           } catch {
             return {
               output: { error: `Could not read file: ${absolutePath}` },
@@ -165,10 +193,27 @@ export function createLspLocalTool(): LocalTool {
             case 'goToImplementation':
               result = await lspImplementation(session, absolutePath, lspLine, lspChar)
               break
+            case 'getDiagnostics': {
+              const diagnostics = await lspGetDiagnostics(session, absolutePath)
+              result = diagnostics.diagnostics
+              return {
+                output: {
+                  operation,
+                  result: simplifyResult(result),
+                  bestEffort: true,
+                  source: diagnostics.source
+                }
+              }
+            }
             default:
               return { output: { error: `Unsupported operation: ${operation}` }, isError: true }
           }
-          return { output: { operation, result: simplifyResult(result) } }
+          return {
+            output: {
+              operation,
+              result: simplifyResult(result)
+            }
+          }
         } catch (err) {
           return {
             output: { error: err instanceof Error ? err.message : String(err) },
@@ -178,7 +223,7 @@ export function createLspLocalTool(): LocalTool {
           if (needsDocument) {
             try { await lspCloseDocument(session, absolutePath) } catch { /* ignore */ }
           }
-          releaseLspSession(workspaceRoot)
+          releaseLspSession(workspaceRoot, server.key)
         }
       })
   })
@@ -221,6 +266,15 @@ function simplifyLocation(item: unknown): unknown {
       ...(obj.selectionRange ? { selectionRange: simplifyRange(obj.selectionRange) } : {}),
       ...(obj.containerName ? { containerName: obj.containerName } : {}),
       ...(obj.location ? { path: uriToPath((obj.location as Record<string, unknown>).uri as string) } : {})
+    }
+  }
+  if (obj.message && (obj.range !== undefined || obj.severity !== undefined || obj.source !== undefined)) {
+    return {
+      message: obj.message,
+      ...(obj.severity !== undefined ? { severity: obj.severity } : {}),
+      ...(obj.source ? { source: obj.source } : {}),
+      ...(obj.code !== undefined ? { code: obj.code } : {}),
+      ...(obj.range ? { range: simplifyRange(obj.range) } : {})
     }
   }
   return obj

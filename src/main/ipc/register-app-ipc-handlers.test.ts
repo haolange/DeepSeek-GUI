@@ -11,6 +11,7 @@ import {
   defaultScheduleSettings,
   defaultWorkflowSettings,
   defaultWriteSettings,
+  defaultTerminalSettings,
   type AppSettingsPatch,
   type AppSettingsV1
 } from '../../shared/app-settings'
@@ -35,13 +36,14 @@ function settings(): AppSettingsV1 {
     version: 1,
     locale: 'en',
     theme: 'system',
-    uiFontScale: 'small',
+    uiFontScale: 0.82,
     provider: defaultModelProviderSettings(),
     agents: {
       kun: defaultKunRuntimeSettings()
     },
     workspaceRoot: '/tmp/workspace',
     log: { enabled: false, retentionDays: 7 },
+    checkpointCleanup: { enabled: false, intervalDays: 3 },
     notifications: { turnComplete: true },
     appBehavior: { openAtLogin: false, startMinimized: false, closeToTray: false },
     keyboardShortcuts: defaultKeyboardShortcuts(),
@@ -49,6 +51,7 @@ function settings(): AppSettingsV1 {
     claw: defaultClawSettings(),
     schedule: defaultScheduleSettings(),
     workflow: defaultWorkflowSettings(),
+    terminal: defaultTerminalSettings(),
     guiUpdate: { channel: 'stable' },
     codePromptPrefix: '',
     disabledSkillIds: []
@@ -113,13 +116,42 @@ describe('registerAppIpcHandlers', () => {
       theme: 'dark' as const,
       agents: {
         kun: {
-          port: 9000
+          port: 19000
         }
       }
     }
     const handler = handlers.get('settings:set')
     await expect(handler?.({}, payload)).resolves.toEqual(settings())
     expect(applySettingsPatch).toHaveBeenCalledWith(payload)
+  })
+
+  it('accepts checkpoint cleanup settings patches', async () => {
+    const { registerAppIpcHandlers } = await import('./register-app-ipc-handlers')
+    const applySettingsPatch = vi.fn(async () => settings())
+
+    registerAppIpcHandlers(registerOptions({ applySettingsPatch }))
+
+    const payload = {
+      checkpointCleanup: {
+        intervalDays: 5
+      }
+    }
+    const handler = handlers.get('settings:set')
+    await expect(handler?.({}, payload)).resolves.toEqual(settings())
+    expect(applySettingsPatch).toHaveBeenCalledWith(payload)
+  })
+
+  it('rejects unsupported checkpoint cleanup intervals', async () => {
+    const { registerAppIpcHandlers } = await import('./register-app-ipc-handlers')
+    const applySettingsPatch = vi.fn(async () => settings())
+
+    registerAppIpcHandlers(registerOptions({ applySettingsPatch }))
+
+    const handler = handlers.get('settings:set')
+    await expect(
+      handler?.({}, { checkpointCleanup: { intervalDays: 4 } })
+    ).rejects.toThrow(/Invalid payload for settings:set/)
+    expect(applySettingsPatch).not.toHaveBeenCalled()
   })
 
   it('accepts telegram phone connection settings patches', async () => {
@@ -308,7 +340,7 @@ describe('registerAppIpcHandlers', () => {
   it('uses the GUI-managed WeChat bridge for WeChat install handlers', async () => {
     const { registerAppIpcHandlers } = await import('./register-app-ipc-handlers')
     const configuredSettings = settings()
-    configuredSettings.claw.im.weixinBridgeUrl = 'http://127.0.0.1:8787/rpc'
+    configuredSettings.claw.im.weixinBridgeUrl = 'http://127.0.0.1:18787/rpc'
     const store = { load: vi.fn(async () => configuredSettings) }
     const startWeixinInstallQrcode = vi.fn(async () => ({
       ok: false as const,
@@ -338,7 +370,7 @@ describe('registerAppIpcHandlers', () => {
     const scheduleRuntime = {
       status: vi.fn(async () => ({
         internalServerRunning: true,
-        internalUrl: 'http://127.0.0.1:8788',
+        internalUrl: 'http://127.0.0.1:18788',
         runningTaskIds: ['task-1'],
         powerSaveBlockerActive: true
       })),

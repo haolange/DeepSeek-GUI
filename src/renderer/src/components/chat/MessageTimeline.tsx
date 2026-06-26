@@ -442,7 +442,9 @@ function MessageTurn({
   const workspaceRoot = useChatStore((s) => s.workspaceRoot)
   const activeThreadGoal = useChatStore((s) => s.activeThreadGoal)
   const forkThreadFromTurn = useChatStore((s) => s.forkThreadFromTurn)
+  const rollbackWorkspaceToCheckpoint = useChatStore((s) => s.rollbackWorkspaceToCheckpoint)
   const [forking, setForking] = useState(false)
+  const [rollingBackCheckpointId, setRollingBackCheckpointId] = useState<string | null>(null)
   // Inline Review Plan card: surfaced under a turn that produced a
   // successful `create_plan` result so the user can open/build the plan
   // without leaving the conversation.
@@ -481,7 +483,11 @@ function MessageTurn({
   )
   const onlyCompactionProcess = processBlocks.length > 0 && workProcessBlocks.length === 0
   const hasProcessError = workProcessBlocks.some(processBlockHasError)
-  const workExpanded = hasProcessError || (workExpandedOverride ?? isProcessing)
+  // Only force the work process open (and lock it open) while the turn is still
+  // running. Once the turn completes — even if a tool call failed mid-turn — the
+  // panel should auto-collapse like a normal completed turn and stay user-toggleable.
+  const forceExpandForError = isProcessing && hasProcessError
+  const workExpanded = forceExpandForError || (workExpandedOverride ?? isProcessing)
   const reviewBlocks = useMemo(
     () => turn.blocks.filter((block) => block.kind === 'review'),
     [turn.blocks]
@@ -514,6 +520,11 @@ function MessageTurn({
     !isProcessing && forkTurnId
       ? assistantContentBlocks[assistantContentBlocks.length - 1]?.id
       : undefined
+  const rollbackCheckpointId = turn.user?.meta?.workspaceCheckpointId?.trim() ?? ''
+  const rollbackActionBlockId =
+    !isProcessing && rollbackCheckpointId
+      ? assistantContentBlocks[assistantContentBlocks.length - 1]?.id
+      : undefined
 
   // Keep completed reasoning/tool work tucked away, but make the active turn's
   // work visible unless the user explicitly collapses it.
@@ -529,6 +540,16 @@ function MessageTurn({
       setForking(false)
     }
   }
+  const rollbackWorkspace = async (checkpointId: string): Promise<void> => {
+    const targetCheckpointId = checkpointId.trim()
+    if (!targetCheckpointId || rollingBackCheckpointId) return
+    setRollingBackCheckpointId(targetCheckpointId)
+    try {
+      await rollbackWorkspaceToCheckpoint(targetCheckpointId)
+    } finally {
+      setRollingBackCheckpointId(null)
+    }
+  }
 
   return (
     <div className="flex min-w-0 flex-col gap-4">
@@ -542,7 +563,7 @@ function MessageTurn({
             durationMs={durationMs}
             reasoningDurationMs={reasoningDurationMs}
             expanded={workExpanded}
-            collapsible={!hasProcessError}
+            collapsible={!forceExpandForError}
             onToggle={() => setWorkExpandedOverride((value) => !(value ?? isProcessing))}
           />
           {workExpanded && processSections.length > 0 ? (
@@ -572,6 +593,16 @@ function MessageTurn({
                   busy: forking,
                   onFork: () => {
                     void forkFromTurn()
+                  }
+                }
+              : undefined
+          }
+          rollbackAction={
+            block.id === rollbackActionBlockId
+              ? {
+                  busy: rollingBackCheckpointId === rollbackCheckpointId,
+                  onRollback: () => {
+                    void rollbackWorkspace(rollbackCheckpointId)
                   }
                 }
               : undefined
