@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import process from 'node:process'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { parseServeOptionsSafe, SERVE_USAGE, ServeExitCode } from './serve.js'
 import {
   KUN_CLI_USAGE,
@@ -7,45 +9,44 @@ import {
   splitKunCliCommand
 } from './agent-cli.js'
 import { startKunServe, type KunServeHandle } from '../server/runtime-factory.js'
+import {
+  resolveEventLoopHardStallThresholdMs,
+  resolveEventLoopStallThresholdMs,
+  startEventLoopMonitor
+} from '../server/event-loop-monitor.js'
+import { installServeCrashHandlers } from './serve-crash-handlers.js'
+import { runExtensionCommand } from './extension-cli.js'
+import { inspectSharedRuntime, resolveSharedRuntime, runRuntimeCommand } from './shared-runtime.js'
+import { withRuntimeStartLock } from '../server/runtime-discovery.js'
+import { RuntimeBuildIdSchema } from '../contracts/runtime-info.js'
+import { readRuntimeBuildIdForEntry } from '../server/runtime-build-identity.js'
+import { KUN_VERSION } from '../version.js'
+import { runSelfUpdateCommand } from './self-update.js'
+import { RuntimeFlavorSchema } from '../contracts/runtime-flavor.js'
+import { runtimeDiscoveryDirectory } from './shared-runtime.js'
+import { defaultKunControlDir } from '../manager/manager-discovery.js'
+import {
+  ManagerRuntimeSlotBusyError,
+  registerRuntimeWithManager,
+  ensureServiceManager,
+  resolveServiceManager,
+  unregisterRuntimeWithManager,
+  heartbeatRuntimeWithManager
+} from '../manager/manager-client.js'
+import {
+  allowsDevelopmentManagerBootstrap,
+  resolveCliRuntimeFlavor,
+  runtimeBuildIdForFlavor
+} from './runtime-flavor.js'
 
 export const KUN_READY_PREFIX = 'KUN_READY '
-
-/**
- * Serve mode runs unattended under the GUI. An uncaught error must not
- * leave a half-dead process: report it on stderr (the GUI captures the
- * tail), attempt a bounded graceful close, then exit non-zero so the
- * GUI supervisor can restart us.
- */
-function installServeCrashHandlers(getHandle: () => KunServeHandle | null): void {
-  let crashing = false
-  const crash = (kind: string, error: unknown): void => {
-    if (crashing) return
-    crashing = true
-    const detail = error instanceof Error ? (error.stack ?? error.message) : String(error)
-    process.stderr.write(`kun serve: ${kind}: ${detail}\n`)
-    const finish = (): void => process.exit(ServeExitCode.runtime)
-    const handle = getHandle()
-    if (!handle) {
-      finish()
-      return
-    }
-    const deadline = setTimeout(finish, 3000)
-    deadline.unref()
-    void handle
-      .close()
-      .catch(() => undefined)
-      .finally(finish)
-  }
-  process.on('uncaughtException', (error) => crash('uncaughtException', error))
-  process.on('unhandledRejection', (reason) => crash('unhandledRejection', reason))
-}
 
 /**
  * Serve-mode command. Kept separate from the dispatcher so GUI startup
  * still has the exact same KUN_READY handshake behavior.
  */
 async function serveMain(argv: readonly string[]): Promise<number> {
-  if (argv.length === 0 || argv.includes('--help') || argv.includes('-h')) {
+  if (argv.includes('--help') || argv.includes('-h')) {
     process.stdout.write(SERVE_USAGE)
     return ServeExitCode.ok
   }
@@ -57,12 +58,179 @@ async function serveMain(argv: readonly string[]): Promise<number> {
     }
     return parsed.exitCode
   }
+  const launchMode = process.env.KUN_RUNTIME_LAUNCH_MODE === 'shared' ? 'shared' : 'foreground'
+  const runtimeFlavor = RuntimeFlavorSchema.parse(
+    process.env.KUN_RUNTIME_FLAVOR?.trim() || 'production'
+  )
+  const controlDir = process.env.KUN_MANAGER_CONTROL_DIR?.trim() || defaultKunControlDir()
+  const discoveryDir = process.env.KUN_RUNTIME_DISCOVERY_DIR?.trim() ||
+    runtimeDiscoveryDirectory(parsed.options.dataDir, runtimeFlavor, controlDir)
+  const manifestBuildId = await readRuntimeBuildIdForEntry(import.meta.url)
+  const environmentBuildId = RuntimeBuildIdSchema.safeParse(
+    process.env.KUN_RUNTIME_BUILD_ID?.trim()
+  )
+  const buildId = runtimeBuildIdForFlavor(
+    manifestBuildId ?? (environmentBuildId.success ? environmentBuildId.data : undefined),
+    runtimeFlavor
+  )
+  const allowDevelopmentBootstrap = allowsDevelopmentManagerBootstrap({
+    flavor: runtimeFlavor,
+    env: process.env
+  })
+  const manager = await ensureServiceManager({
+    flavor: runtimeFlavor,
+    allowDevelopmentBootstrap,
+    controlDir,
+    dataDir: parsed.options.dataDir,
+    ...(process.env.KUN_MANAGER_SETTINGS_PATH?.trim()
+      ? { settingsPath: process.env.KUN_MANAGER_SETTINGS_PATH.trim() }
+      : {})
+  })
+  process.env.KUN_MANAGER_BASE_URL = manager.discovery.baseUrl
+  process.env.KUN_MANAGER_TOKEN = manager.discovery.managerToken
+  process.env.KUN_MANAGER_DATA_DIR = manager.discovery.dataDir
+  const start = async (): Promise<
+    { kind: 'existing'; existing: NonNullable<Awaited<ReturnType<typeof resolveSharedRuntime>>> } |
+    { kind: 'started'; server: KunServeHandle }
+  > => {
+    const inspected = await inspectSharedRuntime(parsed.options.dataDir, fetch, {
+      runtimeFlavor,
+      controlDir,
+      manager
+    })
+    const existing = inspected?.connection ?? null
+    if (existing) return { kind: 'existing', existing }
+    if (inspected) {
+      throw new Error(
+        `Kun shared runtime process ${inspected.discovery.pid} is still alive but is not responding; ` +
+        'preserving the manager owner instead of starting a second runtime'
+      )
+    }
+    return {
+      kind: 'started',
+      server: await startKunServe({
+        ...parsed.options,
+        launchMode,
+        runtimeFlavor,
+        discoveryDir,
+        serviceManager: manager,
+        ...(buildId ? { buildId } : {}),
+        sharedMcpConfigPath: process.env.KUN_MCP_CONFIG_PATH || join(homedir(), '.kun', 'mcp.json'),
+        ...(process.env.KUN_RUNTIME_LOG_PATH ? { logPath: process.env.KUN_RUNTIME_LOG_PATH } : {})
+      })
+    }
+  }
+  // Detached startup is already elected by the parent shared-runtime manager.
+  // Foreground `kun serve` performs the same data-dir election itself.
+  const elected = launchMode === 'foreground'
+    ? await withRuntimeStartLock(discoveryDir, start, runtimeFlavor)
+    : await start()
+  if (elected.kind === 'existing') {
+    process.stderr.write(
+      `kun serve: runtime already running at ${elected.existing.discovery.baseUrl} (PID ${elected.existing.discovery.pid}); ` +
+      'use `kun runtime stop` first or choose another --data-dir.\n'
+    )
+    return ServeExitCode.runtime
+  }
   let handle: KunServeHandle | null = null
   installServeCrashHandlers(() => handle)
-  const server = await startKunServe(parsed.options)
+  const server = elected.server
   handle = server
+  process.title = runtimeFlavor === 'development' ? 'kun-dv-runtime' : 'kun-runtime'
   await selfVerifyHealth(server.host, server.port)
   const info = server.runtime.info()
+  let managerHeartbeat: ReturnType<typeof setInterval> | null = null
+  const registration = {
+    flavor: runtimeFlavor,
+    instanceId: server.instanceId,
+    pid: process.pid,
+    startedAt: info.startedAt,
+    host: server.host,
+    port: server.port,
+    baseUrl: `http://${server.host}:${server.port}`,
+    runtimeToken: parsed.options.runtimeToken,
+    ...(buildId ? { buildId } : {}),
+    ...(process.env.KUN_RUNTIME_LOG_PATH ? { logPath: process.env.KUN_RUNTIME_LOG_PATH } : {})
+  }
+  let ownershipShutdownSignaled = false
+  let requestOwnershipShutdown!: () => void
+  const ownershipShutdownRequested = new Promise<void>((resolve) => {
+    requestOwnershipShutdown = resolve
+  })
+  const signalOwnershipShutdown = (ownerInstanceId?: string): void => {
+    if (ownershipShutdownSignaled) return
+    ownershipShutdownSignaled = true
+    process.stderr.write(
+      `kun serve: ${runtimeFlavor} runtime registration is owned by ` +
+      `${ownerInstanceId ?? 'another instance'}; stopping duplicate PID ${process.pid}.\n`
+    )
+    requestOwnershipShutdown()
+  }
+  let managerRecovery: Promise<void> | null = null
+  const applyManagerConnection = (connection: typeof manager): void => {
+    manager.discovery = connection.discovery
+    process.env.KUN_MANAGER_BASE_URL = connection.discovery.baseUrl
+    process.env.KUN_MANAGER_TOKEN = connection.discovery.managerToken
+    process.env.KUN_MANAGER_DATA_DIR = connection.discovery.dataDir
+  }
+  const recoverManagerConnection = async (): Promise<void> => {
+    let recovered = await resolveServiceManager(controlDir)
+    if (!recovered && (runtimeFlavor === 'production' || allowDevelopmentBootstrap)) {
+      recovered = await ensureServiceManager({
+        flavor: runtimeFlavor,
+        allowDevelopmentBootstrap,
+        controlDir,
+        dataDir: parsed.options.dataDir,
+        settingsPath: manager.discovery.settingsPath
+      })
+    }
+    if (!recovered) throw new Error('Kun Service Manager is unavailable')
+    applyManagerConnection(recovered)
+    await registerRuntimeWithManager({ manager, registration })
+  }
+  const heartbeatManager = async (): Promise<void> => {
+    try {
+      const accepted = await heartbeatRuntimeWithManager({
+        manager,
+        flavor: runtimeFlavor,
+        instanceId: server.instanceId
+      })
+      if (!accepted) {
+        signalOwnershipShutdown()
+        return
+      }
+    } catch (error) {
+      if (error instanceof ManagerRuntimeSlotBusyError) {
+        signalOwnershipShutdown(error.owner.instanceId)
+        return
+      }
+      if (!managerRecovery) {
+        managerRecovery = recoverManagerConnection().finally(() => { managerRecovery = null })
+      }
+      try {
+        await managerRecovery
+      } catch (recoveryError) {
+        if (recoveryError instanceof ManagerRuntimeSlotBusyError) {
+          signalOwnershipShutdown(recoveryError.owner.instanceId)
+          return
+        }
+        throw recoveryError
+      }
+    }
+  }
+  try {
+    await registerRuntimeWithManager({
+      manager,
+      registration
+    })
+    managerHeartbeat = setInterval(() => {
+      void heartbeatManager().catch(() => undefined)
+    }, 5_000)
+    managerHeartbeat.unref?.()
+  } catch (error) {
+    await server.close().catch(() => undefined)
+    throw error
+  }
   const startupInfo = {
     service: 'kun',
     mode: 'serve',
@@ -73,44 +241,59 @@ async function serveMain(argv: readonly string[]): Promise<number> {
     model: info.model,
     approvalPolicy: info.approvalPolicy,
     sandboxMode: info.sandboxMode,
+    approvalReviewer: info.approvalReviewer,
     insecure: info.insecure,
+    instanceId: info.instanceId ?? server.instanceId,
+    ...(info.buildId ? { buildId: info.buildId } : {}),
     startedAt: info.startedAt,
     pid: info.pid,
     message: `kun runtime listening on http://${server.host}:${server.port}`
   }
   process.stdout.write(`${KUN_READY_PREFIX}${JSON.stringify(startupInfo)}\n`)
   process.stdout.write(JSON.stringify(startupInfo, null, 2) + '\n')
+  // Watch for event-loop stalls so a hang that starves /health (and trips the
+  // GUI watchdog) is attributable to CPU starvation vs a hard deadlock (#621).
+  // Attach non-sensitive identity so multi-instance log streams stay traceable.
+  const loopMonitor = startEventLoopMonitor({
+    stallThresholdMs: resolveEventLoopStallThresholdMs(process.env),
+    hardStallThresholdMs: resolveEventLoopHardStallThresholdMs(process.env),
+    context: () => {
+      const counters = server.runtime.liveCounters?.()
+      return [
+        `instance ${startupInfo.instanceId}`,
+        ...(startupInfo.buildId ? [`build ${startupInfo.buildId.slice(0, 12)}`] : []),
+        ...(counters
+          ? [`active inflight ${counters.inflight}`, `active captures ${counters.activeCaptures}`]
+          : [])
+      ]
+    }
+  })
   await new Promise<void>((resolve) => {
+    let stopping = false
     const stop = () => {
-      void server.close().finally(resolve)
+      if (stopping) return
+      stopping = true
+      if (managerHeartbeat) clearInterval(managerHeartbeat)
+      loopMonitor.stop()
+      // Keep the manager slot owned until the server has closed its stores and
+      // released filesystem handles. A concurrent client must not elect a
+      // replacement in the gap between unregister and process teardown.
+      void server.close().finally(() => unregisterRuntimeWithManager({
+        manager,
+        flavor: runtimeFlavor,
+        instanceId: server.instanceId
+      })).catch((error) => {
+        process.stderr.write(
+          `kun serve: failed to close runtime cleanly: ${error instanceof Error ? error.message : String(error)}\n`
+        )
+      }).finally(resolve)
     }
     process.once('SIGTERM', stop)
     process.once('SIGINT', stop)
+    void server.shutdownRequested.then(stop)
+    void ownershipShutdownRequested.then(stop)
   })
   return ServeExitCode.ok
-}
-
-/**
- * When the GUI launches kun without `ELECTRON_RUN_AS_NODE` (the host
- * computer-use mode on darwin), the child runs as a real Electron instance.
- * libnut's first screen-grab / mouse / keyboard call invokes
- * `[NSApplication sharedApplication]`, which promotes the process to a
- * regular Cocoa app and macOS adds a second Dock icon. Hiding it via
- * `app.dock.hide()` is the official Electron API; we never open a window
- * here so the icon serves no purpose. A no-op when running as Node.
- */
-async function hideMacosDockIfRunningAsElectron(): Promise<void> {
-  if (process.platform !== 'darwin') return
-  if (!process.versions.electron) return
-  try {
-    const electron = (await import(/* @vite-ignore */ 'electron')) as {
-      app?: { dock?: { hide?: () => void } }
-    }
-    electron.app?.dock?.hide?.()
-  } catch {
-    // Best-effort: when the electron module is unavailable (pure Node
-    // fallback), leave the dock alone. The user still gets host control.
-  }
 }
 
 const SELF_VERIFY_TIMEOUT_MS = 5_000
@@ -139,7 +322,19 @@ async function selfVerifyHealth(host: string, port: number): Promise<void> {
 }
 
 export async function main(argv: readonly string[]): Promise<number> {
-  await hideMacosDockIfRunningAsElectron()
+  process.env.KUN_RUNTIME_FLAVOR = resolveCliRuntimeFlavor({
+    env: process.env,
+    executablePath: process.argv[1]
+  })
+  process.title = process.env.KUN_RUNTIME_FLAVOR === 'development' ? 'kun-dv' : 'kun'
+  if (argv[0] === 'extension') {
+    return runExtensionCommand(argv.slice(1), {
+      stdout: process.stdout,
+      stderr: process.stderr,
+      env: process.env,
+      cwd: () => process.cwd()
+    })
+  }
   const command = splitKunCliCommand(argv)
   if (command.command === 'help') {
     if (command.error) {
@@ -152,6 +347,24 @@ export async function main(argv: readonly string[]): Promise<number> {
   }
   if (command.command === 'serve') {
     return serveMain(command.args)
+  }
+  if (command.command === 'version') {
+    process.stdout.write(`kun ${KUN_VERSION}\n`)
+    return ServeExitCode.ok
+  }
+  if (command.command === 'runtime') {
+    return runRuntimeCommand(command.args, {
+      stdout: process.stdout,
+      stderr: process.stderr,
+      env: process.env
+    })
+  }
+  if (command.command === 'update') {
+    return runSelfUpdateCommand(command.args, {
+      stdout: process.stdout,
+      stderr: process.stderr,
+      env: process.env
+    })
   }
   return runAgentCommand(command.command, command.args, {
     stdin: process.stdin,
@@ -167,7 +380,9 @@ main(process.argv.slice(2)).then(
     process.exit(code)
   },
   (error) => {
-    process.stderr.write(`kun serve: ${String(error)}\n`)
+    process.stderr.write(
+      `kun serve: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`
+    )
     process.exit(ServeExitCode.runtime)
   }
 )

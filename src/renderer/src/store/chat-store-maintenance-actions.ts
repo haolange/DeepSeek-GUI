@@ -6,6 +6,12 @@ import { applyTheme, applyUiFontScale } from '../lib/apply-theme'
 import { confirmDialog } from '../lib/confirm-dialog'
 import { formatWorkspacePickerError } from '../lib/format-workspace-picker-error'
 import { formatRuntimeError, getRuntimeErrorCode } from '../lib/format-runtime-error'
+import { requestCodeCanvasPanelOpen } from '../lib/code-canvas-panel-event'
+import {
+  prepareCodeCanvasResend,
+  type PrepareCodeCanvasResendOptions,
+  type PreparedCodeCanvasResend
+} from '../design/canvas/code-canvas-resend'
 import {
   deriveThreadTitleFromPrompt,
   getDefaultThreadTitle,
@@ -25,6 +31,11 @@ import {
   readThreadWorktreeRegistry,
   saveThreadWorktreeRegistry
 } from '../lib/thread-worktree-registry'
+import {
+  forgetQueuedMessagesForThread,
+  saveQueuedMessagesForThread
+} from './queued-message-persistence'
+import { invalidateThreadSnapshot } from './thread-snapshot-cache'
 
 /**
  * Release the worktree pool slot owned by a thread when the task completes
@@ -84,6 +95,21 @@ import {
   writeThreadBelongsToWorkspace,
   writeWorkspaceForThreadId
 } from '../write/write-thread-registry'
+import {
+  designDocKey,
+  forgetDesignThread,
+  readDesignThreadRegistry,
+  replaceDesignThreadsForDocument,
+  saveDesignThreadRegistry
+} from '../design/design-thread-registry'
+import {
+  beginDesignChatHistoryMutation,
+  deleteDesignChatDirForDoc,
+  deleteDesignChatTranscriptForThread,
+  endDesignChatHistoryMutation,
+  persistDesignChatMetaForDoc
+} from '../design/design-chat-transcript'
+import { flushDesignPersistenceQueue } from '../design/design-persistence-coordinator'
 import {
   clearBusyWatchdog,
   resetBusyRecoveryAttempts,
@@ -167,6 +193,7 @@ function settleInterruptedTurn(set: ChatStoreSet, get: ChatStoreGet): void {
       ...finalizeTurnTiming(s),
       busy: false,
       currentTurnId: null,
+      currentTurnOrchestration: null,
       currentTurnUserId: null,
       error: null
     })
@@ -180,9 +207,47 @@ function settleInterruptedTurn(set: ChatStoreSet, get: ChatStoreGet): void {
   }
 }
 
+export type MaintenanceActionDependencies = {
+  prepareCodeCanvasResend?: (
+    options: PrepareCodeCanvasResendOptions
+  ) => Promise<PreparedCodeCanvasResend | null>
+  requestCodeCanvasPanelOpen?: () => void
+  deleteDesignChatDirForDoc?: typeof deleteDesignChatDirForDoc
+  deleteDesignChatTranscriptForThread?: typeof deleteDesignChatTranscriptForThread
+  persistDesignChatMetaForDoc?: typeof persistDesignChatMetaForDoc
+  flushDesignPersistenceQueue?: typeof flushDesignPersistenceQueue
+}
+
+/**
+ * Checkpoint create/restore identity must follow the thread workspace, not the
+ * currently selected global workspace picker. Multi-project sidebars can keep
+ * one thread open under DeepSeek-GUI while `workspaceRoot` still points at
+ * another project (e.g. KunUIExtend).
+ */
+function resolveCheckpointExpectedWorkspaceRoot(state: {
+  activeThreadId: string | null
+  threads: Array<{ id: string; workspace?: string | null }>
+  workspaceRoot: string
+}): string {
+  const threadWorkspace = state.threads.find((thread) => thread.id === state.activeThreadId)?.workspace
+  return normalizeWorkspaceRoot(threadWorkspace) || normalizeWorkspaceRoot(state.workspaceRoot)
+}
+
 export function createMaintenanceActions(
-  { set, get, sseAbortRef }: StoreActionContext
-): Pick<ChatState, 'renameActiveThread' | 'renameThread' | 'pinThread' | 'archiveThread' | 'compactActiveThread' | 'forkActiveThread' | 'forkThreadFromTurn' | 'setActiveThreadGoal' | 'setActiveThreadGoalStatus' | 'clearActiveThreadGoal' | 'setActiveThreadTodoStatus' | 'clearActiveThreadTodos' | 'syncPlanTodosFromMarkdown' | 'resumeSessionIntoThread' | 'deleteThread' | 'rewindAndResend' | 'rollbackWorkspaceToCheckpoint' | 'resolveApproval' | 'resolveUserInput' | 'interrupt'> {
+  { set, get, sseAbortRef }: StoreActionContext,
+  dependencies: MaintenanceActionDependencies = {}
+): Pick<ChatState, 'renameActiveThread' | 'renameThread' | 'pinThread' | 'archiveThread' | 'compactActiveThread' | 'forkActiveThread' | 'forkThreadFromTurn' | 'setActiveThreadGoal' | 'setActiveThreadGoalStatus' | 'clearActiveThreadGoal' | 'setActiveThreadTodoStatus' | 'clearActiveThreadTodos' | 'syncPlanTodosFromMarkdown' | 'resumeSessionIntoThread' | 'deleteThread' | 'clearDesignHistory' | 'rewindAndResend' | 'rollbackWorkspaceToCheckpoint' | 'resolveApproval' | 'resolveUserInput' | 'interrupt' | 'cancelToolCall'> {
+  const prepareCanvasResend = dependencies.prepareCodeCanvasResend ?? prepareCodeCanvasResend
+  const openCodeCanvasPanel =
+    dependencies.requestCodeCanvasPanelOpen ?? requestCodeCanvasPanelOpen
+  const deleteDesignChatDir =
+    dependencies.deleteDesignChatDirForDoc ?? deleteDesignChatDirForDoc
+  const deleteDesignChatTranscript =
+    dependencies.deleteDesignChatTranscriptForThread ?? deleteDesignChatTranscriptForThread
+  const persistDesignChatMeta =
+    dependencies.persistDesignChatMetaForDoc ?? persistDesignChatMetaForDoc
+  const flushDesignPersistence =
+    dependencies.flushDesignPersistenceQueue ?? flushDesignPersistenceQueue
   const forkActiveThreadWithOptions = async (options: { turnId?: string } = {}): Promise<void> => {
     const { activeThreadId, busy, blocks } = get()
     if (!activeThreadId) return
@@ -316,6 +381,9 @@ export function createMaintenanceActions(
       } else {
         throw new Error(i18n.t('common:runtimeFeatureUnsupported'))
       }
+      // An archived/unarchived projection can differ from the one currently
+      // parked in memory; force a fresh durable snapshot next time.
+      invalidateThreadSnapshot(targetId)
       if (archivingActive) {
         sseAbortRef.current?.abort()
         sseAbortRef.current = null
@@ -370,23 +438,8 @@ export function createMaintenanceActions(
       const result = await p.compactThread(activeThreadId, reason)
       await get().refreshThreads()
       await get().selectThread(activeThreadId)
-      // Manual compaction may use a model request for the summary, but the
-      // chat context gauge is still based on the main turn's measured prompt.
-      // Drop the last turn's total by the folded amount so the UI reflects the
-      // compacted model-visible history immediately. The next real turn
-      // replaces this with a precise provider count.
       const replacedTokens = result && typeof result.replacedTokens === 'number' ? result.replacedTokens : 0
-      if (replacedTokens > 0) {
-        set((s) => {
-          const prev = s.lastTurnUsage
-          if (!prev || prev.threadId !== activeThreadId) return {}
-          const inputTokens = Math.max(0, prev.snapshot.inputTokens - replacedTokens)
-          return {
-            usageRefreshKey: s.usageRefreshKey + 1,
-            lastTurnUsage: { threadId: prev.threadId, snapshot: { ...prev.snapshot, inputTokens } }
-          }
-        })
-      } else {
+      if (replacedTokens <= 0) {
         // Nothing was folded (e.g. a near-empty thread). The compaction emits no
         // timeline row in that case, so surface a transient notice instead of
         // leaving the command silently doing nothing.
@@ -639,6 +692,283 @@ export function createMaintenanceActions(
     }
   },
 
+  clearDesignHistory: async (workspaceRoot, docId, options = {}) => {
+    const targetWorkspace = normalizeWorkspaceRoot(workspaceRoot)
+    const targetDoc = docId.trim()
+    const emptyResult = {
+      cleared: false,
+      deletedThreadIds: [] as string[],
+      retainedThreadIds: [] as string[],
+      recreatedThreadId: null as string | null
+    }
+    if (!targetWorkspace || !targetDoc) {
+      set({ error: i18n.t('common:workspaceRequiredToCreateThread') })
+      return emptyResult
+    }
+    const registry = readDesignThreadRegistry()
+    const originalRecord = registry.workspaces[designDocKey(targetWorkspace, targetDoc)]
+    const originalThreadIds = [...new Set([
+      ...(originalRecord?.threadIds ?? []),
+      ...(options.includeThreadIds ?? []).map((threadId) => threadId.trim()).filter(Boolean)
+    ])]
+    const replaceRememberedThreads = (
+      threadIds: readonly string[],
+      preferredActiveThreadId?: string | null
+    ): void => {
+      saveDesignThreadRegistry(replaceDesignThreadsForDocument(
+        targetWorkspace,
+        targetDoc,
+        threadIds,
+        preferredActiveThreadId,
+        readDesignThreadRegistry()
+      ))
+    }
+    const restoreOriginalRecord = (): void => {
+      replaceRememberedThreads(originalThreadIds, originalRecord?.activeThreadId)
+    }
+    const fail = (
+      message: string,
+      retainedThreadIds: string[],
+      deletedThreadIds = originalThreadIds.filter((id) => !retainedThreadIds.includes(id))
+    ) => {
+      set({ error: message })
+      return {
+        ...emptyResult,
+        deletedThreadIds,
+        retainedThreadIds
+      }
+    }
+
+    const historyMutationToken = beginDesignChatHistoryMutation(targetWorkspace, targetDoc)
+    if (!historyMutationToken) {
+      return fail(i18n.t('common:designAgentBusy'), originalThreadIds, [])
+    }
+    let historyMutationReleased = false
+    const releaseHistoryMutation = (): void => {
+      if (historyMutationReleased) return
+      historyMutationReleased = true
+      endDesignChatHistoryMutation(historyMutationToken)
+    }
+
+    try {
+      // An empty registry can still have a stale local mirror after an earlier
+      // interrupted cleanup. Make the operation idempotently finish that work,
+      // but do not create a brand-new conversation when there was no history.
+      if (originalThreadIds.length === 0) {
+        await flushDesignPersistence(targetWorkspace)
+        const mirrorDeleted = await deleteDesignChatDir({
+          workspaceRoot: targetWorkspace,
+          docId: targetDoc
+        })
+        if (!mirrorDeleted) {
+          return fail('Failed to delete the local design conversation history.', [])
+        }
+        set({ error: null })
+        return { ...emptyResult, cleared: true }
+      }
+
+      if (get().runtimeConnection !== 'ready') {
+        return fail(
+          i18n.t('common:runtimeActionNeedsConnection'),
+          originalThreadIds,
+          []
+        )
+      }
+
+    const provider = getProvider()
+    // A registered thread can be absent from the renderer's paged snapshot.
+    // Ask Kun before deleting so an unloaded/racing active turn is treated as
+    // busy instead of being destroyed underneath the agent.
+    for (const threadId of originalThreadIds) {
+      const localThread = get().threads.find((thread) => thread.id === threadId)
+      if (
+        localThread && (
+          threadSnapshotLooksRunning([], localThread.status) ||
+          threadSnapshotLooksRunning([], localThread.latestTurnStatus)
+        )
+      ) {
+        return fail(i18n.t('common:designAgentBusy'), originalThreadIds, [])
+      }
+      try {
+        const detail = await provider.getThreadDetail(threadId)
+        if (threadSnapshotLooksRunning(detail.blocks, detail.threadStatus)) {
+          return fail(i18n.t('common:designAgentBusy'), originalThreadIds, [])
+        }
+      } catch (error) {
+        if (getRuntimeErrorCode(error) !== 'not_found') {
+          return fail(formatRuntimeError(error), originalThreadIds, [])
+        }
+      }
+    }
+    const runtimeDeletedIds: string[] = []
+    const runtimeFailedIds: string[] = []
+    const failureMessages: string[] = []
+    await Promise.all(originalThreadIds.map(async (threadId) => {
+      try {
+        await provider.deleteThread(threadId)
+        invalidateThreadSnapshot(threadId)
+        runtimeDeletedIds.push(threadId)
+      } catch (error) {
+        // A retry after an interrupted local cleanup commonly reaches a thread
+        // already removed from Kun. That is success for this idempotent action.
+        if (getRuntimeErrorCode(error) === 'not_found') {
+          invalidateThreadSnapshot(threadId)
+          runtimeDeletedIds.push(threadId)
+          return
+        }
+        runtimeFailedIds.push(threadId)
+        failureMessages.push(`${threadId}: ${formatRuntimeError(error)}`)
+      }
+    }))
+
+    const runtimeDeletedSet = new Set(runtimeDeletedIds)
+    const orderedRuntimeDeletedIds = originalThreadIds.filter((id) => runtimeDeletedSet.has(id))
+    const orderedRuntimeFailedIds = originalThreadIds.filter((id) => runtimeFailedIds.includes(id))
+    const preferredRetainedActive = originalRecord?.activeThreadId &&
+      orderedRuntimeFailedIds.includes(originalRecord.activeThreadId)
+      ? originalRecord.activeThreadId
+      : orderedRuntimeFailedIds[0]
+    // Removing successful ids before flushing prevents an in-flight transcript
+    // refresh from enqueueing a new mirror after cleanup begins.
+    replaceRememberedThreads(orderedRuntimeFailedIds, preferredRetainedActive)
+
+    for (const threadId of orderedRuntimeDeletedIds) {
+      forgetQueuedMessagesForThread(threadId)
+      saveWriteThreadRegistry(forgetWriteThread(threadId))
+      saveThreadForkRegistry(forgetThreadFork(threadId))
+      releaseThreadWorktreeIfNeeded(threadId)
+    }
+
+    const deletingActive = Boolean(get().activeThreadId && runtimeDeletedSet.has(get().activeThreadId!))
+    if (deletingActive) {
+      sseAbortRef.current?.abort()
+      sseAbortRef.current = null
+      clearBusyWatchdog()
+    }
+    set((state) => {
+      const watchTurnCompletion = { ...state.watchTurnCompletion }
+      const unreadThreadIds = { ...state.unreadThreadIds }
+      for (const threadId of orderedRuntimeDeletedIds) {
+        delete watchTurnCompletion[threadId]
+        delete unreadThreadIds[threadId]
+        clearWatchedCompletionNotification(threadId)
+      }
+      return {
+        threads: state.threads.filter((thread) => !runtimeDeletedSet.has(thread.id)),
+        watchTurnCompletion,
+        unreadThreadIds,
+        ...(deletingActive ? clearedThreadSelection() : {}),
+        error: null
+      }
+    })
+
+    await flushDesignPersistence(targetWorkspace)
+
+    if (orderedRuntimeFailedIds.length === 0) {
+      const mirrorDeleted = await deleteDesignChatDir({
+        workspaceRoot: targetWorkspace,
+        docId: targetDoc
+      })
+      if (!mirrorDeleted) {
+        // Keep the old ids as a durable retry journal. The next attempt treats
+        // Kun's not_found response as success and retries only local cleanup.
+        restoreOriginalRecord()
+        return fail(
+          'The conversations were deleted from Kun, but the local design history could not be removed.',
+          originalThreadIds,
+          orderedRuntimeDeletedIds
+        )
+      }
+
+      if (options.recreate === false) {
+        await get().refreshThreads()
+        set({ error: null })
+        return {
+          cleared: true,
+          deletedThreadIds: originalThreadIds,
+          retainedThreadIds: [],
+          recreatedThreadId: null
+        }
+      }
+
+      set({ error: null })
+      // The mirror directory is now gone and every older hydrate/persist read
+      // carries a stale epoch, so replacement-thread persistence can resume.
+      releaseHistoryMutation()
+      const recreatedThreadId = await get().createDesignThread(
+        targetWorkspace,
+        targetDoc,
+        { activate: false, suppressSettingsRedirect: true }
+      )
+      if (!recreatedThreadId && !get().error) {
+        set({ error: 'Design history was cleared, but a new conversation could not be created.' })
+      }
+      return {
+        cleared: true,
+        deletedThreadIds: originalThreadIds,
+        retainedThreadIds: [],
+        recreatedThreadId
+      }
+    }
+
+    // Runtime partial failure: preserve failed threads and their mirrors, while
+    // permanently removing mirrors belonging to successfully deleted threads.
+    if (orderedRuntimeDeletedIds.length === 0) {
+      await get().refreshThreads()
+      return fail(
+        `Design history could not be cleared: ${failureMessages.join('; ')}`,
+        originalThreadIds,
+        []
+      )
+    }
+    const mirrorDeleteResults = await Promise.all(orderedRuntimeDeletedIds.map(async (threadId) => ({
+      threadId,
+      deleted: await deleteDesignChatTranscript({
+        workspaceRoot: targetWorkspace,
+        docId: targetDoc,
+        threadId
+      })
+    })))
+    const mirrorFailedIds = mirrorDeleteResults
+      .filter((result) => !result.deleted)
+      .map((result) => result.threadId)
+    for (const threadId of mirrorFailedIds) {
+      failureMessages.push(`${threadId}: failed to delete the local transcript`)
+    }
+    const retainedSet = new Set([...orderedRuntimeFailedIds, ...mirrorFailedIds])
+    const retainedThreadIds = originalThreadIds.filter((id) => retainedSet.has(id))
+    const preferredActive = originalRecord?.activeThreadId && retainedSet.has(originalRecord.activeThreadId)
+      ? originalRecord.activeThreadId
+      : retainedThreadIds[0]
+    replaceRememberedThreads(retainedThreadIds, preferredActive)
+
+    const metaPersisted = await persistDesignChatMeta({
+      workspaceRoot: targetWorkspace,
+      docId: targetDoc,
+      mutationToken: historyMutationToken
+    })
+    if (!metaPersisted) {
+      restoreOriginalRecord()
+      failureMessages.push('failed to update the local design conversation index')
+      await get().refreshThreads()
+      return fail(
+        `Design history was only partially cleared: ${failureMessages.join('; ')}`,
+        originalThreadIds,
+        orderedRuntimeDeletedIds
+      )
+    }
+
+    await get().refreshThreads()
+    return fail(
+      `Design history was only partially cleared: ${failureMessages.join('; ')}`,
+      retainedThreadIds,
+      orderedRuntimeDeletedIds
+    )
+    } finally {
+      releaseHistoryMutation()
+    }
+  },
+
   deleteThread: async (threadId) => {
     const targetId = threadId.trim()
     if (!targetId) return
@@ -664,7 +994,10 @@ export function createMaintenanceActions(
     }
     try {
       await p.deleteThread(targetId)
+      invalidateThreadSnapshot(targetId)
+      forgetQueuedMessagesForThread(targetId)
       saveWriteThreadRegistry(forgetWriteThread(targetId))
+      saveDesignThreadRegistry(forgetDesignThread(targetId))
       saveThreadForkRegistry(forgetThreadFork(targetId))
       if (wtRecord) saveThreadWorktreeRegistry(forgetThreadWorktree(targetId))
       if (deletingActive) {
@@ -721,7 +1054,12 @@ export function createMaintenanceActions(
     }
     const checkpointId = targetBlock.meta?.workspaceCheckpointId
     if (checkpointId) {
-      const restored = await window.kunGui.restoreGitCheckpoint({ checkpointId }).catch((error) => ({
+      const expectedWorkspaceRoot = resolveCheckpointExpectedWorkspaceRoot(state)
+      const restored = await window.kunGui.restoreGitCheckpoint({
+        checkpointId,
+        ...(state.activeThreadId ? { expectedThreadId: state.activeThreadId } : {}),
+        ...(expectedWorkspaceRoot ? { expectedWorkspaceRoot } : {})
+      }).catch((error) => ({
         ok: false as const,
         reason: 'error' as const,
         message: error instanceof Error ? error.message : String(error)
@@ -733,6 +1071,17 @@ export function createMaintenanceActions(
     }
 
     const trimmedBlocks = state.blocks.slice(0, idx)
+    const attachmentIds = [...new Set([
+      ...(targetBlock.meta?.attachmentIds ?? []),
+      ...(targetBlock.meta?.attachments ?? []).map((attachment) => attachment.id)
+    ].map((id) => id.trim()).filter(Boolean))]
+    const attachments = (targetBlock.meta?.attachments ?? []).filter((attachment) =>
+      attachment.id.trim().length > 0
+    )
+    const attachmentOverrides = {
+      ...(attachmentIds.length ? { attachmentIds } : {}),
+      ...(attachments.length ? { attachments } : {})
+    }
 
     const droppedUserIds = state.blocks
       .slice(idx)
@@ -754,21 +1103,43 @@ export function createMaintenanceActions(
     clearBusyWatchdog()
 
     try {
+      const canvasResend = await prepareCanvasResend({
+        route: state.route,
+        text: trimmed,
+        previousCanvasTurn: targetBlock.meta?.guiDesignCanvas === true,
+        fallbackWorkspaceRoot: state.workspaceRoot,
+        threadWorkspaceRoot: state.threads.find(
+          (thread) => thread.id === state.activeThreadId
+        )?.workspace,
+        threadId: state.activeThreadId
+      })
+      if (canvasResend) openCodeCanvasPanel()
       await p.rewindThread(state.activeThreadId, turnId)
+      invalidateThreadSnapshot(state.activeThreadId)
       set({
         blocks: trimmedBlocks,
         liveReasoning: '',
         liveAssistant: '',
         currentTurnId: null,
+        currentTurnOrchestration: null,
         currentTurnUserId: null,
         turnStartedAtByUserId,
         turnDurationByUserId,
         turnReasoningFirstAtByUserId,
         turnReasoningLastAtByUserId,
-        queuedMessages: [],
         error: null
       })
-      await get().sendMessage(trimmed)
+      if (canvasResend) {
+        await get().sendMessage(canvasResend.text, 'agent', {
+          displayText: canvasResend.displayText,
+          guiDesignCanvas: true,
+          ...attachmentOverrides
+        })
+      } else if (attachmentIds.length > 0) {
+        await get().sendMessage(trimmed, undefined, attachmentOverrides)
+      } else {
+        await get().sendMessage(trimmed)
+      }
     } catch (e) {
       set({ error: formatRuntimeError(e) })
     }
@@ -796,12 +1167,52 @@ export function createMaintenanceActions(
       set({ error: i18n.t('common:rollbackWorkspaceBusyError') })
       return
     }
-    const { activeThreadId, workspaceRoot } = get()
-    const restored = await window.kunGui.restoreGitCheckpoint({ checkpointId: targetCheckpointId }).catch((error) => ({
+    const state = get()
+    const { activeThreadId } = state
+    const expectedWorkspaceRoot = resolveCheckpointExpectedWorkspaceRoot(state)
+    let restored = await window.kunGui.restoreGitCheckpoint({
+      checkpointId: targetCheckpointId,
+      ...(activeThreadId ? { expectedThreadId: activeThreadId } : {}),
+      ...(expectedWorkspaceRoot ? { expectedWorkspaceRoot } : {})
+    }).catch((error) => ({
       ok: false as const,
       reason: 'error' as const,
       message: error instanceof Error ? error.message : String(error)
     }))
+    // A partial checkpoint skipped some untracked files (too large to capture).
+    // Restoring would delete them, so the main process refuses unless the user
+    // opts in. Surface the at-risk files and, on confirmation, retry with the
+    // opt-in (the main process then takes a full rescue checkpoint first).
+    if (!restored.ok && restored.reason === 'partial') {
+      const skipped = 'skippedUntracked' in restored && Array.isArray(restored.skippedUntracked)
+        ? restored.skippedUntracked
+        : []
+      const preview = skipped.slice(0, 10).join(', ') + (skipped.length > 10 ? ` … (+${skipped.length - 10})` : '')
+      const proceed = await confirmDialog(
+        i18n.t('common:rollbackWorkspacePartialConfirm'),
+        i18n.t('common:rollbackWorkspacePartialConfirmDetail', { files: preview })
+      )
+      if (!proceed) {
+        set({ error: null })
+        return
+      }
+      if (get().busy) {
+        set({ error: i18n.t('common:rollbackWorkspaceBusyError') })
+        return
+      }
+      restored = await window.kunGui
+        .restoreGitCheckpoint({
+          checkpointId: targetCheckpointId,
+          allowPartialRestore: true,
+          ...(activeThreadId ? { expectedThreadId: activeThreadId } : {}),
+          ...(expectedWorkspaceRoot ? { expectedWorkspaceRoot } : {})
+        })
+        .catch((error) => ({
+          ok: false as const,
+          reason: 'error' as const,
+          message: error instanceof Error ? error.message : String(error)
+        }))
+    }
     if (!restored.ok) {
       set({ error: restored.message })
       return
@@ -817,7 +1228,7 @@ export function createMaintenanceActions(
       '[rollback] rescue checkpoint:',
       rescueId,
       'workspace:',
-      workspaceRoot,
+      expectedWorkspaceRoot,
       'thread:',
       activeThreadId
     )
@@ -841,19 +1252,37 @@ export function createMaintenanceActions(
       )
     }))
     try {
-      await p.submitApprovalDecision(
+      const outcome = await p.submitApprovalDecision(
         block.approvalId,
         decision === 'allow' ? 'allow' : 'deny',
-        false
+        true
       )
+      if (outcome === 'cancelled') {
+        set((s) => ({
+          blocks: s.blocks.map((b) =>
+            b.id === blockId && b.kind === 'approval' && b.status === 'submitting'
+              ? {
+                  ...b,
+                  status: 'pending' as const,
+                  errorMessage: i18n.t('common:approvalNativeConfirmationCancelled')
+                }
+              : b
+          )
+        }))
+        return
+      }
       set((s) => ({
         blocks: s.blocks.map((b) =>
-          b.id === blockId && b.kind === 'approval'
+          b.id === blockId && b.kind === 'approval' && b.status === 'submitting'
             ? { ...b, status: decision === 'allow' ? ('allowed' as const) : ('denied' as const) }
             : b
         )
       }))
     } catch (e) {
+      const stillSubmitting = get().blocks.some((b) =>
+        b.id === blockId && b.kind === 'approval' && b.status === 'submitting'
+      )
+      if (!stillSubmitting) return
       const msg = formatRuntimeError(e)
       void window.kunGui.logError('approval', 'Failed to submit approval decision', {
         message: msg,
@@ -865,7 +1294,7 @@ export function createMaintenanceActions(
           ? { route: 'settings' as const, settingsSection: 'agents' as const }
           : {}),
         blocks: s.blocks.map((b) =>
-          b.id === blockId && b.kind === 'approval'
+          b.id === blockId && b.kind === 'approval' && b.status === 'submitting'
             ? { ...b, status: 'error' as const, errorMessage: msg }
             : b
         )
@@ -901,7 +1330,8 @@ export function createMaintenanceActions(
                 ...s.queuedMessages,
                 {
                   id: `q-${Date.now()}-${s.queuedMessages.length}`,
-                  text: followupText
+                  text: followupText,
+                  deliveryState: 'pending' as const
                 }
               ],
               blocks: s.blocks.map((b) =>
@@ -910,6 +1340,7 @@ export function createMaintenanceActions(
                   : b
               )
             }))
+            saveQueuedMessagesForThread(activeThreadId, get().queuedMessages)
             await p.interruptTurn(activeThreadId, currentTurnId)
             settleInterruptedTurn(set, get)
             void get().refreshThreads()
@@ -998,6 +1429,37 @@ export function createMaintenanceActions(
     // or a newer stream owns the subscription.
     if (get().activeThreadId === activeThreadId && sseAbortRef.current === null) {
       await get().recoverActiveTurn()
+    }
+  },
+
+  cancelToolCall: async (threadId, turnId, callId) => {
+    const normalizedThreadId = threadId.trim()
+    const normalizedTurnId = turnId.trim()
+    const normalizedCallId = callId.trim()
+    if (!normalizedThreadId || !normalizedTurnId || !normalizedCallId) return false
+    const p = getProvider()
+    if (typeof p.cancelToolCall !== 'function') {
+      set({ error: i18n.t('common:runtimeFeatureUnsupported') })
+      return false
+    }
+    try {
+      await p.cancelToolCall(normalizedThreadId, normalizedTurnId, normalizedCallId)
+      return true
+    } catch (e) {
+      const msg = formatRuntimeError(e)
+      void window.kunGui.logError('tool-cancel', 'Failed to cancel tool call', {
+        message: msg,
+        threadId: normalizedThreadId,
+        turnId: normalizedTurnId,
+        callId: normalizedCallId
+      }).catch(() => undefined)
+      set({
+        error: msg,
+        ...(shouldOpenSettingsForError(e)
+          ? { route: 'settings' as const, settingsSection: 'agents' as const }
+          : {})
+      })
+      return false
     }
   }
   }

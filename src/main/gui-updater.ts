@@ -2,7 +2,7 @@ import { app, autoUpdater as nativeAutoUpdater, BrowserWindow, dialog, shell } f
 import type { MessageBoxOptions } from 'electron'
 import { existsSync, readFileSync } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { dirname, join, win32 as win32Path } from 'node:path'
 import electronUpdater from 'electron-updater'
 import type { ProgressInfo, UpdateDownloadedEvent, UpdateInfo } from 'electron-updater'
 import type {
@@ -15,6 +15,7 @@ import type {
 } from '../shared/gui-update'
 import { nextGuiUpdateCheckDelay } from '../shared/gui-update-schedule'
 import { DEFAULT_GUI_UPDATE_CHANNEL, normalizeGuiUpdateChannel } from '../shared/gui-update'
+import type { AppLocale } from '../shared/app-locales'
 
 // R2 prefix 保持旧值:线上还在运行的 DeepSeek GUI 老版本轮询的
 // 就是 `deepseek-gui/channels/<channel>/latest/`,prefix 一改老客户端
@@ -25,9 +26,31 @@ const LEGACY_R2_PUBLIC_BASE_URL = 'https://deepseek-gui.com/api/r2'
 const DEFAULT_R2_RELEASE_PREFIX = 'deepseek-gui'
 const UPDATE_FEED_PROBE_TIMEOUT_MS = 5_000
 const { autoUpdater } = electronUpdater
+const DEVELOPMENT_APP_FLAVOR = process.env.KUN_APP_FLAVOR === 'development'
+const DEVELOPMENT_UPDATE_MESSAGE =
+  'kun-dv is a source/testing application and cannot use the production Kun update channel.'
+const WINDOWS_INSTALLER_UPDATE_SOURCE_ENV = 'KUN_INSTALLER_UPDATE_SOURCE'
 
 function envWithLegacyFallback(kunName: string, legacyName: string): string {
   return process.env[kunName]?.trim() || process.env[legacyName]?.trim() || ''
+}
+
+export function setWindowsInstallerUpdateSource(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+  executablePath: string = process.execPath
+): () => void {
+  if (platform !== 'win32') return () => undefined
+  const hadPrevious = Object.prototype.hasOwnProperty.call(env, WINDOWS_INSTALLER_UPDATE_SOURCE_ENV)
+  const previous = env[WINDOWS_INSTALLER_UPDATE_SOURCE_ENV]
+  env[WINDOWS_INSTALLER_UPDATE_SOURCE_ENV] = win32Path.dirname(executablePath)
+  return () => {
+    if (hadPrevious && previous !== undefined) {
+      env[WINDOWS_INSTALLER_UPDATE_SOURCE_ENV] = previous
+    } else {
+      delete env[WINDOWS_INSTALLER_UPDATE_SOURCE_ENV]
+    }
+  }
 }
 
 let initialized = false
@@ -41,16 +64,28 @@ let configuredChannel: GuiUpdateChannel = normalizeGuiUpdateChannel(
 )
 let configuredFeedUrl = ''
 let getSelectedChannel: (() => GuiUpdateChannel | Promise<GuiUpdateChannel>) | null = null
-let getSelectedLocale: (() => 'en' | 'zh' | Promise<'en' | 'zh'>) | null = null
+let getSelectedLocale: (() => AppLocale | Promise<AppLocale>) | null = null
 let beforeInstallUpdate: (() => void | Promise<void>) | null = null
 let beforeInstallUpdatePromise: Promise<void> | null = null
+let beforeInstallUpdatePrepared = false
+let setUpdateInstallQuitting: ((active: boolean) => void) | null = null
 let pendingVersionStateWrite: Promise<void> | null = null
 let backgroundCheckTimer: NodeJS.Timeout | null = null
 let backgroundCheckPromise: Promise<void> | null = null
+let updateInstallQuitting = false
+let installPromise: Promise<GuiUpdateInstallResult> | null = null
+let updateInstallHandoffPending = false
+let updateInstallHandoffStarted = false
+let updateInstallLaunchError: Error | null = null
+let updateInstallAttemptActive = false
+let updateInstallRecoveryNeeded = false
+let updateInstallRecoveryScheduled = false
+let restoreInstallerUpdateSourceAfterFailure: (() => void) | null = null
 
 const GUI_UPDATE_SCHEDULE_FILE = 'gui-update-schedule.json'
 const GUI_VERSION_STATE_FILE = 'gui-version-state.json'
-const DEFAULT_CHANGELOG_URL = 'https://deepseek-gui.com/changelog'
+const DEFAULT_CHANGELOG_DIRECTORY_URL = 'https://github.com/KunAgent/Kun/tree/master/release'
+const DEFAULT_CHANGELOG_FILE_BASE_URL = 'https://github.com/KunAgent/Kun/blob/master/release'
 
 type GuiVersionState = {
   lastSeenVersion?: string
@@ -165,8 +200,20 @@ async function writeGuiVersionState(state: GuiVersionState): Promise<void> {
   await writeFile(path, JSON.stringify(state, null, 2), 'utf8')
 }
 
-function changelogUrl(): string {
-  return envWithLegacyFallback('KUN_CHANGELOG_URL', 'DEEPSEEK_GUI_CHANGELOG_URL') || DEFAULT_CHANGELOG_URL
+function normalizeChangelogVersion(version: string): string {
+  const cleaned = version.trim().replace(/^v/i, '')
+  return /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(cleaned) ? `v${cleaned}` : ''
+}
+
+function changelogUrl(version?: string): string {
+  const normalizedVersion = normalizeChangelogVersion(version ?? '')
+  const configured = envWithLegacyFallback('KUN_CHANGELOG_URL', 'DEEPSEEK_GUI_CHANGELOG_URL')
+  if (configured) {
+    return normalizedVersion ? configured.replace(/\{version\}/g, normalizedVersion) : configured
+  }
+  return normalizedVersion
+    ? `${DEFAULT_CHANGELOG_FILE_BASE_URL}/release-${encodeURIComponent(normalizedVersion)}.md`
+    : DEFAULT_CHANGELOG_DIRECTORY_URL
 }
 
 function normalizeReleaseNotes(value: unknown): string | undefined {
@@ -391,16 +438,66 @@ function emitGuiUpdateState(state: GuiUpdateState): void {
 }
 
 function runBeforeInstallUpdate(): Promise<void> {
+  if (beforeInstallUpdatePrepared) return Promise.resolve()
   if (!beforeInstallUpdate) return Promise.resolve()
   if (!beforeInstallUpdatePromise) {
     beforeInstallUpdatePromise = Promise.resolve()
       .then(() => beforeInstallUpdate?.())
-      .then(() => undefined)
+      .then(() => {
+        beforeInstallUpdatePrepared = true
+      })
       .finally(() => {
         beforeInstallUpdatePromise = null
       })
   }
   return beforeInstallUpdatePromise
+}
+
+function markUpdateInstallQuitting(active: boolean): void {
+  if (updateInstallQuitting === active) return
+  updateInstallQuitting = active
+  setUpdateInstallQuitting?.(active)
+}
+
+function clearBeforeInstallUpdatePreparation(): void {
+  beforeInstallUpdatePrepared = false
+}
+
+function asError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error))
+}
+
+function relaunchAfterFailedUpdateInstall(): void {
+  try {
+    app.relaunch()
+    app.exit(0)
+  } catch (error) {
+    console.error('[kun-gui updater] failed to relaunch after update install failure:', error)
+  }
+}
+
+function resetFailedUpdateInstallState(): void {
+  restoreInstallerUpdateSourceAfterFailure?.()
+  restoreInstallerUpdateSourceAfterFailure = null
+  updateInstallAttemptActive = false
+  updateInstallHandoffPending = false
+  updateInstallHandoffStarted = false
+  updateInstallLaunchError = null
+  clearBeforeInstallUpdatePreparation()
+  markUpdateInstallQuitting(false)
+}
+
+function scheduleFailedUpdateInstallRecovery(): void {
+  updateInstallRecoveryNeeded = true
+  if (updateInstallRecoveryScheduled) return
+  updateInstallRecoveryScheduled = true
+  queueMicrotask(() => {
+    updateInstallRecoveryScheduled = false
+    if (!updateInstallRecoveryNeeded) return
+    updateInstallRecoveryNeeded = false
+    resetFailedUpdateInstallState()
+    relaunchAfterFailedUpdateInstall()
+  })
 }
 
 function clearBackgroundCheckTimer(): void {
@@ -460,6 +557,8 @@ function configureUpdaterChannel(channel: GuiUpdateChannel, feedUrl = updateFeed
   configuredChannel = normalized
   configuredFeedUrl = feedUrl
   autoUpdater.allowPrerelease = normalized === 'frontier'
+  // Switching from frontier to stable must never install an older build.
+  autoUpdater.allowDowngrade = false
   autoUpdater.setFeedURL({ provider: 'generic', url: feedUrl })
   if (!changed) return
   downloaded = false
@@ -473,6 +572,7 @@ async function configureReachableUpdaterChannel(channel: GuiUpdateChannel): Prom
 }
 
 export function setGuiUpdateChannel(channel: GuiUpdateChannel): void {
+  if (DEVELOPMENT_APP_FLAVOR) return
   configureUpdaterChannel(channel)
 }
 
@@ -544,14 +644,18 @@ export function initializeGuiUpdater(
   windowGetter: () => BrowserWindow | null,
   channelGetter?: () => GuiUpdateChannel | Promise<GuiUpdateChannel>,
   beforeInstall?: () => void | Promise<void>,
-  localeGetter?: () => 'en' | 'zh' | Promise<'en' | 'zh'>
+  localeGetter?: () => AppLocale | Promise<AppLocale>,
+  updateInstallQuittingSetter?: (active: boolean) => void
 ): void {
   getMainWindow = windowGetter
   getSelectedChannel = channelGetter ?? null
   beforeInstallUpdate = beforeInstall ?? null
   getSelectedLocale = localeGetter ?? null
+  setUpdateInstallQuitting = updateInstallQuittingSetter ?? null
   if (initialized) return
   initialized = true
+
+  if (DEVELOPMENT_APP_FLAVOR) return
 
   autoUpdater.autoDownload = false
   autoUpdater.autoInstallOnAppQuit = false
@@ -604,11 +708,33 @@ export function initializeGuiUpdater(
 
   autoUpdater.on('error', (error) => {
     const message = error instanceof Error ? error.message : String(error)
-    emitGuiUpdateState({ status: 'error', info: lastInfo ?? undefined, message, code: 'unknown' })
+    const installFailed = updateInstallAttemptActive
+    if (installFailed) {
+      updateInstallLaunchError = asError(error)
+      scheduleFailedUpdateInstallRecovery()
+    }
+    const downloadFailed = !installFailed && (downloadPromise !== null || lastState.status === 'downloading')
+    if (downloadFailed) {
+      downloaded = false
+      downloadPromise = null
+    }
+    emitGuiUpdateState({
+      status: 'error',
+      info: lastInfo ?? undefined,
+      message,
+      code: installFailed ? 'install_failed' : downloadFailed ? 'download_failed' : 'unknown'
+    })
   })
 
   nativeAutoUpdater?.on?.('before-quit-for-update', () => {
+    if (updateInstallHandoffPending) {
+      updateInstallHandoffStarted = true
+      updateInstallHandoffPending = false
+    }
+    markUpdateInstallQuitting(true)
     void runBeforeInstallUpdate().catch((error) => {
+      clearBeforeInstallUpdatePreparation()
+      markUpdateInstallQuitting(false)
       console.warn('[kun-gui updater] failed to stop runtimes before update quit:', error)
     })
   })
@@ -617,6 +743,9 @@ export function initializeGuiUpdater(
 }
 
 export async function showPostUpdateReleaseNotes(): Promise<void> {
+  if (DEVELOPMENT_APP_FLAVOR) return
+  if (!app.isPackaged) return
+
   const currentVersion = app.getVersion().trim()
   const state = await readGuiVersionState()
   if (!state.lastSeenVersion) {
@@ -624,6 +753,7 @@ export async function showPostUpdateReleaseNotes(): Promise<void> {
     return
   }
   if (state.lastSeenVersion === currentVersion) return
+  if (!isVersionGreater(currentVersion, state.lastSeenVersion)) return
 
   const pendingUpdate =
     state.pendingUpdate?.version === currentVersion ? state.pendingUpdate : undefined
@@ -651,7 +781,7 @@ export async function showPostUpdateReleaseNotes(): Promise<void> {
       ? await dialog.showMessageBox(window, options)
       : await dialog.showMessageBox(options)
   if (result.response === 0) {
-    await shell.openExternal(changelogUrl())
+    await shell.openExternal(changelogUrl(currentVersion))
   }
 }
 
@@ -661,6 +791,15 @@ export function getGuiUpdateState(): GuiUpdateState {
 
 export async function checkGuiUpdate(channel?: GuiUpdateChannel): Promise<GuiUpdateInfo> {
   const selectedChannel = await resolveUpdateChannel(channel)
+  if (DEVELOPMENT_APP_FLAVOR) {
+    return {
+      ok: false,
+      currentVersion: app.getVersion(),
+      channel: selectedChannel,
+      code: 'unsupported',
+      message: DEVELOPMENT_UPDATE_MESSAGE
+    }
+  }
   await configureReachableUpdaterChannel(selectedChannel)
 
   if (!macAutoUpdateAllowed()) {
@@ -694,6 +833,14 @@ export async function checkGuiUpdate(channel?: GuiUpdateChannel): Promise<GuiUpd
 
 export async function downloadGuiUpdate(channel?: GuiUpdateChannel): Promise<GuiUpdateDownloadResult> {
   const selectedChannel = await resolveUpdateChannel(channel)
+  if (DEVELOPMENT_APP_FLAVOR) {
+    return {
+      ok: false,
+      currentVersion: app.getVersion(),
+      code: 'unsupported',
+      message: DEVELOPMENT_UPDATE_MESSAGE
+    }
+  }
   await configureReachableUpdaterChannel(selectedChannel)
 
   if (!macAutoUpdateAllowed()) {
@@ -722,13 +869,17 @@ export async function downloadGuiUpdate(channel?: GuiUpdateChannel): Promise<Gui
     }
 
     if (!downloadPromise) {
-      downloadPromise = autoUpdater.downloadUpdate().finally(() => {
-        downloadPromise = null
+      let tracked: Promise<string[]>
+      tracked = autoUpdater.downloadUpdate().finally(() => {
+        if (downloadPromise === tracked) downloadPromise = null
       })
+      downloadPromise = tracked
     }
     const paths = await downloadPromise
     return { ok: true, paths }
   } catch (e) {
+    downloaded = false
+    downloadPromise = null
     const message = e instanceof Error ? e.message : String(e)
     emitGuiUpdateState({ status: 'error', info: lastInfo ?? undefined, message, code: 'download_failed' })
     return {
@@ -740,7 +891,35 @@ export async function downloadGuiUpdate(channel?: GuiUpdateChannel): Promise<Gui
   }
 }
 
-export async function installGuiUpdate(): Promise<GuiUpdateInstallResult> {
+export function installGuiUpdate(): Promise<GuiUpdateInstallResult> {
+  if (installPromise) return installPromise
+  if (updateInstallAttemptActive || updateInstallHandoffPending || updateInstallHandoffStarted) {
+    return Promise.resolve({ ok: true })
+  }
+  const operation = installGuiUpdateOnce()
+  installPromise = operation
+  void operation.then(
+    () => {
+      if (installPromise === operation) installPromise = null
+    },
+    () => {
+      if (installPromise === operation) installPromise = null
+    }
+  )
+  return operation
+}
+
+async function installGuiUpdateOnce(): Promise<GuiUpdateInstallResult> {
+  if (DEVELOPMENT_APP_FLAVOR) {
+    return {
+      ok: false,
+      currentVersion: app.getVersion(),
+      code: 'unsupported',
+      message: DEVELOPMENT_UPDATE_MESSAGE
+    }
+  }
+  let updateInstallQuitMarked = false
+  let restoreInstallerUpdateSource = (): void => undefined
   try {
     if (!downloaded) {
       return {
@@ -751,12 +930,40 @@ export async function installGuiUpdate(): Promise<GuiUpdateInstallResult> {
       }
     }
     emitGuiUpdateState({ status: 'installing', info: lastInfo ?? undefined })
+    markUpdateInstallQuitting(true)
+    updateInstallQuitMarked = true
     await Promise.all([pendingVersionStateWrite, runBeforeInstallUpdate()])
-    autoUpdater.quitAndInstall(false, true)
+    restoreInstallerUpdateSource = setWindowsInstallerUpdateSource()
+    restoreInstallerUpdateSourceAfterFailure = restoreInstallerUpdateSource
+    // In-app updates must stay silent on Windows. The assisted NSIS UI can
+    // surface its old-uninstaller retry dialog even though our overwrite
+    // fallback can safely continue; silent mode applies that dialog's default
+    // cancel action instead of asking the user to make the counter-intuitive
+    // choice. Manually launched installers remain interactive.
+    updateInstallLaunchError = null
+    updateInstallAttemptActive = true
+    updateInstallHandoffPending = true
+    updateInstallHandoffStarted = false
+    autoUpdater.quitAndInstall(true, true)
+    if (updateInstallLaunchError) throw updateInstallLaunchError
     return { ok: true }
   } catch (e) {
+    const relaunchRequired = updateInstallQuitMarked
+    restoreInstallerUpdateSource()
+    if (restoreInstallerUpdateSourceAfterFailure === restoreInstallerUpdateSource) {
+      restoreInstallerUpdateSourceAfterFailure = null
+    }
+    updateInstallAttemptActive = false
+    updateInstallHandoffPending = false
+    updateInstallHandoffStarted = false
+    updateInstallLaunchError = null
+    if (updateInstallQuitMarked) {
+      clearBeforeInstallUpdatePreparation()
+      markUpdateInstallQuitting(false)
+    }
     const message = e instanceof Error ? e.message : String(e)
     emitGuiUpdateState({ status: 'error', info: lastInfo ?? undefined, message, code: 'install_failed' })
+    if (relaunchRequired) scheduleFailedUpdateInstallRecovery()
     return {
       ok: false,
       currentVersion: app.getVersion(),

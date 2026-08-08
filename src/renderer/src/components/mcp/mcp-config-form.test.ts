@@ -77,6 +77,29 @@ describe('parseMcpConfigText', () => {
     expect(server.headers).toEqual([{ key: 'Authorization', value: 'Bearer x' }])
   })
 
+  it('parses workspace visibility roots separately from trust roots', () => {
+    const model = expectOk(
+      parseMcpConfigText(
+        JSON.stringify({
+          servers: {
+            codegraph: {
+              transport: 'streamable-http',
+              url: 'https://example.com/mcp',
+              workspaceRoots: ['/workspace/project-a'],
+              trustScope: 'workspace',
+              trustedWorkspaceRoots: ['/workspace'],
+              planModeReadOnlyTools: ['lookup', 'query_database']
+            }
+          }
+        })
+      )
+    )
+    const server = model.servers[0]
+    expect(server.workspaceRoots).toEqual(['/workspace/project-a'])
+    expect(server.trustedWorkspaceRoots).toEqual(['/workspace'])
+    expect(server.planModeReadOnlyTools).toEqual(['lookup', 'query_database'])
+  })
+
   it('accepts the Claude Desktop format: mcpServers + type:http', () => {
     const model = expectOk(
       parseMcpConfigText(
@@ -220,6 +243,26 @@ describe('serializeMcpConfig', () => {
       trustedWorkspaceRoots: ['/a', ' /b ', '']
     }
     expect(serializeMcpServer(server).trustedWorkspaceRoots).toEqual(['/a', '/b'])
+  })
+
+  it('serializes deduplicated host-approved Plan-mode read-only tools', () => {
+    const server: McpFormServer = {
+      ...createBlankMcpServer('stdio'),
+      name: 's',
+      command: 'run',
+      planModeReadOnlyTools: ['lookup', ' lookup ', '', 'query_database']
+    }
+    expect(serializeMcpServer(server).planModeReadOnlyTools).toEqual(['lookup', 'query_database'])
+  })
+
+  it('writes visibility roots when present', () => {
+    const server: McpFormServer = {
+      ...createBlankMcpServer('stdio'),
+      name: 's',
+      command: 'run',
+      workspaceRoots: ['/a', ' /b ', '']
+    }
+    expect(serializeMcpServer(server).workspaceRoots).toEqual(['/a', '/b'])
   })
 
   it('drops blank env/header rows on serialize', () => {

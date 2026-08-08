@@ -1,8 +1,16 @@
 import { lazy, Suspense, useEffect } from 'react'
+import { appWindowTitleForFlavor } from '@shared/app-environment'
 import { useChatStore } from './store/chat-store'
 import { supportsDesktopTitleBar, WindowsTitleBar } from './components/WindowsTitleBar'
 import { RuntimeStatusBanner } from './components/RuntimeStatusBanner'
 import i18n from './i18n'
+import { ExtensionWorkbenchLifecycle } from './extensions/ExtensionWorkbenchLifecycle'
+import { ProtectedRendererSurface } from './extensions/ProtectedRendererSurface'
+import { ExtensionSettingsServiceProvider } from './extensions/ExtensionSettingsServiceContext'
+import { RuntimeExtensionSettingsService } from './extensions/runtime-extension-settings-service'
+import { DataMigrationActivityIndicator } from './components/DataMigrationActivityIndicator'
+
+const extensionSettingsService = new RuntimeExtensionSettingsService()
 
 const Workbench = lazy(() =>
   import('./components/Workbench').then((module) => ({ default: module.Workbench }))
@@ -36,6 +44,7 @@ export default function AppShell(): React.ReactElement {
   const boot = useChatStore((s) => s.boot)
   const initialSetupOpen = useChatStore((s) => s.initialSetupOpen)
   const platform = typeof window !== 'undefined' ? window.kunGui?.platform ?? 'unknown' : 'unknown'
+  const appEnvironment = typeof window !== 'undefined' ? window.kunGui?.appEnvironment : undefined
   const hasDesktopTitleBar = supportsDesktopTitleBar(platform)
 
   useEffect(() => {
@@ -51,20 +60,43 @@ export default function AppShell(): React.ReactElement {
     }
   }, [boot])
 
+  useEffect(() => {
+    if (!appEnvironment?.flavor || typeof document === 'undefined') return
+    document.title = appWindowTitleForFlavor(appEnvironment.flavor)
+  }, [appEnvironment?.flavor])
+
   return (
-    <div className={hasDesktopTitleBar ? 'ds-windows-app-frame flex h-full min-h-0 flex-col bg-ds-main' : 'flex h-full min-h-0 flex-col bg-transparent'}>
-      {hasDesktopTitleBar ? <WindowsTitleBar platform={platform} /> : null}
-      <div className="flex min-h-0 flex-1 flex-col">
-        <RuntimeStatusBanner />
-        <Suspense fallback={<RouteFallback />}>
-          {route === 'settings' ? <SettingsView /> : <Workbench />}
-        </Suspense>
+    <ExtensionSettingsServiceProvider service={extensionSettingsService}>
+      <div className={hasDesktopTitleBar ? 'ds-windows-app-frame flex h-full min-h-0 flex-col bg-ds-main' : 'flex h-full min-h-0 flex-col bg-transparent'}>
+        {hasDesktopTitleBar ? <WindowsTitleBar platform={platform} /> : null}
+        <div className="flex min-h-0 flex-1 flex-col">
+          <RuntimeStatusBanner />
+          <DataMigrationActivityIndicator />
+          <Suspense fallback={<RouteFallback />}>
+            {route === 'settings' ? (
+              <ProtectedRendererSurface
+                kind="account-credentials"
+                restoreTarget="settings"
+                fallback={<RouteFallback />}
+              >
+                <SettingsView />
+              </ProtectedRendererSurface>
+            ) : <Workbench />}
+          </Suspense>
+        </div>
+        <ExtensionWorkbenchLifecycle />
+        {initialSetupOpen ? (
+          <ProtectedRendererSurface
+            kind="account-credentials"
+            restoreTarget="initial-setup"
+            fallback={null}
+          >
+            <Suspense fallback={null}>
+              <InitialSetupDialog />
+            </Suspense>
+          </ProtectedRendererSurface>
+        ) : null}
       </div>
-      {initialSetupOpen ? (
-        <Suspense fallback={null}>
-          <InitialSetupDialog />
-        </Suspense>
-      ) : null}
-    </div>
+    </ExtensionSettingsServiceProvider>
   )
 }

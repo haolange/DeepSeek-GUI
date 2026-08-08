@@ -2,6 +2,8 @@ import type {
   AttachmentReference,
   ChatBlock,
   NormalizedThread,
+  RequestContextSnapshot,
+  DelegatedRuntimeState,
   RuntimeConnectionStatus,
   ReviewTarget,
   ThreadGoal,
@@ -14,27 +16,41 @@ import type {
 } from '../agent/types'
 import type { KunRuntimeStatusPayload } from '@shared/kun-gui-api'
 import type {
+  AppLocale,
   ClawImAgentProfileV1,
   ClawImChannelV1,
   ClawImPlatformCredentialV1,
   ClawImProvider,
   ClawImSettingsV1,
-  ClawModel
+  ClawModel,
+  ModelReasoningEffort
 } from '@shared/app-settings'
 import type { ModelProviderModelGroup } from '@shared/kun-gui-api'
+import type { ComposerContextAttachment } from '@kun/extension-api'
+import type { ExtensionComposerContextEvent } from '@shared/extension-ipc'
 
 export type QueuedUserMessage = {
   id: string
   text: string
+  /** Pending items are visible; starting/in-flight items remain durable until the turn settles. */
+  deliveryState?: 'pending' | 'starting' | 'in_flight'
+  deliveryTurnId?: string
+  deliveryUserMessageItemId?: string
   displayText?: string
   mode?: string
+  orchestration?: 'direct' | 'graph'
   model?: string
   providerId?: string
+  accountId?: string
   modelLabel?: string
   reasoningEffort?: string
+  serviceTier?: 'priority'
+  /** Renderer-only guard that prevents a scoped send from falling back to another thread. */
+  expectedThreadId?: string
   attachmentIds?: string[]
   attachments?: AttachmentReference[]
   fileReferences?: UserFileReference[]
+  composerContexts?: ComposerContextAttachment[]
   /**
    * Optional GUI plan context forwarded to Kun. The renderer
    * attaches it for plan/refine turns so the runtime can advertise
@@ -49,6 +65,12 @@ export type QueuedUserMessage = {
     sourceRequest?: string
     title?: string
   }
+  guiDesignCanvas?: boolean
+  /** True only for the product Design surface; Code whiteboards leave this unset. */
+  guiDesignMode?: boolean
+  agentSurface?: 'code' | 'write' | 'design'
+  guiDesignArtifact?: GuiDesignArtifactMessageContext
+  writeContext?: WriteAssistantMessageContext
 }
 
 /**
@@ -65,29 +87,85 @@ export type GuiPlanMessageContext = {
   title?: string
 }
 
+export type GuiDesignArtifactMessageContext = {
+  kind: 'svg'
+  artifactId: string
+  relativePath: string
+}
+
+/** Renderer-only routing context that keeps a Write send bound to the file and
+ * conversation selected when the user submitted it. */
+export type WriteAssistantMessageContext = {
+  workspaceRoot: string
+  activeFilePath: string | null
+  documentEpoch: number
+  contentRevision: number
+  /** Filled after the first explicit ensure; queued sends keep this identity. */
+  threadId?: string
+}
+
 export type SendMessageOverrides = {
   queued?: QueuedUserMessage
   model?: string
   providerId?: string
+  accountId?: string
   modelLabel?: string
   reasoningEffort?: string
+  serviceTier?: 'priority'
+  /** Renderer-only guard that prevents Design/Write-style sends from changing thread identity. */
+  expectedThreadId?: string
   displayText?: string
+  orchestration?: 'direct' | 'graph'
   guiPlan?: GuiPlanMessageContext
+  guiDesignCanvas?: boolean
+  guiDesignMode?: boolean
+  agentSurface?: 'code' | 'write' | 'design'
+  guiDesignArtifact?: GuiDesignArtifactMessageContext
   attachmentIds?: string[]
   attachments?: AttachmentReference[]
   fileReferences?: UserFileReference[]
+  composerContexts?: ComposerContextAttachment[]
+  writeContext?: WriteAssistantMessageContext
+}
+
+export type ClearDesignHistoryOptions = {
+  /** Create and bind one empty replacement thread after the old history is gone. */
+  recreate?: boolean
+  /** Known provisional ids to clean even if the renderer registry write failed. */
+  includeThreadIds?: string[]
+}
+
+export type CreateDesignThreadOptions = {
+  /** Select the new thread and navigate to Design. Defaults to true. */
+  activate?: boolean
+  /** Keep the current route when creation fails during background maintenance. */
+  suppressSettingsRedirect?: boolean
+}
+
+export type ClearDesignHistoryResult = {
+  /** True only when no runtime thread or local chat mirror remains to retry. */
+  cleared: boolean
+  deletedThreadIds: string[]
+  retainedThreadIds: string[]
+  recreatedThreadId: string | null
 }
 
 export type InitialSetupMode = 'required' | 'preview'
 export type SettingsRouteSection =
   | 'general'
   | 'providers'
+  | 'extensions'
   | 'write'
+  | 'design'
   | 'imageGeneration'
   | 'mediaGeneration'
   | 'speechToText'
   | 'agents'
+  | 'laboratory'
+  | 'subagents'
   | 'archives'
+  | 'worktree'
+  | 'memory'
   | 'permissions'
   | 'skill'
   | 'mcp'
@@ -96,7 +174,10 @@ export type SettingsRouteSection =
   | 'claw'
   | 'updates'
   | 'terminal'
-export type AppRoute = 'chat' | 'write' | 'settings' | 'plugins' | 'claw' | 'schedule' | 'workflow'
+  | 'debug'
+  | 'storage'
+  | 'dataMigration'
+export type AppRoute = 'chat' | 'write' | 'design' | 'settings' | 'plugins' | 'extensions' | 'claw' | 'schedule' | 'workflow'
 export type PluginHostRoute = 'chat' | 'claw'
 
 /**
@@ -118,19 +199,44 @@ export type SideConversation = {
   blocks: ChatBlock[]
   liveReasoning: string
   liveAssistant: string
+  /** Stable runtime identity for the current compatibility live overlays. */
+  liveReasoningItemId?: string
+  liveReasoningTurnId?: string
+  liveReasoningCreatedAt?: string
+  liveAssistantItemId?: string
+  liveAssistantTurnId?: string
+  liveAssistantCreatedAt?: string
   lastSeq: number
   input: string
   model: string
+  /** Provider paired with `model`; kept local to this side conversation. */
+  providerId: string
   reasoningEffort: string
+  /** User preference; effective only when this branch selects an eligible Codex model. */
+  fastMode: boolean
+  attachments: AttachmentReference[]
   busy: boolean
   turnId: string | null
   userItemId: string | null
   error: string | null
 }
 
+export type TurnTimingMetrics = {
+  avgTtftMs: number | null
+  avgTokensPerSecond: number | null
+}
+
 export type SidePanelState = {
   open: boolean
   activeSideId: string | null
+}
+
+export type SideConversationDraftOptions = {
+  model?: string
+  providerId?: string
+  reasoningEffort?: string
+  fastMode?: boolean
+  attachments?: AttachmentReference[]
 }
 
 export type ChatState = {
@@ -142,6 +248,8 @@ export type ChatState = {
   initialSetupMode: InitialSetupMode
   workspaceRoot: string
   workspaceLabel: string
+  /** 对话会话的工作目录根(默认 ~/Documents/Kun),供侧边栏对话区块和项目保护使用。 */
+  conversationWorkspaceRoot: string
   runtimeConnection: RuntimeConnectionStatus
   runtimeStatus: KunRuntimeStatusPayload | null
   codeWorkspaceRoots: string[]
@@ -149,6 +257,10 @@ export type ChatState = {
   threadSearch: string
   showArchivedThreads: boolean
   activeThreadId: string | null
+  /** Thread selected immediately but whose durable snapshot is still loading. */
+  threadLoadingId: string | null
+  /** 最近一次在 Code 工作台(chat 路由)选中的会话,供从设置/其他工作区/Connect Phone 返回时恢复。 */
+  lastCodeThreadId: string | null
   /** Relationship of the active thread (e.g. `side` for a subagent's own session). */
   activeThreadRelation: 'primary' | 'fork' | 'side' | null
   /** Parent thread of the active thread, when it is a `side`/`fork` branch. */
@@ -158,18 +270,49 @@ export type ChatState = {
   blocks: ChatBlock[]
   liveReasoning: string
   liveAssistant: string
+  /** Stable runtime identity for the current compatibility live overlays. */
+  liveReasoningItemId?: string
+  liveReasoningTurnId?: string
+  liveReasoningCreatedAt?: string
+  liveAssistantItemId?: string
+  liveAssistantTurnId?: string
+  liveAssistantCreatedAt?: string
   lastSeq: number
-  usageRefreshKey: number
   /**
-   * Latest turn's usage snapshot, tagged with the thread it belongs to. Used by
-   * the context-capacity gauge: the last turn's prompt tokens ≈ what currently
-   * occupies the window. Null until a live turn reports usage.
+   * Highest delta `seq` (per-thread, monotonic) already folded into the live
+   * buffers. Unlike the per-sink `appliedDeltaSeqFloor` closure — which only
+   * dedups within ONE subscription — this lives in the store and is shared
+   * across every sink. When a long, tool-heavy turn loses its SSE stream and
+   * more than one sink is briefly live (recovery / re-subscribe), the per-sink
+   * floors are independent and each re-appends the same replayed deltas; the
+   * shared floor serializes them so a given seq folds into `liveAssistant` at
+   * most once. Reset to the new subscription's `sinceSeq` in lockstep with
+   * every `liveAssistant` reset (send / select / recover / live / clear) — and
+   * because seqs are per-thread, the reset is what keeps a thread switch from
+   * dropping the new thread's low seqs. A genuine new delta always has seq >
+   * sinceSeq, so this never drops live text.
+   */
+  liveDeltaSeqFloor: number
+  usageRefreshKey: number
+  /** Latest main-agent request context snapshot, tagged with its owning thread. */
+  lastContextSnapshot: RequestContextSnapshot | null
+  /** Latest truthful optional-capability snapshot for the active delegated route. */
+  lastDelegatedRuntimeState: DelegatedRuntimeState | null
+  /**
+   * Latest cumulative usage snapshot, tagged with the thread it belongs to.
+   * This is billing/cache telemetry and must not be used as context occupancy.
    */
   lastTurnUsage: { threadId: string; snapshot: ThreadUsageSnapshot } | null
+  /**
+   * Per-turn TTFT/TPS averages for the active thread, keyed by turnId. Bounded
+   * to the turns currently visible in the timeline; cleared on thread switch.
+   */
+  turnTimingMetrics: Map<string, TurnTimingMetrics>
   busy: boolean
   error: string | null
   runtimeErrorDetail: string | null
   currentTurnId: string | null
+  currentTurnOrchestration: 'direct' | 'graph' | null
   currentTurnUserId: string | null
   turnStartedAtByUserId: Record<string, number>
   turnDurationByUserId: Record<string, number>
@@ -177,8 +320,13 @@ export type ChatState = {
   turnReasoningLastAtByUserId: Record<string, number>
   inspectorSelectedId: string | null
   composerMode: 'plan' | 'agent'
+  composerOrchestration: 'direct' | 'graph'
+  graphEnabled: boolean
   composerModel: string
   composerProviderId: string
+  composerReasoningEffort: ModelReasoningEffort
+  /** User preference; effective only for eligible ChatGPT subscription models. */
+  composerFastMode: boolean
   composerPickList: string[]
   composerModelGroups: ModelProviderModelGroup[]
   /**
@@ -188,6 +336,8 @@ export type ChatState = {
   composerAgentId: string
   disabledSkillIds: string[]
   queuedMessages: QueuedUserMessage[]
+  /** Host-authenticated, workspace-scoped context awaiting one main-chat turn. */
+  extensionComposerContexts: ExtensionComposerContextEvent[]
   watchTurnCompletion: Record<string, boolean>
   unreadThreadIds: Record<string, boolean>
   /**
@@ -201,20 +351,38 @@ export type ChatState = {
   appendLocalClawTurn: (userText: string, replyText: string) => void
   setError: (message: string | null) => void
   setComposerMode: (mode: 'plan' | 'agent') => void
+  setComposerOrchestration: (mode: 'direct' | 'graph') => void
   setComposerModel: (modelId: string, providerId?: string) => void
+  setComposerReasoningEffort: (effort: ModelReasoningEffort) => void
+  setComposerFastMode: (enabled: boolean) => void
   setComposerAgentId: (agentId: string) => void
   loadComposerModels: () => Promise<void>
   setRoute: (r: AppRoute) => void
   openWrite: () => Promise<void>
   openCode: () => Promise<void>
-  ensureWriteThreadForWorkspace: (workspaceRoot?: string) => Promise<string | null>
-  createWriteThread: (workspaceRoot?: string) => Promise<string | null>
+  ensureWriteThreadForWorkspace: (workspaceRoot?: string, activeFilePath?: string) => Promise<string | null>
+  createWriteThread: (workspaceRoot?: string, activeFilePath?: string) => Promise<string | null>
+  ensureDesignThreadForWorkspace: (workspaceRoot?: string, docId?: string) => Promise<string | null>
+  createDesignThread: (
+    workspaceRoot?: string,
+    docId?: string,
+    options?: CreateDesignThreadOptions
+  ) => Promise<string | null>
+  clearDesignHistory: (
+    workspaceRoot: string,
+    docId: string,
+    options?: ClearDesignHistoryOptions
+  ) => Promise<ClearDesignHistoryResult>
   selectWriteThread: (threadId: string, workspaceRoot?: string) => Promise<void>
   openSettings: (section?: SettingsRouteSection) => void
+  /** 离开设置页:直接把 route 恢复为进入设置前的工作台路由,不经过会重新解析/切换会话的 open* 入口。 */
+  closeSettings: () => void
   openPlugins: (host?: PluginHostRoute) => void
   openClaw: () => void
   openSchedule: () => void
   openWorkflow: () => void
+  openDesign: () => void
+  clearActiveThreadSelection: () => void
   refreshClawChannels: () => Promise<void>
   addClawChannel: (
     provider: ClawImProvider,
@@ -233,7 +401,7 @@ export type ChatState = {
   selectClawConversation: (channelId: string, threadId: string) => Promise<void>
   deleteClawChannel: (channelId: string) => Promise<void>
   resetClawChannelSession: (channelId: string) => Promise<void>
-  setClawChannelModel: (channelId: string, model: string) => Promise<void>
+  setClawChannelModel: (channelId: string, model: string, providerId?: string) => Promise<void>
   openInitialSetup: (mode?: InitialSetupMode) => void
   closeInitialSetup: () => void
   boot: () => Promise<void>
@@ -257,7 +425,13 @@ export type ChatState = {
      * providerId / model / systemPrompt are snapshotted onto the thread.
      */
     agentId?: string
-  }) => Promise<void>
+    /**
+     * 创建一条不绑定项目文件夹的对话会话:在 conversationWorkspaceRoot 下
+     * 自动创建一个时间戳子目录作为工作目录。
+     */
+    conversation?: boolean
+  }) => Promise<string | null>
+  createConversation: () => Promise<void>
   selectThread: (id: string) => Promise<void>
   /**
    * 打开 SSE 订阅一条 thread(不预先拉 getThreadDetail)。
@@ -271,9 +445,18 @@ export type ChatState = {
   reviewActiveThread: (target: ReviewTarget) => Promise<boolean>
   drainQueuedMessages: () => Promise<void>
   removeQueuedMessage: (id: string) => void
+  reorderQueuedMessage: (
+    id: string,
+    targetId: string,
+    position: 'before' | 'after'
+  ) => void
+  guideQueuedMessage: (id: string) => Promise<boolean>
+  attachExtensionComposerContext: (event: ExtensionComposerContextEvent) => void
+  removeExtensionComposerContext: (attachmentId: string) => void
   rewindAndResend: (userBlockId: string, newText: string) => Promise<void>
   rollbackWorkspaceToCheckpoint: (checkpointId: string) => Promise<void>
   interrupt: (options?: { discard?: boolean }) => Promise<void>
+  cancelToolCall: (threadId: string, turnId: string, callId: string) => Promise<boolean>
   renameActiveThread: (title: string) => Promise<void>
   renameThread: (threadId: string, title: string) => Promise<void>
   pinThread: (threadId: string, pinned: boolean) => Promise<void>
@@ -295,7 +478,10 @@ export type ChatState = {
    * while the active thread is running. Does not change `activeThreadId`.
    * If `seedText` is provided, immediately sends it as the first turn.
    */
-  spawnSideConversation: (seedText?: string) => Promise<string | null>
+  spawnSideConversation: (
+    seedText?: string,
+    options?: SideConversationDraftOptions
+  ) => Promise<string | null>
   /**
    * Open the side chat surface without creating an underlying side
    * thread. The first draft send will create the side thread.
@@ -303,9 +489,16 @@ export type ChatState = {
   openSideConversationDraft: () => void
   sendSideMessage: (sideId: string, text: string) => Promise<boolean>
   interruptSide: (sideId: string) => Promise<void>
+  resolveSideUserInput: (
+    sideId: string,
+    blockId: string,
+    action: { kind: 'submit'; answers: UserInputAnswer[] } | { kind: 'cancel' }
+  ) => Promise<void>
   setSideInput: (sideId: string, text: string) => void
-  setSideModel: (sideId: string, model: string) => void
+  setSideModel: (sideId: string, model: string, providerId?: string) => void
   setSideReasoningEffort: (sideId: string, effort: string) => void
+  setSideFastMode: (sideId: string, enabled: boolean) => void
+  setSideAttachments: (sideId: string, attachments: AttachmentReference[]) => void
   selectSideConversation: (sideId: string) => void
   setSidePanelOpen: (open: boolean) => void
   closeSideConversation: (sideId: string) => Promise<void>
@@ -322,7 +515,7 @@ export type ChatState = {
     action: { kind: 'submit'; answers: UserInputAnswer[] } | { kind: 'cancel' }
   ) => Promise<void>
   selectInspectorItem: (id: string | null) => void
-  applyI18nFromSettings: (locale: 'en' | 'zh') => Promise<void>
+  applyI18nFromSettings: (locale: AppLocale) => Promise<void>
   reloadUiSettings: () => Promise<void>
 }
 

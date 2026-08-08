@@ -2,8 +2,8 @@
 
 本文记录 Kun 运行时当前的缓存优化设计、实现位置、
 统计口径与后续演进方向。目标不是单纯“让缓存数字变高”，而是让 GUI 与
-本地 agent 的请求前缀长期稳定、可验证、可观测，并且在 Code / Write /
-连接手机三条主路径下都成立。
+本地 agent 的请求前缀长期稳定、可验证、可观测，并且在 Code / Design /
+Write / 连接手机四条主路径下都成立。
 
 ## 目标
 
@@ -146,11 +146,8 @@ Kun 也会在模型请求边界做一层共享的 history hygiene：
 - `kun/src/loop/request-history-hygiene.ts`
 - `kun/src/loop/agent-loop.ts`
 
-同一 turn 内还会启用 repeat-loop guard：
-
-- 第三次完全相同的 `(toolName, arguments)` 会被抑制。
-- Kun 会写入一个 error `tool_result`，让模型收敛到更窄的查询或解释原因。
-- 文件变更类工具会清掉之前的只读调用记录，避免“编辑后复读”被误判。
+同一 turn 内不再抑制重复的相同工具调用：模型可以按需重试同一参数的工具，
+失败原因通过 error `tool_result` 返回给模型自行收敛。
 
 连续的内置只读工具调用会做保守并发：
 
@@ -162,8 +159,8 @@ Kun 也会在模型请求边界做一层共享的 history hygiene：
 
 实现位置：
 
-- `kun/src/loop/tool-storm-breaker.ts`
-- `kun/src/loop/agent-loop.ts`
+- `kun/src/loop/tool-dispatch-policy.ts`
+- `kun/src/loop/tool-call-dispatcher.ts`
 
 Fork / resume 创建新线程时也会修复克隆历史：
 
@@ -314,7 +311,7 @@ GUI 不应该做：
 - 猜测缓存命中率公式
 - 为了显示效果临时修正 usage 统计
 
-这样 Code / Write / 连接手机三个入口才能共享同一套缓存纪律。
+这样 Code / Design / Write / 连接手机四个入口才能共享同一套缓存纪律。
 
 ## 当前已借鉴与未完成项
 

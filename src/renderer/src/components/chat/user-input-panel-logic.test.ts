@@ -1,17 +1,26 @@
 import { describe, expect, it } from 'vitest'
-import type { UserInputQuestion } from '../../agent/types'
+import type { ChatBlock, UserInputQuestion } from '../../agent/types'
 import {
   USER_INPUT_FREEFORM_LABEL,
   USER_INPUT_OTHER_LABEL,
   allAnswered,
+  answerDisplayValues,
   answerFromOption,
+  answerFromOptions,
   answerFromTypedText,
   answersByQuestionId,
+  isMultipleChoiceQuestion,
+  isLivePendingUserInput,
   isQuestionAnswered,
   nextUnansweredIndex,
   optionsNeedRows,
   orderedAnswers,
-  shouldShowQuestionHeader
+  questionMaxSelections,
+  questionMinSelections,
+  selectLivePendingUserInput,
+  selectedOptionValues,
+  shouldShowQuestionHeader,
+  toggleOptionAnswer
 } from './user-input-panel-logic'
 
 const optionQuestion: UserInputQuestion = {
@@ -31,6 +40,57 @@ const freeformQuestion: UserInputQuestion = {
   options: []
 }
 
+const multiQuestion: UserInputQuestion = {
+  id: 'requirements',
+  header: 'Requirements',
+  question: 'Pick requirements',
+  selectionMode: 'multiple',
+  minSelections: 2,
+  maxSelections: 2,
+  options: [
+    { label: 'Keep ratio', description: '' },
+    { label: 'App icon', description: '' },
+    { label: 'Redesign outline', description: '' }
+  ]
+}
+
+function userInputBlock(overrides: Partial<Extract<ChatBlock, { kind: 'user_input' }>>): ChatBlock {
+  return {
+    kind: 'user_input',
+    id: overrides.id ?? 'ui_1',
+    requestId: overrides.requestId ?? 'in_1',
+    questions: overrides.questions ?? [optionQuestion],
+    status: overrides.status ?? 'pending',
+    ...overrides
+  }
+}
+
+describe('selectLivePendingUserInput', () => {
+  it('surfaces a live pending request', () => {
+    const block = userInputBlock({ status: 'pending', live: true })
+    expect(isLivePendingUserInput(block as Extract<ChatBlock, { kind: 'user_input' }>)).toBe(true)
+    expect(selectLivePendingUserInput([block])).toBe(block)
+  })
+
+  it('ignores a stale pending request rehydrated from history (issue #606)', () => {
+    // No `live` flag — this is exactly the block a finished thread replays.
+    const stale = userInputBlock({ status: 'pending' })
+    expect(isLivePendingUserInput(stale as Extract<ChatBlock, { kind: 'user_input' }>)).toBe(false)
+    expect(selectLivePendingUserInput([stale])).toBeNull()
+  })
+
+  it('ignores resolved requests even when marked live', () => {
+    const submitted = userInputBlock({ status: 'submitted', live: true })
+    expect(selectLivePendingUserInput([submitted])).toBeNull()
+  })
+
+  it('returns the latest live pending block when several exist', () => {
+    const older = userInputBlock({ id: 'ui_old', requestId: 'in_old', status: 'pending', live: true })
+    const newer = userInputBlock({ id: 'ui_new', requestId: 'in_new', status: 'pending', live: true })
+    expect(selectLivePendingUserInput([older, newer])).toBe(newer)
+  })
+})
+
 describe('answerFromOption', () => {
   it('uses the option label as both label and value', () => {
     expect(answerFromOption(optionQuestion, optionQuestion.options[0])).toEqual({
@@ -38,6 +98,49 @@ describe('answerFromOption', () => {
       label: 'PostgreSQL',
       value: 'PostgreSQL'
     })
+  })
+})
+
+describe('multi-select answers', () => {
+  it('builds a compatible joined answer with structured values', () => {
+    expect(answerFromOptions(multiQuestion, multiQuestion.options.slice(0, 2))).toEqual({
+      id: 'requirements',
+      label: 'Keep ratio, App icon',
+      value: 'Keep ratio, App icon',
+      labels: ['Keep ratio', 'App icon'],
+      values: ['Keep ratio', 'App icon']
+    })
+  })
+
+  it('toggles selected options in question order', () => {
+    const first = toggleOptionAnswer(multiQuestion, undefined, multiQuestion.options[1])
+    const second = toggleOptionAnswer(multiQuestion, first ?? undefined, multiQuestion.options[0])
+    expect(selectedOptionValues(second ?? undefined)).toEqual(['Keep ratio', 'App icon'])
+    expect(toggleOptionAnswer(multiQuestion, second ?? undefined, multiQuestion.options[0])).toEqual({
+      id: 'requirements',
+      label: 'App icon',
+      value: 'App icon',
+      labels: ['App icon'],
+      values: ['App icon']
+    })
+  })
+
+  it('enforces min and max selections', () => {
+    const one = answerFromOptions(multiQuestion, [multiQuestion.options[0]])
+    const two = answerFromOptions(multiQuestion, multiQuestion.options.slice(0, 2))
+    expect(isMultipleChoiceQuestion(multiQuestion)).toBe(true)
+    expect(questionMinSelections(multiQuestion)).toBe(2)
+    expect(questionMaxSelections(multiQuestion)).toBe(2)
+    expect(isQuestionAnswered(multiQuestion, one)).toBe(false)
+    expect(isQuestionAnswered(multiQuestion, two)).toBe(true)
+  })
+
+  it('uses display values for multi-select and legacy answers', () => {
+    expect(answerDisplayValues(answerFromOptions(multiQuestion, multiQuestion.options.slice(0, 2)))).toEqual([
+      'Keep ratio',
+      'App icon'
+    ])
+    expect(answerDisplayValues({ id: 'db', label: 'PostgreSQL', value: 'PostgreSQL' })).toEqual(['PostgreSQL'])
   })
 })
 

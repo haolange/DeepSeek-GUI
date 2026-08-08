@@ -1,10 +1,21 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { EventEmitter } from 'node:events'
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  writeFileSync
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   mergeScheduleSettings,
   defaultClawSettings,
+  defaultDesignSettings,
   defaultKeyboardShortcuts,
   defaultKunRuntimeSettings,
   defaultModelProviderSettings,
@@ -12,23 +23,107 @@ import {
   defaultWorkflowSettings,
   defaultWriteSettings,
   defaultTerminalSettings,
+  mergeKunRuntimeSettings,
   type AppSettingsPatch,
   type AppSettingsV1
 } from '../../shared/app-settings'
+import { registerAppIpcHandlers } from './register-app-ipc-handlers'
+import {
+  ApprovalConsentVerifier,
+  KUN_APPROVAL_CONSENT_HEADER
+} from '../../../kun/src/server/approval-consent.js'
 
-const handlers = new Map<string, (event: unknown, payload?: unknown) => Promise<unknown>>()
+const handlers = new Map<string, (...args: unknown[]) => Promise<unknown>>()
+
+function createGate(): { promise: Promise<void>; release: () => void } {
+  let release!: () => void
+  const promise = new Promise<void>((resolve) => { release = resolve })
+  return { promise, release }
+}
+
+const electronMock = vi.hoisted(() => ({
+  showMessageBox: vi.fn(),
+  openPath: vi.fn(async () => ''),
+  showItemInFolder: vi.fn(),
+  userDataPath: '/tmp/kun-user-data'
+}))
+const uiPluginMocks = vi.hoisted(() => ({
+  ensureBundledUiPlugins: vi.fn(async () => undefined),
+  installUiPluginFromDirectory: vi.fn(),
+  listUiPlugins: vi.fn(),
+  loadUiPluginFigures: vi.fn(),
+  removeUiPlugin: vi.fn(),
+  activate: vi.fn(async (_pluginId: string, _css: string) => undefined),
+  deactivate: vi.fn(async () => undefined)
+}))
+const protectedProviderMocks = vi.hoisted(() => ({
+  probeClaudeSubscription: vi.fn(async () => ({ ok: true as const, latencyMs: 1 })),
+  fetchSdkModels: vi.fn(async () => ['claude-model']),
+  discoverCursorSubscription: vi.fn(async () => ({
+    account: { apiKeyName: 'registry-key' },
+    models: [{ id: 'cursor-model', displayName: 'Cursor Model' }]
+  }))
+}))
 
 vi.mock('electron', () => ({
   app: {
-    quit: vi.fn()
+    quit: vi.fn(),
+    getPath: vi.fn(() => electronMock.userDataPath),
+    getAppPath: vi.fn(() => '/tmp/kun-app'),
+    isPackaged: false
   },
-  dialog: {},
-  shell: {},
+  dialog: { showMessageBox: electronMock.showMessageBox },
+  shell: {
+    openPath: electronMock.openPath,
+    showItemInFolder: electronMock.showItemInFolder
+  },
   ipcMain: {
     handle: vi.fn((channel: string, handler: (event: unknown, payload?: unknown) => Promise<unknown>) => {
       handlers.set(channel, handler)
     })
   }
+}))
+
+vi.mock('../services/ui-plugin-service', () => ({
+  installUiPluginFromDirectory: uiPluginMocks.installUiPluginFromDirectory,
+  listUiPlugins: uiPluginMocks.listUiPlugins,
+  loadUiPluginFigures: uiPluginMocks.loadUiPluginFigures,
+  removeUiPlugin: uiPluginMocks.removeUiPlugin
+}))
+
+vi.mock('../ui-plugin-bundled', () => ({
+  ensureBundledUiPlugins: uiPluginMocks.ensureBundledUiPlugins
+}))
+
+vi.mock('../services/ui-plugin-cdp-theme-controller', () => ({
+  UiPluginCdpThemeController: class {
+    activePluginId: string | null = null
+
+    async activate(pluginId: string, css: string): Promise<void> {
+      await uiPluginMocks.activate(pluginId, css)
+      this.activePluginId = pluginId
+    }
+
+    async deactivate(): Promise<void> {
+      await uiPluginMocks.deactivate()
+      this.activePluginId = null
+    }
+  }
+}))
+
+vi.mock('../claude-subscription-auth', async () => ({
+  ...await vi.importActual<typeof import('../claude-subscription-auth')>('../claude-subscription-auth'),
+  probeClaudeSubscription: protectedProviderMocks.probeClaudeSubscription
+}))
+
+vi.mock('../claude-subscription-models', async () => ({
+  ...await vi.importActual<typeof import('../claude-subscription-models')>('../claude-subscription-models'),
+  fetchSdkModels: protectedProviderMocks.fetchSdkModels
+}))
+
+vi.mock('../cursor-subscription-models', async () => ({
+  ...await vi.importActual<typeof import('../cursor-subscription-models')>('../cursor-subscription-models'),
+  discoverCursorSubscription: protectedProviderMocks.discoverCursorSubscription
 }))
 
 function settings(): AppSettingsV1 {
@@ -37,13 +132,16 @@ function settings(): AppSettingsV1 {
     locale: 'en',
     theme: 'system',
     uiFontScale: 0.82,
+    chatContentMaxWidthPx: 896,
+    composerSendKey: 'enter',
     provider: defaultModelProviderSettings(),
     agents: {
       kun: defaultKunRuntimeSettings()
     },
     workspaceRoot: '/tmp/workspace',
+    conversationWorkspaceRoot: '~/Documents/Kun',
     log: { enabled: false, retentionDays: 7 },
-    checkpointCleanup: { enabled: false, intervalDays: 3 },
+    checkpointCleanup: { createEnabled: false, enabled: false, intervalDays: 3 },
     notifications: { turnComplete: true },
     appBehavior: { openAtLogin: false, startMinimized: false, closeToTray: false },
     keyboardShortcuts: defaultKeyboardShortcuts(),
@@ -51,11 +149,98 @@ function settings(): AppSettingsV1 {
     claw: defaultClawSettings(),
     schedule: defaultScheduleSettings(),
     workflow: defaultWorkflowSettings(),
+    design: defaultDesignSettings(),
     terminal: defaultTerminalSettings(),
     guiUpdate: { channel: 'stable' },
     codePromptPrefix: '',
     disabledSkillIds: []
   }
+}
+
+function settingsWithProtectedSubscriptionCredentials(): AppSettingsV1 {
+  const current = settings()
+  const defaultProfile = current.provider.providers[0]!
+  return {
+    ...current,
+    provider: {
+      ...current.provider,
+      providers: [
+        defaultProfile,
+        {
+          ...defaultProfile,
+          id: 'claude-subscription',
+          name: 'Claude subscription',
+          kind: 'agent-sdk',
+          apiKey: 'registry-claude-secret'
+        },
+        {
+          ...defaultProfile,
+          id: 'cursor-subscription',
+          name: 'Cursor subscription',
+          kind: 'cursor-sdk',
+          apiKey: 'registry-cursor-secret'
+        }
+      ]
+    }
+  }
+}
+
+function settingsWithPlaintextModelCredentials(): AppSettingsV1 {
+  const current = settings()
+  return {
+    ...current,
+    provider: {
+      ...current.provider,
+      apiKey: 'legacy-provider-secret',
+      providers: current.provider.providers.map((provider, index) => ({
+        ...provider,
+        apiKey: `provider-secret-${index}`
+      }))
+    },
+    agents: {
+      ...current.agents,
+      kun: {
+        ...current.agents.kun,
+        apiKey: 'runtime-model-secret',
+        runtimeToken: 'runtime-auth-token',
+        imageGeneration: {
+          ...current.agents.kun.imageGeneration,
+          apiKey: 'image-secret'
+        },
+        speechToText: {
+          ...current.agents.kun.speechToText,
+          apiKey: 'speech-to-text-secret'
+        },
+        textToSpeech: {
+          ...current.agents.kun.textToSpeech,
+          apiKey: 'text-to-speech-secret'
+        },
+        musicGeneration: {
+          ...current.agents.kun.musicGeneration,
+          apiKey: 'music-secret'
+        },
+        videoGeneration: {
+          ...current.agents.kun.videoGeneration,
+          apiKey: 'video-secret'
+        }
+      }
+    }
+  }
+}
+
+function expectRendererModelCredentialsRedacted(value: unknown): void {
+  const projected = value as AppSettingsV1
+  expect(projected.provider.apiKey).toBe('')
+  expect(projected.provider.providers.every((provider) => provider.apiKey === '')).toBe(true)
+  expect(projected.agents.kun.apiKey).toBe('')
+  // These custom capability secrets have not migrated to Registry ownership;
+  // preserving them avoids erasing the key on an adjacent settings edit.
+  expect(projected.agents.kun.imageGeneration.apiKey).toBe('image-secret')
+  expect(projected.agents.kun.speechToText.apiKey).toBe('speech-to-text-secret')
+  expect(projected.agents.kun.textToSpeech.apiKey).toBe('text-to-speech-secret')
+  expect(projected.agents.kun.musicGeneration.apiKey).toBe('music-secret')
+  expect(projected.agents.kun.videoGeneration.apiKey).toBe('video-secret')
+  expect(projected.agents.kun.runtimeToken).toBe('runtime-auth-token')
 }
 
 function registerOptions(overrides: Partial<Parameters<typeof import('./register-app-ipc-handlers').registerAppIpcHandlers>[0]> = {}) {
@@ -66,11 +251,26 @@ function registerOptions(overrides: Partial<Parameters<typeof import('./register
     getMainWindow: () => null,
     applySettingsPatch,
     saveSettingsPatch,
+    resetUnreadableCredentials: vi.fn(async () => ({
+      reset: true as const,
+      backupPath: '/tmp/credential-recovery',
+      movedItems: ['secret.key']
+    })),
     runtimeRequest: vi.fn() as never,
+    acquireRuntimeRequestLease: vi.fn(async () => ({
+      runtimeToken: 'runtime-auth-token',
+      request: vi.fn(async () => ({ ok: true, status: 200, body: '{}' }))
+    })),
+    getRuntimeSettingsSyncStatus: () => ({
+      state: 'idle' as const,
+      generation: 0,
+      at: '2026-07-22T00:00:00.000Z'
+    }),
     restartRuntime: vi.fn(async () => undefined),
     fetchUpstreamModels: vi.fn() as never,
     getClawRuntime: () => null,
     getScheduleRuntime: () => null,
+    getDaemonRuntime: () => null,
     getWorkflowRuntime: () => null,
     startFeishuInstallQrcode: vi.fn() as never,
     pollFeishuInstall: vi.fn() as never,
@@ -83,6 +283,10 @@ function registerOptions(overrides: Partial<Parameters<typeof import('./register
     loadGuiUpdaterModule: vi.fn() as never,
     resolveLogDirectory: () => '/tmp/logs',
     logError: vi.fn(),
+    workspacePreviewProtocols: {
+      createLease: vi.fn(async () => ({ ok: false, message: 'unavailable' })),
+      release: vi.fn(() => ({ ok: true }))
+    } as never,
     ...overrides
   }
 }
@@ -90,10 +294,366 @@ function registerOptions(overrides: Partial<Parameters<typeof import('./register
 describe('registerAppIpcHandlers', () => {
   beforeEach(() => {
     handlers.clear()
+    electronMock.userDataPath = '/tmp/kun-user-data'
+    electronMock.showMessageBox.mockReset()
+    electronMock.openPath.mockClear()
+    electronMock.showItemInFolder.mockClear()
+    uiPluginMocks.ensureBundledUiPlugins.mockClear()
+    uiPluginMocks.installUiPluginFromDirectory.mockReset()
+    uiPluginMocks.listUiPlugins.mockReset()
+    uiPluginMocks.loadUiPluginFigures.mockReset()
+    uiPluginMocks.removeUiPlugin.mockReset()
+    uiPluginMocks.activate.mockClear()
+    uiPluginMocks.deactivate.mockClear()
+    protectedProviderMocks.probeClaudeSubscription.mockClear()
+    protectedProviderMocks.fetchSdkModels.mockClear()
+    protectedProviderMocks.discoverCursorSubscription.mockClear()
+  })
+
+  afterEach(() => {
+    vi.unstubAllEnvs()
+  })
+
+  it('registers the Cursor subscription discovery handler at application startup', () => {
+    registerAppIpcHandlers(registerOptions())
+
+    expect(handlers.get('cursor-subscription:discover')).toBeTypeOf('function')
+    expect(handlers.get('gemini-cli-subscription:status')).toBeTypeOf('function')
+    expect(handlers.get('gemini-cli-subscription:models')).toBeTypeOf('function')
+  })
+
+  it('resolves persisted Claude and Cursor credentials through the Main-only Registry projection', async () => {
+    const projected = settingsWithProtectedSubscriptionCredentials()
+    const stored: AppSettingsV1 = {
+      ...projected,
+      provider: {
+        ...projected.provider,
+        providers: projected.provider.providers.map((provider) => ({
+          ...provider,
+          apiKey: ''
+        }))
+      }
+    }
+    const mainFrame = { processId: 10, routingId: 20 }
+    const contents = { id: 7, mainFrame }
+    const mainWindow = { isDestroyed: () => false, webContents: contents }
+    const trustedEvent = { sender: contents, senderFrame: mainFrame }
+    const withRegistryCredentials = vi.fn(async () => projected)
+    registerAppIpcHandlers(registerOptions({
+      store: { load: vi.fn(async () => stored) } as never,
+      getMainWindow: () => mainWindow as never,
+      withRegistryCredentials
+    }))
+
+    await handlers.get('claude-subscription:probe')?.(
+      trustedEvent,
+      undefined,
+      'claude-subscription'
+    )
+    await handlers.get('claude-subscription:models')?.(
+      trustedEvent,
+      undefined,
+      'claude-subscription'
+    )
+    await handlers.get('cursor-subscription:discover')?.(
+      trustedEvent,
+      { providerId: 'cursor-subscription' }
+    )
+
+    expect(protectedProviderMocks.probeClaudeSubscription).toHaveBeenCalledWith(expect.objectContaining({
+      token: 'registry-claude-secret'
+    }))
+    expect(protectedProviderMocks.fetchSdkModels).toHaveBeenCalledWith(expect.objectContaining({
+      token: 'registry-claude-secret'
+    }))
+    expect(protectedProviderMocks.discoverCursorSubscription).toHaveBeenCalledWith(expect.objectContaining({
+      apiKey: 'registry-cursor-secret'
+    }))
+    expect(withRegistryCredentials).toHaveBeenCalledTimes(3)
+  })
+
+  it('rejects untrusted Registry credential lookups before loading protected settings', async () => {
+    const projected = settingsWithProtectedSubscriptionCredentials()
+    const mainFrame = { processId: 10, routingId: 20 }
+    const contents = { id: 7, mainFrame }
+    const mainWindow = { isDestroyed: () => false, webContents: contents }
+    const untrustedEvent = {
+      sender: { id: 99 },
+      senderFrame: { processId: 90, routingId: 91 }
+    }
+    const storeLoad = vi.fn(async () => settings())
+    const withRegistryCredentials = vi.fn(async () => projected)
+    registerAppIpcHandlers(registerOptions({
+      store: { load: storeLoad } as never,
+      getMainWindow: () => mainWindow as never,
+      withRegistryCredentials
+    }))
+
+    await expect(handlers.get('claude-subscription:probe')?.(
+      untrustedEvent,
+      undefined,
+      'claude-subscription'
+    )).rejects.toThrow(/trusted workbench frame/)
+    await expect(handlers.get('claude-subscription:models')?.(
+      untrustedEvent,
+      undefined,
+      'claude-subscription'
+    )).rejects.toThrow(/trusted workbench frame/)
+    await expect(handlers.get('cursor-subscription:discover')?.(
+      untrustedEvent,
+      { providerId: 'cursor-subscription' }
+    )).rejects.toThrow(/trusted workbench frame/)
+    await expect(handlers.get('claude-subscription:probe')?.(
+      untrustedEvent,
+      'renderer-supplied-secret'
+    )).rejects.toThrow(/trusted workbench frame/)
+
+    expect(storeLoad).not.toHaveBeenCalled()
+    expect(withRegistryCredentials).not.toHaveBeenCalled()
+    expect(protectedProviderMocks.probeClaudeSubscription).not.toHaveBeenCalled()
+    expect(protectedProviderMocks.fetchSdkModels).not.toHaveBeenCalled()
+    expect(protectedProviderMocks.discoverCursorSubscription).not.toHaveBeenCalled()
+  })
+
+  it('binds protected subscription credentials to the expected provider transport', async () => {
+    const projected = settingsWithProtectedSubscriptionCredentials()
+    const mainFrame = { processId: 10, routingId: 20 }
+    const contents = { id: 7, mainFrame }
+    const mainWindow = { isDestroyed: () => false, webContents: contents }
+    const trustedEvent = { sender: contents, senderFrame: mainFrame }
+    const withRegistryCredentials = vi.fn(async () => projected)
+    registerAppIpcHandlers(registerOptions({
+      store: { load: vi.fn(async () => projected) } as never,
+      getMainWindow: () => mainWindow as never,
+      withRegistryCredentials
+    }))
+
+    await expect(handlers.get('claude-subscription:probe')?.(
+      trustedEvent,
+      undefined,
+      'cursor-subscription'
+    )).rejects.toThrow(/not an? agent-sdk provider/)
+    await expect(handlers.get('claude-subscription:models')?.(
+      trustedEvent,
+      undefined,
+      'cursor-subscription'
+    )).rejects.toThrow(/not an? agent-sdk provider/)
+    await expect(handlers.get('cursor-subscription:discover')?.(
+      trustedEvent,
+      { providerId: 'claude-subscription' }
+    )).rejects.toThrow(/not a cursor-sdk provider/)
+
+    expect(protectedProviderMocks.probeClaudeSubscription).not.toHaveBeenCalled()
+    expect(protectedProviderMocks.fetchSdkModels).not.toHaveBeenCalled()
+    expect(protectedProviderMocks.discoverCursorSubscription).not.toHaveBeenCalled()
+    expect(withRegistryCredentials).not.toHaveBeenCalled()
+  })
+
+  it('allows explicit subscription credential drafts without a Registry lookup', async () => {
+    const mainFrame = { processId: 10, routingId: 20 }
+    const contents = { id: 7, mainFrame }
+    const mainWindow = { isDestroyed: () => false, webContents: contents }
+    const trustedEvent = { sender: contents, senderFrame: mainFrame }
+    const withRegistryCredentials = vi.fn(async () => {
+      throw new Error('Registry lookup must not run for an explicit draft')
+    })
+    registerAppIpcHandlers(registerOptions({
+      getMainWindow: () => mainWindow as never,
+      withRegistryCredentials
+    }))
+
+    await handlers.get('claude-subscription:probe')?.(
+      trustedEvent,
+      'draft-claude-secret',
+      'cursor-subscription'
+    )
+    await handlers.get('claude-subscription:models')?.(
+      trustedEvent,
+      'draft-claude-secret',
+      'cursor-subscription'
+    )
+    await handlers.get('cursor-subscription:discover')?.(trustedEvent, {
+      apiKey: 'draft-cursor-secret',
+      providerId: 'claude-subscription'
+    })
+
+    expect(withRegistryCredentials).not.toHaveBeenCalled()
+    expect(protectedProviderMocks.probeClaudeSubscription).toHaveBeenCalledWith(expect.objectContaining({
+      token: 'draft-claude-secret'
+    }))
+    expect(protectedProviderMocks.fetchSdkModels).toHaveBeenCalledWith(expect.objectContaining({
+      token: 'draft-claude-secret'
+    }))
+    expect(protectedProviderMocks.discoverCursorSubscription).toHaveBeenCalledWith(expect.objectContaining({
+      apiKey: 'draft-cursor-secret'
+    }))
+  })
+
+  it('bypasses cache for development reload commands and keeps packaged reloads ordinary', async () => {
+    const reload = vi.fn()
+    const reloadIgnoringCache = vi.fn()
+    const contents = { reload, reloadIgnoringCache }
+    const mainWindow = { isDestroyed: () => false, webContents: contents }
+    registerAppIpcHandlers(registerOptions({ getMainWindow: () => mainWindow as never }))
+    const handler = handlers.get('desktop:command')
+
+    vi.stubEnv('ELECTRON_RENDERER_URL', 'http://127.0.0.1:5173')
+    await handler?.({ sender: contents }, 'reload')
+    expect(reloadIgnoringCache).toHaveBeenCalledOnce()
+    expect(reload).not.toHaveBeenCalled()
+
+    reloadIgnoringCache.mockClear()
+    vi.stubEnv('ELECTRON_RENDERER_URL', '')
+    await handler?.({ sender: contents }, 'reload')
+    expect(reload).toHaveBeenCalledOnce()
+    expect(reloadIgnoringCache).not.toHaveBeenCalled()
+  })
+
+  it('registers a trusted dedicated runtime image upload bridge', async () => {
+    const mainFrame = { processId: 10, routingId: 20 }
+    const contents = { id: 7, mainFrame }
+    const mainWindow = { isDestroyed: () => false, webContents: contents }
+    const runtimeRequest = vi.fn(async (path: string, _method?: string, body?: string) => {
+      if (path === '/v1/runtime/info') {
+        return {
+          ok: true,
+          status: 200,
+          body: JSON.stringify({
+            capabilities: {
+              attachments: {
+                maxImageBytes: 5 * 1024 * 1024,
+                maxImageDimension: 4096,
+                allowedMimeTypes: ['image/png', 'image/jpeg', 'image/webp'],
+                textFallbackMaxBase64Bytes: 512 * 1024,
+                textFallbackMaxImageDimension: 1280,
+                textFallbackPreferredMimeType: 'image/webp'
+              }
+            }
+          })
+        }
+      }
+      const upload = JSON.parse(body ?? '{}') as Record<string, unknown>
+      return {
+        ok: true,
+        status: 201,
+        body: JSON.stringify({
+          attachment: {
+            id: 'att_ipc',
+            name: upload.name,
+            kind: 'image',
+            mimeType: upload.mimeType,
+            byteSize: Buffer.from(String(upload.dataBase64), 'base64').byteLength,
+            hash: 'hash',
+            textFallback: upload.textFallback,
+            createdAt: 't0',
+            updatedAt: 't0'
+          }
+        })
+      }
+    })
+    registerAppIpcHandlers(registerOptions({
+      getMainWindow: () => mainWindow as never,
+      runtimeRequest: runtimeRequest as never
+    }))
+    const handler = handlers.get('runtime:attachment:upload-image')
+    const payload = {
+      source: {
+        kind: 'base64',
+        mimeType: 'image/png',
+        dataBase64: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='
+      },
+      name: 'pixel.png'
+    }
+
+    await expect(handler?.({
+      sender: { id: 99 },
+      senderFrame: { processId: 90, routingId: 91 }
+    }, payload)).rejects.toThrow(/trusted workbench frame/)
+    await expect(handler?.({ sender: contents, senderFrame: mainFrame }, payload)).resolves.toMatchObject({
+      ok: true,
+      attachment: { id: 'att_ipc' }
+    })
+    expect(runtimeRequest.mock.calls.map((call) => call[0])).toEqual([
+      '/v1/runtime/info',
+      '/v1/attachments'
+    ])
+  })
+
+  it('reveals a workspace file only for the trusted workbench frame', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'kun-reveal-workspace-'))
+    const filePath = join(root, 'preview.md')
+    writeFileSync(filePath, '# Preview', 'utf8')
+    const mainFrame = { processId: 10, routingId: 20 }
+    const contents = { id: 7, mainFrame }
+    const mainWindow = { isDestroyed: () => false, webContents: contents }
+    try {
+      registerAppIpcHandlers(registerOptions({ getMainWindow: () => mainWindow as never }))
+      const handler = handlers.get('file:reveal-workspace-file')
+      const payload = { path: 'preview.md', workspaceRoot: root }
+
+      await expect(handler?.({
+        sender: { id: 99 },
+        senderFrame: { processId: 90, routingId: 91 }
+      }, payload)).rejects.toThrow(/trusted workbench frame/)
+      await expect(handler?.({ sender: contents, senderFrame: mainFrame }, payload)).resolves.toEqual({ ok: true })
+      const shownPath = electronMock.showItemInFolder.mock.calls[0]?.[0]
+      expect(shownPath).toBeTypeOf('string')
+      const canonicalPath = (candidate: string): string =>
+        typeof (realpathSync as { native?: (path: string) => string }).native === 'function'
+          ? realpathSync.native(candidate).toLowerCase()
+          : realpathSync(candidate).toLowerCase()
+      expect(canonicalPath(shownPath as string)).toBe(canonicalPath(filePath))
+      expect(electronMock.openPath).not.toHaveBeenCalled()
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects reveal targets that escape or do not name a workspace file', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'kun-reveal-boundary-'))
+    const workspaceRoot = join(root, 'workspace')
+    const outsideFile = join(root, 'outside.md')
+    mkdirSync(workspaceRoot)
+    writeFileSync(outsideFile, '# Outside', 'utf8')
+    const mainFrame = { processId: 10, routingId: 20 }
+    const contents = { id: 7, mainFrame }
+    const mainWindow = { isDestroyed: () => false, webContents: contents }
+    const event = { sender: contents, senderFrame: mainFrame }
+
+    try {
+      registerAppIpcHandlers(registerOptions({ getMainWindow: () => mainWindow as never }))
+      const handler = handlers.get('file:reveal-workspace-file')
+      expect(handler).toBeTypeOf('function')
+
+      await expect(handler?.(event, {
+        path: '../outside.md',
+        workspaceRoot
+      })).resolves.toMatchObject({ ok: false })
+      await expect(handler?.(event, {
+        path: outsideFile,
+        workspaceRoot
+      })).resolves.toMatchObject({ ok: false })
+      await expect(handler?.(event, {
+        path: '.',
+        workspaceRoot
+      })).resolves.toEqual({
+        ok: false,
+        message: 'Path must point to a regular workspace file.'
+      })
+      await expect(handler?.(event, {
+        path: 'missing.md',
+        workspaceRoot
+      })).resolves.toMatchObject({ ok: false })
+      await expect(handler?.(event, {
+        path: outsideFile
+      })).rejects.toThrow(/Invalid payload for file:reveal-workspace-file/)
+      expect(electronMock.showItemInFolder).not.toHaveBeenCalled()
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
   })
 
   it('rejects invalid settings patches at the handler boundary', async () => {
-    const { registerAppIpcHandlers } = await import('./register-app-ipc-handlers')
     const applySettingsPatch = vi.fn(async () => settings())
 
     registerAppIpcHandlers(registerOptions({ applySettingsPatch }))
@@ -106,8 +666,145 @@ describe('registerAppIpcHandlers', () => {
     expect(applySettingsPatch).not.toHaveBeenCalled()
   })
 
+  it('includes the Zod path when settings:set rejects an empty primary model', async () => {
+    const applySettingsPatch = vi.fn(async () => settings())
+
+    registerAppIpcHandlers(registerOptions({ applySettingsPatch }))
+
+    const handler = handlers.get('settings:set')
+    await expect(
+      handler?.({}, { agents: { kun: { model: '' } } })
+    ).rejects.toThrow(/Invalid payload for settings:set: agents\.kun\.model: Too small/)
+    expect(applySettingsPatch).not.toHaveBeenCalled()
+  })
+
+  it('redacts plaintext model credentials from settings:get without mutating the Main snapshot', async () => {
+    const current = settingsWithPlaintextModelCredentials()
+    const original = JSON.stringify(current)
+    registerAppIpcHandlers(registerOptions({
+      store: { load: vi.fn(async () => current) } as never
+    }))
+
+    const result = await handlers.get('settings:get')?.({})
+
+    expectRendererModelCredentialsRedacted(result)
+    expect(JSON.stringify(current)).toBe(original)
+  })
+
+  it('redacts plaintext model credentials from both settings write responses', async () => {
+    const persisted = settingsWithPlaintextModelCredentials()
+    const original = JSON.stringify(persisted)
+    const applySettingsPatch = vi.fn(async () => persisted)
+    const saveSettingsPatch = vi.fn(async () => persisted)
+    registerAppIpcHandlers(registerOptions({ applySettingsPatch, saveSettingsPatch }))
+
+    const setResult = await handlers.get('settings:set')?.({}, { theme: 'dark' })
+    const saveResult = await handlers.get('settings:save-silent')?.({}, { locale: 'zh' })
+
+    expectRendererModelCredentialsRedacted(setResult)
+    expectRendererModelCredentialsRedacted(saveResult)
+    expect(applySettingsPatch).toHaveBeenCalledWith({ theme: 'dark' })
+    expect(saveSettingsPatch).toHaveBeenCalledWith({ locale: 'zh' })
+    expect(JSON.stringify(persisted)).toBe(original)
+  })
+
+  it('reveals only the requested provider credential to the trusted workbench', async () => {
+    const projected = settingsWithPlaintextModelCredentials()
+    const providerId = projected.provider.providers[0]!.id
+    const stored: AppSettingsV1 = {
+      ...projected,
+      provider: {
+        ...projected.provider,
+        apiKey: '',
+        providers: projected.provider.providers.map((provider) => ({
+          ...provider,
+          apiKey: ''
+        }))
+      }
+    }
+    const mainFrame = { processId: 10, routingId: 20 }
+    const contents = { id: 7, mainFrame }
+    const mainWindow = { isDestroyed: () => false, webContents: contents }
+    const trustedEvent = { sender: contents, senderFrame: mainFrame }
+    const withRegistryCredentials = vi.fn(async () => projected)
+    registerAppIpcHandlers(registerOptions({
+      store: { load: vi.fn(async () => stored) } as never,
+      getMainWindow: () => mainWindow as never,
+      withRegistryCredentials
+    }))
+
+    await expect(handlers.get('model-provider:credential:reveal')?.(
+      trustedEvent,
+      { providerId }
+    )).resolves.toEqual({ providerId, credential: 'provider-secret-0' })
+    expect(withRegistryCredentials).toHaveBeenCalledOnce()
+  })
+
+  it('rejects untrusted provider credential reveal before loading protected settings', async () => {
+    const mainFrame = { processId: 10, routingId: 20 }
+    const contents = { id: 7, mainFrame }
+    const mainWindow = { isDestroyed: () => false, webContents: contents }
+    const storeLoad = vi.fn(async () => settings())
+    const withRegistryCredentials = vi.fn(async (value: AppSettingsV1) => value)
+    registerAppIpcHandlers(registerOptions({
+      store: { load: storeLoad } as never,
+      getMainWindow: () => mainWindow as never,
+      withRegistryCredentials
+    }))
+
+    await expect(handlers.get('model-provider:credential:reveal')?.(
+      { sender: { id: 99 }, senderFrame: { processId: 90, routingId: 91 } },
+      { providerId: 'deepseek' }
+    )).rejects.toThrow(/trusted workbench frame/)
+    expect(storeLoad).not.toHaveBeenCalled()
+    expect(withRegistryCredentials).not.toHaveBeenCalled()
+  })
+
+  it('requires trusted native confirmation before resetting unreadable credentials', async () => {
+    const mainFrame = { processId: 10, routingId: 20 }
+    const contents = { id: 7, mainFrame }
+    const mainWindow = { isDestroyed: () => false, webContents: contents }
+    const resetUnreadableCredentials = vi.fn(async () => ({
+      reset: true as const,
+      backupPath: '/tmp/credential-recovery',
+      movedItems: ['secret.key']
+    }))
+    registerAppIpcHandlers(registerOptions({
+      getMainWindow: () => mainWindow as never,
+      resetUnreadableCredentials
+    }))
+    const handler = handlers.get('credentials:reset-unreadable')
+
+    await expect(handler?.({
+      sender: { id: 99 },
+      senderFrame: { processId: 90, routingId: 91 }
+    })).rejects.toThrow(/trusted workbench frame/)
+
+    electronMock.showMessageBox.mockResolvedValueOnce({ response: 1 })
+    await expect(handler?.({ sender: contents, senderFrame: mainFrame })).resolves.toEqual({ reset: false })
+    expect(resetUnreadableCredentials).not.toHaveBeenCalled()
+
+    electronMock.showMessageBox.mockResolvedValueOnce({ response: 0 })
+    await expect(handler?.({ sender: contents, senderFrame: mainFrame })).resolves.toMatchObject({ reset: true })
+    expect(resetUnreadableCredentials).toHaveBeenCalledOnce()
+  })
+
+  it('reports whether a workspace directory currently exists', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'kun-workspace-exists-'))
+    const filePath = join(root, 'not-a-directory')
+    writeFileSync(filePath, 'file', 'utf8')
+    registerAppIpcHandlers(registerOptions())
+
+    const handler = handlers.get('workspace:directory-exists')
+    expect(handler).toBeTypeOf('function')
+    await expect(handler?.({}, root)).resolves.toBe(true)
+    await expect(handler?.({}, filePath)).resolves.toBe(false)
+    await expect(handler?.({}, join(root, 'missing'))).resolves.toBe(false)
+
+    rmSync(root, { recursive: true, force: true })
+  })
+
   it('passes valid settings patches through to applySettingsPatch', async () => {
-    const { registerAppIpcHandlers } = await import('./register-app-ipc-handlers')
     const applySettingsPatch = vi.fn(async () => settings())
 
     registerAppIpcHandlers(registerOptions({ applySettingsPatch }))
@@ -125,8 +822,611 @@ describe('registerAppIpcHandlers', () => {
     expect(applySettingsPatch).toHaveBeenCalledWith(payload)
   })
 
+  it('accepts ChatGPT subscription service tiers at the settings boundary', async () => {
+    const applySettingsPatch = vi.fn(async () => settings())
+    registerAppIpcHandlers(registerOptions({ applySettingsPatch }))
+    const payload = {
+      provider: {
+        providers: [{
+          id: 'codex',
+          name: 'ChatGPT 订阅',
+          modelProfiles: {
+            'gpt-5.6-sol': {
+              serviceTiers: ['priority' as const]
+            }
+          }
+        }]
+      }
+    }
+
+    await expect(handlers.get('settings:set')?.({}, payload)).resolves.toEqual(settings())
+    expect(applySettingsPatch).toHaveBeenCalledWith(payload)
+  })
+
+  it('accepts strict multi-account provider source metadata with routing settings', async () => {
+    const applySettingsPatch = vi.fn(async () => settings())
+    registerAppIpcHandlers(registerOptions({ applySettingsPatch }))
+    const payload = {
+      provider: {
+        providers: [{
+          id: 'kimi-code-2',
+          name: 'Kimi Code 2',
+          presetSource: { presetId: 'kimi-code', mode: 'api' as const },
+          models: ['kimi-for-coding']
+        }],
+        routePools: [{
+          id: 'kimi-route', name: 'Kimi Route', modelId: 'kimi-auto', enabled: true, strategy: 'priority' as const,
+          targets: [{ id: 'target-2', providerId: 'kimi-code-2', modelId: 'kimi-for-coding', enabled: true, weight: 1 }],
+          failurePolicy: { failoverHttpStatusCodes: [429], failoverOnNetworkError: true, failoverOnTimeout: true, failoverOnAuthError: true },
+          healthPolicy: { failureThreshold: 3, cooldownMs: 60_000, halfOpenMaxAttempts: 1 }
+        }]
+      }
+    }
+
+    await expect(handlers.get('settings:set')?.({}, payload)).resolves.toEqual(settings())
+    expect(applySettingsPatch).toHaveBeenCalledWith(payload)
+  })
+
+  it('preserves project grants instead of accepting them through generic settings writes', async () => {
+    const applySettingsPatch = vi.fn(async () => settings())
+    registerAppIpcHandlers(registerOptions({ applySettingsPatch }))
+
+    await handlers.get('settings:set')?.({}, {
+      agents: {
+        kun: {
+          model: 'next-model',
+          projectConfig: {
+            grants: [{ workspaceRoot: '/workspace/forged', configDigest: 'a'.repeat(64) }]
+          }
+        }
+      }
+    })
+
+    expect(applySettingsPatch).toHaveBeenCalledWith({
+      agents: { kun: { model: 'next-model' } }
+    })
+  })
+
+  it('does not persist renderer-requested full access without protected native consent', async () => {
+    const current = settings()
+    current.agents.kun = mergeKunRuntimeSettings(current.agents.kun, {
+      approvalPolicy: 'on-request',
+      sandboxMode: 'workspace-write',
+      approvalReviewer: 'user'
+    })
+    const mainFrame = { processId: 10, routingId: 20 }
+    const contents = { id: 7, mainFrame }
+    const mainWindow = { isDestroyed: () => false, webContents: contents }
+    const applySettingsPatch = vi.fn(async () => settings())
+    const saveSettingsPatch = vi.fn(async () => settings())
+    registerAppIpcHandlers(registerOptions({
+      store: { load: vi.fn(async () => current) } as never,
+      getMainWindow: () => mainWindow as never,
+      applySettingsPatch,
+      saveSettingsPatch
+    }))
+    const payload = {
+      agents: {
+        kun: {
+          approvalPolicy: 'auto' as const,
+          sandboxMode: 'danger-full-access' as const,
+          approvalReviewer: 'user' as const
+        }
+      }
+    }
+    const trustedEvent = { sender: contents, senderFrame: mainFrame }
+
+    await expect(handlers.get('settings:set')?.({
+      sender: { id: 99 },
+      senderFrame: { processId: 90, routingId: 91 }
+    }, payload)).rejects.toThrow(/trusted workbench frame/)
+    expect(applySettingsPatch).not.toHaveBeenCalled()
+
+    // A Direct DOM synthetic click can at most make the trusted renderer send
+    // this request. Cancelling the Main-owned prompt leaves settings unchanged.
+    electronMock.showMessageBox.mockResolvedValueOnce({ response: 1 })
+    await expect(handlers.get('settings:set')?.(trustedEvent, payload)).resolves.toEqual(current)
+    expect(applySettingsPatch).not.toHaveBeenCalled()
+    expect(electronMock.showMessageBox).toHaveBeenLastCalledWith(
+      mainWindow,
+      expect.objectContaining({
+        detail: expect.stringContaining(
+          'Full access lets Kun access any local file, execute host commands, and use network-capable tools'
+        )
+      })
+    )
+
+    electronMock.showMessageBox.mockResolvedValueOnce({ response: 0 })
+    await handlers.get('settings:set')?.(trustedEvent, payload)
+    expect(applySettingsPatch).toHaveBeenCalledWith(payload)
+
+    electronMock.showMessageBox.mockResolvedValueOnce({ response: 1 })
+    await handlers.get('settings:save-silent')?.(trustedEvent, payload)
+    expect(saveSettingsPatch).not.toHaveBeenCalled()
+  })
+
+  it('uses the resolved shared runtime token after trusted native approval', async () => {
+    const current = settings()
+    const resolvedRuntimeToken = 'approval-runtime-secret'
+    expect(current.agents.kun.runtimeToken).toBe('')
+    const mainFrame = { processId: 10, routingId: 20 }
+    const contents = { id: 7, mainFrame }
+    const mainWindow = { isDestroyed: () => false, webContents: contents }
+    const leaseRequest = vi.fn(async (
+      _path: string,
+      _method?: string,
+      _body?: string,
+      _headers?: Record<string, string>
+    ) => ({ ok: true, status: 200, body: '{}' }))
+    const acquireRuntimeRequestLease = vi.fn(async () => ({
+      runtimeToken: resolvedRuntimeToken,
+      request: leaseRequest
+    }))
+    const runtimeRequest = vi.fn()
+    registerAppIpcHandlers(registerOptions({
+      store: { load: vi.fn(async () => current) } as never,
+      getMainWindow: () => mainWindow as never,
+      acquireRuntimeRequestLease,
+      runtimeRequest
+    }))
+    const handler = handlers.get('approval:decide')!
+    const payload = { approvalId: 'approval-1', decision: 'allow', source: 'user' }
+
+    await expect(handler({
+      sender: { id: 99 },
+      senderFrame: { processId: 90, routingId: 91 }
+    }, payload)).rejects.toThrow(/trusted workbench frame/)
+    expect(runtimeRequest).not.toHaveBeenCalled()
+    expect(acquireRuntimeRequestLease).not.toHaveBeenCalled()
+
+    electronMock.showMessageBox.mockResolvedValueOnce({ response: 1 })
+    await expect(handler({ sender: contents, senderFrame: mainFrame }, payload))
+      .resolves.toEqual({ confirmed: false })
+    expect(runtimeRequest).not.toHaveBeenCalled()
+    expect(acquireRuntimeRequestLease).not.toHaveBeenCalled()
+
+    electronMock.showMessageBox.mockResolvedValueOnce({ response: 0 })
+    await expect(handler({ sender: contents, senderFrame: mainFrame }, payload))
+      .resolves.toMatchObject({ confirmed: true, response: { ok: true } })
+    expect(acquireRuntimeRequestLease).toHaveBeenCalledOnce()
+    expect(runtimeRequest).not.toHaveBeenCalled()
+    expect(leaseRequest).toHaveBeenCalledOnce()
+    const headers = leaseRequest.mock.calls[0]?.[3] as Record<string, string>
+    const consent = headers[KUN_APPROVAL_CONSENT_HEADER]
+    expect(consent).toMatch(/^v1\./)
+    expect(new ApprovalConsentVerifier(resolvedRuntimeToken).verifyAndConsume({
+      token: consent,
+      approvalId: 'approval-1',
+      decision: 'allow'
+    })).toBe(true)
+  })
+
+  it('reveals the approval parent and records only a redacted native-dialog reference', async () => {
+    const mainFrame = { processId: 10, routingId: 20 }
+    const contents = { id: 7, mainFrame }
+    const restore = vi.fn()
+    const show = vi.fn()
+    const focus = vi.fn()
+    const mainWindow = {
+      isDestroyed: () => false,
+      isMinimized: () => true,
+      isVisible: () => false,
+      isFocused: () => false,
+      restore,
+      show,
+      focus,
+      webContents: contents
+    }
+    const logInfo = vi.fn()
+    const runtimeRequest = vi.fn(async () => ({ ok: true, status: 200, body: '{}' }))
+    registerAppIpcHandlers(registerOptions({
+      getMainWindow: () => mainWindow as never,
+      runtimeRequest,
+      logInfo
+    }))
+    electronMock.showMessageBox.mockResolvedValueOnce({ response: 1 })
+
+    await expect(handlers.get('approval:decide')?.({
+      sender: contents,
+      senderFrame: mainFrame
+    }, {
+      approvalId: 'approval-secret-value',
+      decision: 'allow',
+      source: 'user'
+    })).resolves.toEqual({ confirmed: false })
+
+    expect(restore).toHaveBeenCalledOnce()
+    expect(show).toHaveBeenCalledOnce()
+    expect(focus).toHaveBeenCalledOnce()
+    expect(electronMock.showMessageBox).toHaveBeenCalledWith(
+      mainWindow,
+      expect.objectContaining({
+        detail: expect.stringContaining('Approval reference: sha256:')
+      })
+    )
+    expect(electronMock.showMessageBox.mock.calls[0]?.[1]?.detail)
+      .not.toContain('approval-secret-value')
+    expect(logInfo).toHaveBeenCalledWith(
+      'approval',
+      'Opening protected native approval dialog.',
+      expect.objectContaining({
+        approvalRef: expect.stringMatching(/^sha256:[a-f0-9]{16}$/),
+        windowBeforeReveal: expect.objectContaining({
+          destroyed: false,
+          visible: false,
+          minimized: true,
+          focused: false
+        }),
+        windowAfterReveal: expect.objectContaining({ destroyed: false })
+      })
+    )
+    expect(logInfo).toHaveBeenCalledWith(
+      'approval',
+      'Protected native approval dialog resolved.',
+      expect.objectContaining({ response: 1, confirmed: false })
+    )
+    expect(runtimeRequest).not.toHaveBeenCalled()
+  })
+
+  it('fails closed when the approval parent is destroyed while the native dialog closes', async () => {
+    const mainFrame = { processId: 10, routingId: 20 }
+    let destroyed = false
+    const contents = { id: 7, mainFrame, isDestroyed: () => destroyed }
+    const mainWindow = { isDestroyed: () => destroyed, webContents: contents }
+    const runtimeRequest = vi.fn(async () => ({ ok: true, status: 200, body: '{}' }))
+    const logInfo = vi.fn()
+    registerAppIpcHandlers(registerOptions({
+      getMainWindow: () => mainWindow as never,
+      runtimeRequest,
+      logInfo
+    }))
+    electronMock.showMessageBox.mockImplementationOnce(async () => {
+      destroyed = true
+      return { response: 0 }
+    })
+
+    await expect(handlers.get('approval:decide')?.({
+      sender: contents,
+      senderFrame: mainFrame
+    }, {
+      approvalId: 'approval-parent-destroyed',
+      decision: 'allow',
+      source: 'user'
+    })).resolves.toEqual({ confirmed: false })
+
+    expect(runtimeRequest).not.toHaveBeenCalled()
+    expect(logInfo).toHaveBeenCalledWith(
+      'approval',
+      'Protected native approval confirmation was not submitted.',
+      expect.objectContaining({ reason: 'parent_or_sender_unavailable_after_confirmation' })
+    )
+  })
+
+  it('fails closed when the approval sender navigates while the native dialog is open', async () => {
+    const mainFrame = { processId: 10, routingId: 20, detached: false }
+    const contents = {
+      id: 7,
+      mainFrame,
+      isDestroyed: () => false
+    }
+    const mainWindow = { isDestroyed: () => false, webContents: contents }
+    const runtimeRequest = vi.fn(async () => ({ ok: true, status: 200, body: '{}' }))
+    const logInfo = vi.fn()
+    registerAppIpcHandlers(registerOptions({
+      getMainWindow: () => mainWindow as never,
+      runtimeRequest,
+      logInfo
+    }))
+    electronMock.showMessageBox.mockImplementationOnce(async () => {
+      contents.mainFrame = { processId: 11, routingId: 21, detached: false }
+      return { response: 0 }
+    })
+
+    await expect(handlers.get('approval:decide')?.({
+      sender: contents,
+      senderFrame: mainFrame
+    }, {
+      approvalId: 'approval-navigated',
+      decision: 'allow',
+      source: 'user'
+    })).resolves.toEqual({ confirmed: false })
+
+    expect(runtimeRequest).not.toHaveBeenCalled()
+    expect(logInfo).toHaveBeenCalledWith(
+      'approval',
+      'Protected native approval confirmation was not submitted.',
+      expect.objectContaining({ reason: 'parent_or_sender_unavailable_after_confirmation' })
+    )
+  })
+
+  it('fails closed when the approval sender changes while the Runtime lease is acquired', async () => {
+    const mainFrame = { processId: 10, routingId: 20, detached: false }
+    const contents = {
+      id: 7,
+      mainFrame,
+      isDestroyed: () => false
+    }
+    const mainWindow = { isDestroyed: () => false, webContents: contents }
+    let releaseLease!: () => void
+    const leaseGate = new Promise<void>((resolve) => { releaseLease = resolve })
+    const leaseRequest = vi.fn(async () => ({ ok: true, status: 200, body: '{}' }))
+    const acquireRuntimeRequestLease = vi.fn(async () => {
+      await leaseGate
+      return { runtimeToken: 'lease-token', request: leaseRequest }
+    })
+    const logInfo = vi.fn()
+    registerAppIpcHandlers(registerOptions({
+      getMainWindow: () => mainWindow as never,
+      acquireRuntimeRequestLease,
+      logInfo
+    }))
+    electronMock.showMessageBox.mockResolvedValueOnce({ response: 0 })
+
+    const decision = handlers.get('approval:decide')?.({
+      sender: contents,
+      senderFrame: mainFrame
+    }, {
+      approvalId: 'approval-navigated-during-ensure',
+      decision: 'allow',
+      source: 'user'
+    })
+    await vi.waitFor(() => expect(acquireRuntimeRequestLease).toHaveBeenCalledOnce())
+    contents.mainFrame = { processId: 11, routingId: 21, detached: false }
+    releaseLease()
+
+    await expect(decision).resolves.toEqual({ confirmed: false })
+    expect(leaseRequest).not.toHaveBeenCalled()
+    expect(logInfo).toHaveBeenCalledWith(
+      'approval',
+      'Protected native approval confirmation was not submitted.',
+      expect.objectContaining({ reason: 'parent_or_sender_unavailable_after_runtime_ensure' })
+    )
+  })
+
+  it('revalidates a policy approval sender after Runtime lease acquisition', async () => {
+    const mainFrame = { processId: 10, routingId: 20, detached: false }
+    const contents = { id: 7, mainFrame, isDestroyed: () => false }
+    const mainWindow = { isDestroyed: () => false, webContents: contents }
+    const leaseGate = createGate()
+    const leaseRequest = vi.fn(async () => ({ ok: true, status: 200, body: '{}' }))
+    const acquireRuntimeRequestLease = vi.fn(async () => {
+      await leaseGate.promise
+      return { runtimeToken: 'lease-token', request: leaseRequest }
+    })
+    registerAppIpcHandlers(registerOptions({
+      getMainWindow: () => mainWindow as never,
+      acquireRuntimeRequestLease
+    }))
+
+    const decision = handlers.get('approval:decide')?.({
+      sender: contents,
+      senderFrame: mainFrame
+    }, {
+      approvalId: 'approval-policy-during-ensure',
+      decision: 'allow',
+      source: 'policy'
+    })
+    await vi.waitFor(() => expect(acquireRuntimeRequestLease).toHaveBeenCalledOnce())
+    contents.mainFrame = { processId: 11, routingId: 21, detached: false }
+    leaseGate.release()
+
+    await expect(decision).resolves.toEqual({ confirmed: false })
+    expect(leaseRequest).not.toHaveBeenCalled()
+    expect(electronMock.showMessageBox).not.toHaveBeenCalled()
+  })
+
+  it('returns a safe Runtime failure when approval lease acquisition fails', async () => {
+    const mainFrame = { processId: 10, routingId: 20 }
+    const contents = { id: 7, mainFrame, isDestroyed: () => false }
+    const mainWindow = { isDestroyed: () => false, webContents: contents }
+    const logError = vi.fn()
+    registerAppIpcHandlers(registerOptions({
+      getMainWindow: () => mainWindow as never,
+      acquireRuntimeRequestLease: vi.fn(async () => {
+        throw new Error('/Users/private-user/.kun/runtime failed to start')
+      }),
+      logError
+    }))
+
+    const result = await handlers.get('approval:decide')?.({
+      sender: contents,
+      senderFrame: mainFrame
+    }, {
+      approvalId: 'approval-lease-failed',
+      decision: 'deny',
+      source: 'policy'
+    }) as { confirmed: boolean; response: { ok: boolean; body: string } }
+
+    expect(result.confirmed).toBe(true)
+    expect(result.response.ok).toBe(false)
+    expect(result.response.body).toContain('runtime_unhealthy')
+    expect(result.response.body).not.toContain('private-user')
+    expect(logError).toHaveBeenCalledWith(
+      'approval',
+      'Protected approval Runtime lease acquisition failed.',
+      expect.objectContaining({
+        approvalRef: expect.stringMatching(/^sha256:/),
+        errorType: 'Error'
+      })
+    )
+    expect(JSON.stringify(logError.mock.calls)).not.toContain('private-user')
+  })
+
+  it('rejects every UI plugin bridge outside the trusted top-level workbench frame', async () => {
+    const mainFrame = { processId: 10, routingId: 20 }
+    const contents = { id: 7, mainFrame }
+    const mainWindow = { isDestroyed: () => false, webContents: contents }
+    registerAppIpcHandlers(registerOptions({ getMainWindow: () => mainWindow as never }))
+    const untrustedEvent = {
+      sender: contents,
+      senderFrame: { processId: 10, routingId: 21 }
+    }
+
+    for (const [channel, payload] of [
+      ['ui-plugin:list', undefined],
+      ['ui-plugin:install', undefined],
+      ['ui-plugin:remove', { id: 'starlight' }],
+      ['ui-plugin:load', { id: 'starlight' }],
+      ['ui-plugin:theme:activate', { id: 'starlight' }],
+      ['ui-plugin:theme:deactivate', undefined]
+    ] as const) {
+      await expect(handlers.get(channel)?.(untrustedEvent, payload)).rejects.toThrow(
+        /trusted workbench frame/
+      )
+    }
+  })
+
+  it('builds presentation variables in Main before activating the fixed CDP stylesheet', async () => {
+    const mainFrame = { processId: 10, routingId: 20 }
+    const contents = { id: 7, mainFrame }
+    const mainWindow = { isDestroyed: () => false, webContents: contents }
+    uiPluginMocks.loadUiPluginFigures.mockResolvedValueOnce({
+      ok: true,
+      manifest: {
+        id: 'portrait-theme',
+        name: 'Portrait theme',
+        version: '1.0.0',
+        figures: { portrait: 'img/portrait.png' },
+        presentation: {
+          character: {
+            anchor: 'right',
+            size: 'hero',
+            offsetX: 4,
+            offsetY: -2,
+            opacity: 0.93,
+            frame: 'crystal',
+            motion: 'float',
+            contentReserve: 'wide'
+          },
+          readability: { scrim: 'opposite-character', strength: 'medium' },
+          surfaces: {
+            sidebar: 'glass',
+            topbar: 'translucent',
+            composer: 'strong-glass',
+            cards: 'glass'
+          }
+        }
+      },
+      figures: { portrait: 'data:image/png;base64,AAAA' },
+      backgrounds: {},
+      sceneAssets: {}
+    })
+    registerAppIpcHandlers(registerOptions({ getMainWindow: () => mainWindow as never }))
+
+    const response = await handlers.get('ui-plugin:theme:activate')?.(
+      { sender: contents, senderFrame: mainFrame },
+      { id: 'portrait-theme' }
+    )
+
+    expect(response).toMatchObject({
+      ok: true,
+      manifest: { id: 'portrait-theme' },
+      figures: { portrait: 'data:image/png;base64,AAAA' }
+    })
+    expect(uiPluginMocks.ensureBundledUiPlugins).toHaveBeenCalledOnce()
+    expect(uiPluginMocks.activate).toHaveBeenCalledOnce()
+    const [pluginId, css] = uiPluginMocks.activate.mock.calls[0] ?? []
+    expect(pluginId).toBe('portrait-theme')
+    expect(css).toContain("html[data-ui-plugin='portrait-theme']")
+    expect(css).toContain('--kun-ui-plugin-character-offset-x: 4%;')
+    expect(css).toContain('--kun-ui-plugin-character-offset-y: -2%;')
+    expect(css).toContain('--kun-ui-plugin-character-opacity: 0.93;')
+    expect(css).not.toContain('crystal')
+    expect(css).not.toContain('opposite-character')
+  })
+
+  it('returns validated scene assets while CDP receives only host numeric scene variables', async () => {
+    const mainFrame = { processId: 10, routingId: 20 }
+    const contents = { id: 7, mainFrame }
+    const mainWindow = { isDestroyed: () => false, webContents: contents }
+    const presentation = {
+      character: {
+        anchor: 'right',
+        size: 'large',
+        offsetX: 0,
+        offsetY: 0,
+        opacity: 1,
+        frame: 'soft-card',
+        motion: 'none',
+        contentReserve: 'wide'
+      },
+      readability: { scrim: 'opposite-character', strength: 'medium' },
+      surfaces: {
+        sidebar: 'glass',
+        topbar: 'glass',
+        composer: 'strong-glass',
+        cards: 'translucent'
+      }
+    }
+    uiPluginMocks.loadUiPluginFigures.mockResolvedValueOnce({
+      ok: true,
+      manifest: {
+        id: 'scene-theme',
+        name: 'Scene theme',
+        version: '1.0.0',
+        figures: { portrait: 'img/portrait.png' },
+        presentation,
+        scene: {
+          apiVersion: '1.6',
+          layout: 'rail-left',
+          character: {
+            scale: 'hero',
+            fit: 'contain',
+            focalPoint: 'bottom',
+            mask: 'arch',
+            offsetX: 3,
+            offsetY: -2,
+            opacity: 0.96,
+            flipX: false,
+            motion: { preset: 'sway', speed: 'slow', phase: 'b' }
+          },
+          artwork: {
+            frame: {
+              path: 'scene/frame.png',
+              anchor: 'center',
+              size: 'large',
+              fit: 'contain',
+              offsetX: 1,
+              offsetY: -1,
+              opacity: 1,
+              blend: 'normal',
+              motion: { preset: 'none', speed: 'normal', phase: 'a' }
+            }
+          },
+          chrome: {
+            sidebar: 'paper',
+            topbar: 'editorial',
+            composer: 'hologram',
+            cards: 'ticket'
+          }
+        }
+      },
+      figures: { portrait: 'data:image/png;base64,AAAA' },
+      backgrounds: {},
+      sceneAssets: { assets: { 'scene/frame.png': 'data:image/png;base64,AQID' } }
+    })
+    registerAppIpcHandlers(registerOptions({ getMainWindow: () => mainWindow as never }))
+
+    const response = await handlers.get('ui-plugin:theme:activate')?.(
+      { sender: contents, senderFrame: mainFrame },
+      { id: 'scene-theme' }
+    )
+
+    expect(response).toMatchObject({
+      ok: true,
+      manifest: { id: 'scene-theme', scene: { layout: 'rail-left' } },
+      sceneAssets: { assets: { 'scene/frame.png': 'data:image/png;base64,AQID' } }
+    })
+    const [, css] = uiPluginMocks.activate.mock.calls[0] ?? []
+    expect(css).toContain('--kun-ui-plugin-scene-character-offset-x: 3%;')
+    expect(css).toContain('--kun-ui-plugin-scene-character-offset-y: -2%;')
+    expect(css).toContain('--kun-ui-plugin-scene-frame-offset-x: 1%;')
+    expect(css).not.toContain('scene/frame.png')
+    expect(css).not.toContain('rail-left')
+    expect(css).not.toContain('sway')
+  })
+
   it('accepts checkpoint cleanup settings patches', async () => {
-    const { registerAppIpcHandlers } = await import('./register-app-ipc-handlers')
     const applySettingsPatch = vi.fn(async () => settings())
 
     registerAppIpcHandlers(registerOptions({ applySettingsPatch }))
@@ -142,7 +1442,6 @@ describe('registerAppIpcHandlers', () => {
   })
 
   it('rejects unsupported checkpoint cleanup intervals', async () => {
-    const { registerAppIpcHandlers } = await import('./register-app-ipc-handlers')
     const applySettingsPatch = vi.fn(async () => settings())
 
     registerAppIpcHandlers(registerOptions({ applySettingsPatch }))
@@ -155,7 +1454,6 @@ describe('registerAppIpcHandlers', () => {
   })
 
   it('accepts telegram phone connection settings patches', async () => {
-    const { registerAppIpcHandlers } = await import('./register-app-ipc-handlers')
     const applySettingsPatch = vi.fn(async () => settings())
 
     registerAppIpcHandlers(registerOptions({ applySettingsPatch }))
@@ -200,7 +1498,6 @@ describe('registerAppIpcHandlers', () => {
   })
 
   it('restarts the managed runtime through the restart IPC handler', async () => {
-    const { registerAppIpcHandlers } = await import('./register-app-ipc-handlers')
     const restartRuntime = vi.fn(async () => undefined)
 
     registerAppIpcHandlers(registerOptions({ restartRuntime }))
@@ -209,9 +1506,49 @@ describe('registerAppIpcHandlers', () => {
     expect(restartRuntime).toHaveBeenCalledTimes(1)
   })
 
+  it('restarts Kun after an already-downloaded Claude SDK is provisioned through IPC', async () => {
+    const userDataDir = mkdtempSync(join(tmpdir(), 'kun-agent-sdk-ipc-'))
+    const binaryName = process.platform === 'win32' ? 'claude.exe' : 'claude'
+    const binaryPath = join(userDataDir, 'agent-sdk', binaryName)
+    const restartRuntime = vi.fn(async () => undefined)
+    electronMock.userDataPath = userDataDir
+    mkdirSync(join(userDataDir, 'agent-sdk'), { recursive: true })
+    writeFileSync(binaryPath, 'claude binary')
+
+    try {
+      registerAppIpcHandlers(registerOptions({ restartRuntime }))
+
+      await expect(handlers.get('claude-subscription:sdk-install')?.({})).resolves.toMatchObject({
+        status: 'restarting'
+      })
+      await Promise.resolve()
+      await Promise.resolve()
+      expect(restartRuntime).toHaveBeenCalledTimes(1)
+    } finally {
+      rmSync(userDataDir, { recursive: true, force: true })
+    }
+  })
+
+  it('returns the current Runtime settings synchronization status', async () => {
+    registerAppIpcHandlers(registerOptions({
+      getRuntimeSettingsSyncStatus: () => ({
+        state: 'failed',
+        generation: 7,
+        message: 'hot apply failed',
+        at: '2026-07-22T08:00:00.000Z'
+      })
+    }))
+
+    expect(handlers.get('runtime:settings-sync-status:get')?.({})).toEqual({
+      state: 'failed',
+      generation: 7,
+      message: 'hot apply failed',
+      at: '2026-07-22T08:00:00.000Z'
+    })
+  })
+
   it('saves generated files to a user-selected path', async () => {
     const { dialog } = await import('electron')
-    const { registerAppIpcHandlers } = await import('./register-app-ipc-handlers')
     const temp = mkdtempSync(join(tmpdir(), 'kun-save-as-'))
     const source = join(temp, 'source.png')
     const target = join(temp, 'downloaded.png')
@@ -236,8 +1573,121 @@ describe('registerAppIpcHandlers', () => {
     }
   })
 
+  it('opens and reveals only runtime-validated generated artifacts', async () => {
+    const mainFrame = { processId: 10, routingId: 20 }
+    const mainContents = { id: 1, mainFrame }
+    const runtimeRequest = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      body: JSON.stringify({
+        artifactId: 'artifact_1234567890',
+        absolutePath: '/tmp/workspace/exports/final.mp4',
+        displayName: 'final.mp4',
+        mimeType: 'video/mp4'
+      })
+    }))
+    registerAppIpcHandlers(registerOptions({
+      getMainWindow: () => ({
+        isDestroyed: () => false,
+        webContents: mainContents
+      }) as never,
+      runtimeRequest
+    }))
+    const handler = handlers.get('extension:artifact:open')!
+    const payload = {
+      artifactId: 'artifact_1234567890',
+      ownerExtensionId: 'kun.video-editor',
+      ownerExtensionVersion: '1.1.0',
+      workspaceId: 'a'.repeat(64),
+      workspaceRoot: '/tmp/workspace',
+      action: 'open'
+    }
+    await expect(handler({ sender: mainContents, senderFrame: mainFrame }, payload))
+      .resolves.toEqual({ ok: true })
+    expect(runtimeRequest).toHaveBeenCalledWith(
+      '/v1/extensions/media/artifacts/resolve',
+      'POST',
+      JSON.stringify({
+        artifactId: payload.artifactId,
+        ownerExtensionId: payload.ownerExtensionId,
+        ownerExtensionVersion: payload.ownerExtensionVersion,
+        workspaceId: payload.workspaceId,
+        workspaceRoot: payload.workspaceRoot
+      })
+    )
+    expect(electronMock.openPath).toHaveBeenCalledWith('/tmp/workspace/exports/final.mp4')
+
+    await expect(handler(
+      { sender: mainContents, senderFrame: mainFrame },
+      { ...payload, action: 'reveal' }
+    )).resolves.toEqual({ ok: true })
+    expect(electronMock.showItemInFolder).toHaveBeenCalledWith('/tmp/workspace/exports/final.mp4')
+    await expect(handler(
+      { sender: { id: 99 }, senderFrame: { processId: 99, routingId: 99 } },
+      payload
+    )).rejects.toThrow(/trusted workbench frame/)
+  })
+
+  it('keeps workspace watches alive across atomic replacements and releases the sender listener', async () => {
+    const temp = mkdtempSync(join(tmpdir(), 'kun-watch-atomic-'))
+    const target = join(temp, 'motion.svg')
+    writeFileSync(target, '<svg id="one"/>')
+    const sender = Object.assign(new EventEmitter(), {
+      id: 73,
+      send: vi.fn(),
+      isDestroyed: () => false
+    })
+
+    try {
+      registerAppIpcHandlers(registerOptions())
+      const watchHandler = handlers.get('file:watch-workspace')
+      const unwatchHandler = handlers.get('file:unwatch-workspace')
+      const result = await watchHandler?.({ sender }, { path: 'motion.svg', workspaceRoot: temp }) as {
+        ok: boolean
+        watchId?: string
+      }
+      expect(result.ok).toBe(true)
+      expect(result.watchId).toBeTruthy()
+      expect(sender.listenerCount('destroyed')).toBe(1)
+      writeFileSync(join(temp, 'other.svg'), '<svg/>')
+      const secondResult = await watchHandler?.({ sender }, { path: 'other.svg', workspaceRoot: temp }) as {
+        ok: boolean
+        watchId?: string
+      }
+      expect(secondResult.ok).toBe(true)
+      expect(sender.listenerCount('destroyed')).toBe(1)
+
+      const replace = (source: string, content: string): void => {
+        const staged = join(temp, source)
+        writeFileSync(staged, content)
+        renameSync(staged, target)
+      }
+      replace('.motion-first.tmp', '<svg id="two"/>')
+      await vi.waitFor(() => {
+        expect(sender.send).toHaveBeenCalledWith(
+          'file:workspace-changed',
+          expect.objectContaining({ ok: true, content: '<svg id="two"/>' })
+        )
+      }, { timeout: 5_000 })
+
+      replace('.motion-second.tmp', '<svg id="three"/>')
+      await vi.waitFor(() => {
+        expect(sender.send).toHaveBeenCalledWith(
+          'file:workspace-changed',
+          expect.objectContaining({ ok: true, content: '<svg id="three"/>' })
+        )
+      }, { timeout: 5_000 })
+
+      await expect(unwatchHandler?.({}, result.watchId)).resolves.toBe(true)
+      expect(sender.listenerCount('destroyed')).toBe(1)
+      await expect(unwatchHandler?.({}, secondResult.watchId)).resolves.toBe(true)
+      expect(sender.listenerCount('destroyed')).toBe(0)
+    } finally {
+      rmSync(temp, { recursive: true, force: true })
+    }
+  })
+
   it('accepts the full settings snapshot emitted by SettingsView auto-apply', async () => {
-    const { registerAppIpcHandlers } = await import('./register-app-ipc-handlers')
     const applySettingsPatch = vi.fn(async () => settings())
 
     registerAppIpcHandlers(registerOptions({ applySettingsPatch }))
@@ -245,11 +1695,15 @@ describe('registerAppIpcHandlers', () => {
     const payload = { ...settings(), locale: 'zh' as const }
     const handler = handlers.get('settings:set')
     await expect(handler?.({}, payload)).resolves.toEqual(settings())
-    expect(applySettingsPatch).toHaveBeenCalledWith(payload)
+    const { projectConfig: _projectConfig, ...safeKun } = payload.agents.kun
+    void _projectConfig
+    expect(applySettingsPatch).toHaveBeenCalledWith({
+      ...payload,
+      agents: { kun: safeKun }
+    })
   })
 
   it('passes schedule settings patches through to applySettingsPatch', async () => {
-    const { registerAppIpcHandlers } = await import('./register-app-ipc-handlers')
     const applySettingsPatch = vi.fn(async (partial: AppSettingsPatch) => ({
       ...settings(),
       schedule: mergeScheduleSettings(settings().schedule, partial.schedule)
@@ -282,7 +1736,6 @@ describe('registerAppIpcHandlers', () => {
   })
 
   it('writes MCP config JSON and notifies the runtime apply hook', async () => {
-    const { registerAppIpcHandlers } = await import('./register-app-ipc-handlers')
     const tempRoot = mkdtempSync(join(tmpdir(), 'deepseek-gui-ipc-'))
     const configPath = join(tempRoot, 'mcp.json')
     const onKunMcpConfigWritten = vi.fn(async () => undefined)
@@ -313,7 +1766,6 @@ describe('registerAppIpcHandlers', () => {
   })
 
   it('rejects invalid MCP config JSON before writing or applying it', async () => {
-    const { registerAppIpcHandlers } = await import('./register-app-ipc-handlers')
     const tempRoot = mkdtempSync(join(tmpdir(), 'deepseek-gui-ipc-'))
     const configPath = join(tempRoot, 'mcp.json')
     const onKunMcpConfigWritten = vi.fn(async () => undefined)
@@ -337,8 +1789,163 @@ describe('registerAppIpcHandlers', () => {
     }
   })
 
+  it('writes and reads project config without implicitly granting MCP trust', async () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), 'kun-project-config-ipc-'))
+    const workspace = join(tempRoot, 'workspace')
+    const onKunProjectConfigChanged = vi.fn(async () => undefined)
+    const content = JSON.stringify({
+      version: 1,
+      mcp: { servers: { local: { transport: 'stdio', command: 'node' } } }
+    }, null, 2)
+    try {
+      await import('node:fs/promises').then(({ mkdir }) => mkdir(workspace))
+      const canonicalWorkspace = realpathSync.native(workspace)
+      registerAppIpcHandlers(registerOptions({ onKunProjectConfigChanged }))
+
+      const written = await handlers.get('kun:project-config:write')?.({}, {
+        workspaceRoot: workspace,
+        content
+      }) as Record<string, unknown>
+
+      expect(written).toMatchObject({
+        status: 'valid',
+        trust: 'untrusted',
+        content,
+        exists: true
+      })
+      expect(onKunProjectConfigChanged).toHaveBeenCalledWith(
+        join(canonicalWorkspace, '.kun', 'project.json'),
+        content
+      )
+      await expect(handlers.get('kun:project-config:read')?.({}, { workspaceRoot: workspace }))
+        .resolves.toMatchObject({ status: 'valid', trust: 'untrusted', content })
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('persists and revokes only the current validated project config digest', async () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), 'kun-project-trust-ipc-'))
+    const workspace = join(tempRoot, 'workspace')
+    let current = settings()
+    const store = { load: vi.fn(async () => current) }
+    const applySettingsPatch = vi.fn(async (patch: AppSettingsPatch) => {
+      current = {
+        ...current,
+        agents: {
+          kun: mergeKunRuntimeSettings(current.agents.kun, patch.agents?.kun)
+        }
+      }
+      return current
+    })
+    try {
+      await import('node:fs/promises').then(({ mkdir }) => mkdir(workspace))
+      const canonicalWorkspace = realpathSync.native(workspace)
+      registerAppIpcHandlers(registerOptions({ store: store as never, applySettingsPatch }))
+      await handlers.get('kun:project-config:write')?.({}, {
+        workspaceRoot: workspace,
+        content: JSON.stringify({
+          version: 1,
+          mcp: { servers: { local: { transport: 'stdio', command: 'node' } } }
+        })
+      })
+
+      const reviewed = await handlers.get('kun:project-config:read')?.({}, {
+        workspaceRoot: workspace
+      }) as { digest: string }
+      writeFileSync(join(workspace, '.kun', 'project.json'), JSON.stringify({
+        version: 1,
+        mcp: { servers: { raced: { transport: 'stdio', command: 'node' } } }
+      }))
+      await expect(handlers.get('kun:project-config:trust')?.({}, {
+        workspaceRoot: workspace,
+        trusted: true,
+        expectedDigest: reviewed.digest
+      })).rejects.toThrow(/changed after confirmation/)
+      expect(current.agents.kun.projectConfig.grants).toEqual([])
+
+      let currentReview = await handlers.get('kun:project-config:read')?.({}, {
+        workspaceRoot: workspace
+      }) as { digest: string }
+      electronMock.showMessageBox.mockImplementationOnce(async () => {
+        writeFileSync(join(workspace, '.kun', 'project.json'), JSON.stringify({
+          version: 1,
+          mcp: { servers: { duringConfirm: { transport: 'stdio', command: 'node' } } }
+        }))
+        return { response: 0 }
+      })
+      await expect(handlers.get('kun:project-config:trust')?.({}, {
+        workspaceRoot: workspace,
+        trusted: true,
+        expectedDigest: currentReview.digest
+      })).rejects.toThrow(/changed during confirmation/)
+      expect(current.agents.kun.projectConfig.grants).toEqual([])
+
+      currentReview = await handlers.get('kun:project-config:read')?.({}, {
+        workspaceRoot: workspace
+      }) as { digest: string }
+      electronMock.showMessageBox.mockResolvedValueOnce({ response: 1 })
+      await expect(handlers.get('kun:project-config:trust')?.({}, {
+        workspaceRoot: workspace,
+        trusted: true,
+        expectedDigest: currentReview.digest
+      })).resolves.toMatchObject({ status: 'valid', trust: 'untrusted' })
+      expect(current.agents.kun.projectConfig.grants).toEqual([])
+
+      electronMock.showMessageBox.mockResolvedValue({ response: 0 })
+      await expect(handlers.get('kun:project-config:trust')?.({}, {
+        workspaceRoot: workspace,
+        trusted: true,
+        expectedDigest: currentReview.digest
+      })).resolves.toMatchObject({ status: 'valid', trust: 'trusted' })
+      expect(electronMock.showMessageBox).toHaveBeenLastCalledWith(expect.objectContaining({
+        title: 'Approve project MCP',
+        detail: expect.stringContaining(`SHA-256: ${currentReview.digest}`),
+        defaultId: 1,
+        cancelId: 1
+      }))
+      expect(current.agents.kun.projectConfig.grants).toEqual([
+        expect.objectContaining({ workspaceRoot: canonicalWorkspace })
+      ])
+
+      writeFileSync(join(workspace, '.kun', 'project.json'), JSON.stringify({
+        version: 1,
+        mcp: { servers: { changed: { transport: 'stdio', command: 'node' } } }
+      }))
+      await expect(handlers.get('kun:project-config:read')?.({}, { workspaceRoot: workspace }))
+        .resolves.toMatchObject({ status: 'valid', trust: 'stale' })
+
+      await expect(handlers.get('kun:project-config:trust')?.({}, {
+        workspaceRoot: workspace,
+        trusted: false
+      })).resolves.toMatchObject({ status: 'valid', trust: 'untrusted' })
+      expect(current.agents.kun.projectConfig.grants).toEqual([])
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects invalid project config payloads and unsafe content without callbacks', async () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), 'kun-project-invalid-ipc-'))
+    const workspace = join(tempRoot, 'workspace')
+    const onKunProjectConfigChanged = vi.fn()
+    try {
+      await import('node:fs/promises').then(({ mkdir }) => mkdir(workspace))
+      registerAppIpcHandlers(registerOptions({ onKunProjectConfigChanged }))
+
+      await expect(handlers.get('kun:project-config:read')?.({}, { workspaceRoot: 'relative' }))
+        .rejects.toThrow(/absolute path/)
+      await expect(handlers.get('kun:project-config:write')?.({}, {
+        workspaceRoot: workspace,
+        content: JSON.stringify({ version: 1, skills: { roots: ['../escape'] } })
+      })).rejects.toThrow(/escapes the workspace/)
+      expect(onKunProjectConfigChanged).not.toHaveBeenCalled()
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true })
+    }
+  })
+
   it('uses the GUI-managed WeChat bridge for WeChat install handlers', async () => {
-    const { registerAppIpcHandlers } = await import('./register-app-ipc-handlers')
     const configuredSettings = settings()
     configuredSettings.claw.im.weixinBridgeUrl = 'http://127.0.0.1:18787/rpc'
     const store = { load: vi.fn(async () => configuredSettings) }
@@ -366,7 +1973,6 @@ describe('registerAppIpcHandlers', () => {
   })
 
   it('routes schedule task IPC calls to the Schedule runtime', async () => {
-    const { registerAppIpcHandlers } = await import('./register-app-ipc-handlers')
     const scheduleRuntime = {
       status: vi.fn(async () => ({
         internalServerRunning: true,
@@ -419,7 +2025,6 @@ describe('registerAppIpcHandlers', () => {
   })
 
   it('routes desktop command IPC calls to the focused window and web contents', async () => {
-    const { registerAppIpcHandlers } = await import('./register-app-ipc-handlers')
     const webContents = {
       undo: vi.fn(),
       redo: vi.fn(),
@@ -456,5 +2061,51 @@ describe('registerAppIpcHandlers', () => {
     expect(webContents.setZoomLevel).toHaveBeenCalledWith(1)
     expect(mainWindow.maximize).toHaveBeenCalledTimes(1)
     expect(mainWindow.close).toHaveBeenCalledTimes(1)
+  })
+
+  it('creates a unique conversation workspace, suffixing on timestamp collision', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'kun-conv-'))
+    try {
+      registerAppIpcHandlers(registerOptions({
+        store: { load: vi.fn(async () => ({ ...settings(), conversationWorkspaceRoot: root })) } as never
+      }))
+
+      const handler = handlers.get('conversation:create-workspace')
+      expect(handler).toBeTypeOf('function')
+
+      const first = await handler?.({}) as { ok: boolean; path: string }
+      const second = await handler?.({}) as { ok: boolean; path: string }
+
+      expect(first.ok).toBe(true)
+      expect(second.ok).toBe(true)
+      // 两次创建即使落在同一秒,目录路径也必须不同,否则会静默共用目录。
+      expect(first.path).not.toBe(second.path)
+      expect(existsSync(first.path)).toBe(true)
+      expect(existsSync(second.path)).toBe(true)
+      expect(first.path.startsWith(root)).toBe(true)
+      expect(second.path.startsWith(root)).toBe(true)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('creates a missing custom conversation workspace root when creating a conversation', async () => {
+    const parent = mkdtempSync(join(tmpdir(), 'kun-conv-missing-'))
+    const root = join(parent, 'custom-root', 'nested-root')
+    try {
+      registerAppIpcHandlers(registerOptions({
+        store: { load: vi.fn(async () => ({ ...settings(), conversationWorkspaceRoot: root })) } as never
+      }))
+
+      const handler = handlers.get('conversation:create-workspace')
+      const result = await handler?.({}) as { ok: boolean; path: string; error?: string }
+
+      expect(result.ok).toBe(true)
+      expect(result.path.startsWith(root)).toBe(true)
+      expect(existsSync(root)).toBe(true)
+      expect(existsSync(result.path)).toBe(true)
+    } finally {
+      rmSync(parent, { recursive: true, force: true })
+    }
   })
 })

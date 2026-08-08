@@ -141,11 +141,13 @@ PR 描述建议至少包含：
 
 当同仓库内从 `develop` 指向 `master` 的 PR 被合并后，GitHub Actions 会自动发布稳定版本。
 
+每次合并发布 PR 前，发布负责人必须完成[稳定版发版交验清单与故障排查](./release-validation-checklist.md)，重点核验 Graph 时序、Linux AppImage、Windows NSIS/跨范围迁移、打包后的 Electron/Extension smoke、跨平台 evidence 和 R2 `stable/latest`。
+
 发布 workflow 会：
 
 - 基于最新三段式 semver tag 自动生成下一个 `vX.Y.Z` patch tag
 - 如果 rerun 时当前 merge commit 已经有 tag，则复用该 tag
-- 构建已签名并公证的 macOS arm64/x64 包、Windows x64 安装器、Linux x64 AppImage
+- 构建已签名并公证的 macOS arm64/x64 包、Windows x64 安装器、Linux x64 AppImage 与 deb
 - 将发布产物和更新元数据上传到 GitHub Releases 与 R2 `stable` 渠道
 - 只有在全部平台上传成功后，才会 promote R2 `stable/latest`
 

@@ -4,13 +4,30 @@ import { jsonResponse, type JsonResponse } from '../response.js'
 import type { ServerRuntime } from './server-runtime.js'
 
 export function runtimeInfoJsonResponse(runtime: ServerRuntime): JsonResponse {
-  return jsonResponse(RuntimeInfoResponse.parse(runtime.info()))
+  const response = jsonResponse(RuntimeInfoResponse.parse(runtime.info()))
+  if (
+    typeof runtime.managerProtocolVersion === 'number' &&
+    Number.isSafeInteger(runtime.managerProtocolVersion) &&
+    runtime.managerProtocolVersion > 0
+  ) {
+    response.headers['x-kun-manager-protocol-version'] = String(runtime.managerProtocolVersion)
+  }
+  const activeTurnCount = runtime.activeTurnCount?.()
+  if (
+    typeof activeTurnCount === 'number' &&
+    Number.isSafeInteger(activeTurnCount) &&
+    activeTurnCount >= 0
+  ) {
+    response.headers['x-kun-active-turn-count'] = String(activeTurnCount)
+  }
+  return response
 }
 
 export async function runtimeToolDiagnosticsJsonResponse(runtime: ServerRuntime): Promise<JsonResponse> {
   return jsonResponse(redactSecrets(await (runtime.toolDiagnostics?.() ?? {
     providers: [],
     mcpServers: [],
+    mcpOAuth: [],
     webProviders: [],
     skills: {
       enabled: false,

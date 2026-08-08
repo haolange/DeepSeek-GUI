@@ -20,10 +20,13 @@ class FakeProvider implements AgentProvider {
   readonly displayName = 'Fake'
   forkMock = vi.fn()
   sendMock = vi.fn()
+  sendGate: Promise<void> | null = null
   deleteMock = vi.fn()
   patchMock = vi.fn()
   interruptMock = vi.fn()
   subscribeMock = vi.fn()
+  submitUserInputMock = vi.fn()
+  cancelUserInputMock = vi.fn()
   refreshThreadsMock = vi.fn()
   closeSideMock = vi.fn()
   getCapabilities() {
@@ -39,12 +42,23 @@ class FakeProvider implements AgentProvider {
   async getThreadDetail() {
     return { blocks: [], latestSeq: 0 }
   }
+  async getThreadState() {
+    return { status: 'idle', updatedAt: '', latestSeq: 0 }
+  }
   async sendUserMessage(
     threadId: string,
     text: string,
-    options?: { model?: string; reasoningEffort?: string }
+    options?: {
+      model?: string
+      providerId?: string
+      accountId?: string
+      reasoningEffort?: string
+      serviceTier?: 'priority'
+      attachmentIds?: string[]
+    }
   ) {
     this.sendMock(threadId, text, options)
+    if (this.sendGate) await this.sendGate
     return { threadId, turnId: `turn_${threadId}_${Date.now()}` }
   }
   async steerUserMessage() {}
@@ -95,8 +109,12 @@ class FakeProvider implements AgentProvider {
     })
   }
   async submitApprovalDecision() {}
-  async submitUserInputResponse() {}
-  async cancelUserInput() {}
+  async submitUserInputResponse(inputId: string, answers: unknown[]) {
+    this.submitUserInputMock(inputId, answers)
+  }
+  async cancelUserInput(inputId: string) {
+    this.cancelUserInputMock(inputId)
+  }
 }
 
 function buildHarness(overrides: Partial<ChatState> = {}): Harness {
@@ -140,7 +158,9 @@ function buildHarness(overrides: Partial<ChatState> = {}): Harness {
     turnReasoningLastAtByUserId: {},
     inspectorSelectedId: null,
     composerModel: 'deepseek-chat',
+    composerProviderId: 'deepseek',
     composerPickList: ['deepseek-chat'],
+    composerModelGroups: [],
     queuedMessages: [],
     watchTurnCompletion: {},
     unreadThreadIds: {},
@@ -159,6 +179,7 @@ function buildHarness(overrides: Partial<ChatState> = {}): Harness {
     createWriteThread: async () => null,
     selectWriteThread: async () => undefined,
     openSettings: () => undefined,
+    closeSettings: () => undefined,
     openPlugins: () => undefined,
     openClaw: () => undefined,
     refreshClawChannels: async () => undefined,
@@ -198,9 +219,12 @@ function buildHarness(overrides: Partial<ChatState> = {}): Harness {
     openSideConversationDraft: () => undefined,
     sendSideMessage: async () => false,
     interruptSide: async () => undefined,
+    resolveSideUserInput: async () => undefined,
     setSideInput: () => undefined,
     setSideModel: () => undefined,
     setSideReasoningEffort: () => undefined,
+    setSideFastMode: () => undefined,
+    setSideAttachments: () => undefined,
     selectSideConversation: () => undefined,
     setSidePanelOpen: () => undefined,
     closeSideConversation: async () => undefined,
@@ -275,6 +299,56 @@ describe('chat-store-side-actions', () => {
     expect(provider.forkMock).not.toHaveBeenCalled()
   })
 
+  it('keeps side user input live and resolves it against the side block', async () => {
+    const { actions, state, provider } = buildHarness()
+    const sideId = await actions.spawnSideConversation()
+    const sink = provider.subscribeMock.mock.calls.at(-1)?.[2] as ThreadEventSink
+
+    sink.onUserInput({
+      requestId: 'request-side-1',
+      itemId: 'item-side-1',
+      turnId: 'turn-side-1',
+      questions: [{
+        id: 'scope',
+        header: 'Scope',
+        question: 'Where should this be available?',
+        options: [
+          { label: 'Side only', description: 'Keep it in the side conversation.' },
+          { label: 'Everywhere', description: 'Share it with the main conversation.' }
+        ]
+      }]
+    })
+
+    expect(state.sideConversations[sideId!].blocks).toContainEqual(
+      expect.objectContaining({
+        kind: 'user_input',
+        id: 'item-side-1',
+        requestId: 'request-side-1',
+        status: 'pending',
+        live: true
+      })
+    )
+
+    await actions.resolveSideUserInput(sideId!, 'item-side-1', {
+      kind: 'submit',
+      answers: [{ id: 'scope', label: 'Side only', value: 'Side only' }]
+    })
+
+    expect(provider.submitUserInputMock).toHaveBeenCalledWith(
+      'request-side-1',
+      [{ id: 'scope', label: 'Side only', value: 'Side only' }]
+    )
+    expect(state.sideConversations[sideId!].blocks).toContainEqual(
+      expect.objectContaining({
+        kind: 'user_input',
+        id: 'item-side-1',
+        status: 'submitted',
+        live: false,
+        answers: [{ id: 'scope', label: 'Side only', value: 'Side only' }]
+      })
+    )
+  })
+
   it('spawnSideConversation with seedText immediately sends the first turn', async () => {
     const { actions, state, provider } = buildHarness()
     const id = await actions.spawnSideConversation('what is the dependency tree?')
@@ -288,6 +362,241 @@ describe('chat-store-side-actions', () => {
     expect(side.busy).toBe(true)
     expect(side.turnId).toMatch(/^turn_side_thr_main_/)
     expect(side.input).toBe('')
+  })
+
+  it('sends Fast mode as priority service tier for eligible Codex branch turns', async () => {
+    const modelGroup = {
+      providerId: 'codex-2',
+      presetSource: 'codex' as const,
+      label: 'ChatGPT subscription 2',
+      modelIds: ['gpt-5.4'],
+      modelProfiles: {
+        'gpt-5.4': {
+          inputModalities: ['text' as const],
+          outputModalities: ['text' as const],
+          supportsToolCalling: true,
+          messageParts: ['text' as const],
+          serviceTiers: ['priority' as const]
+        }
+      }
+    }
+    const { actions, state, provider } = buildHarness({
+      composerModel: 'gpt-5.4',
+      composerProviderId: 'codex-2',
+      composerFastMode: true,
+      composerPickList: ['gpt-5.4'],
+      composerModelGroups: [modelGroup]
+    })
+
+    const id = await actions.spawnSideConversation('send the first turn fast', {
+      model: 'gpt-5.4',
+      providerId: 'codex-2',
+      fastMode: true
+    })
+
+    expect(id).toBe('side_thr_main')
+    expect(state.sideConversations[id!].fastMode).toBe(true)
+    expect(provider.sendMock).toHaveBeenLastCalledWith(
+      id,
+      'send the first turn fast',
+      expect.objectContaining({ serviceTier: 'priority' })
+    )
+
+    state.sideConversations[id!].busy = false
+    actions.setSideFastMode(id!, false)
+    await actions.sendSideMessage(id!, 'send the next turn normally')
+    expect(provider.sendMock).toHaveBeenLastCalledWith(
+      id,
+      'send the next turn normally',
+      expect.not.objectContaining({ serviceTier: 'priority' })
+    )
+  })
+
+  it('starts an attachment-only first branch turn', async () => {
+    const { actions, state, provider } = buildHarness()
+
+    const id = await actions.spawnSideConversation('', {
+      attachments: [{ id: 'att-only', kind: 'image' }]
+    })
+
+    expect(provider.sendMock).toHaveBeenCalledWith(
+      id,
+      '',
+      expect.objectContaining({ attachmentIds: ['att-only'] })
+    )
+    expect(state.sideConversations[id!].attachments).toEqual([])
+    expect(state.sideConversations[id!].busy).toBe(true)
+  })
+
+  it('sends branch attachments, clears them only after success, and keeps Fast mode', async () => {
+    const modelGroup = {
+      providerId: 'codex-2',
+      presetSource: 'codex' as const,
+      label: 'ChatGPT subscription 2',
+      modelIds: ['gpt-5.4'],
+      modelProfiles: {
+        'gpt-5.4': {
+          inputModalities: ['text' as const, 'image' as const],
+          outputModalities: ['text' as const],
+          supportsToolCalling: true,
+          messageParts: ['text' as const, 'image_url' as const],
+          serviceTiers: ['priority' as const]
+        }
+      }
+    }
+    const { actions, state, provider } = buildHarness({
+      composerModel: 'gpt-5.4',
+      composerProviderId: 'codex-2',
+      composerFastMode: true,
+      composerPickList: ['gpt-5.4'],
+      composerModelGroups: [modelGroup]
+    })
+    const id = await actions.spawnSideConversation(undefined, {
+      model: 'gpt-5.4',
+      providerId: 'codex-2',
+      fastMode: true
+    })
+    actions.setSideAttachments(id!, [
+      { id: 'att-side', kind: 'image', previewUrl: 'data:image/png;base64,preview' }
+    ])
+
+    await actions.sendSideMessage(id!, 'inspect this image')
+
+    expect(provider.sendMock).toHaveBeenLastCalledWith(
+      id,
+      'inspect this image',
+      expect.objectContaining({
+        serviceTier: 'priority',
+        attachmentIds: ['att-side']
+      })
+    )
+    expect(state.sideConversations[id!].attachments).toEqual([])
+  })
+
+  it('preserves attachments added while turn admission is pending', async () => {
+    const { actions, state, provider } = buildHarness()
+    const id = (await actions.spawnSideConversation())!
+    actions.setSideAttachments(id, [{ id: 'att-submitted', kind: 'image' }])
+    let releaseSend!: () => void
+    provider.sendGate = new Promise<void>((resolve) => {
+      releaseSend = resolve
+    })
+
+    const sending = actions.sendSideMessage(id, 'inspect the first image')
+    await vi.waitFor(() => expect(provider.sendMock).toHaveBeenCalled())
+    actions.setSideAttachments(id, [
+      { id: 'att-submitted', kind: 'image' },
+      { id: 'att-uploaded-later', kind: 'image' }
+    ])
+    releaseSend()
+    await sending
+
+    expect(state.sideConversations[id].attachments).toEqual([
+      expect.objectContaining({ id: 'att-uploaded-later' })
+    ])
+  })
+
+  it('sends draft attachments on the first branch turn and retains them when admission fails', async () => {
+    const { actions, state, provider } = buildHarness()
+    provider.sendMock.mockImplementationOnce(() => {
+      throw new Error('turn admission failed')
+    })
+
+    const id = await actions.spawnSideConversation('inspect draft image', {
+      attachments: [{ id: 'att-draft', kind: 'image' }]
+    })
+
+    expect(id).toBe('side_thr_main')
+    expect(provider.sendMock).toHaveBeenCalledWith(
+      id,
+      'inspect draft image',
+      expect.objectContaining({ attachmentIds: ['att-draft'] })
+    )
+    expect(state.sideConversations[id!].attachments).toEqual([
+      expect.objectContaining({ id: 'att-draft' })
+    ])
+    expect(state.sideConversations[id!].error).toBe('turn admission failed')
+  })
+
+  it('keeps attachments isolated between side conversations and the main composer', async () => {
+    const { actions, state } = buildHarness()
+    const firstId = (await actions.spawnSideConversation())!
+    state.sideConversations['side-other'] = {
+      ...state.sideConversations[firstId],
+      threadId: 'side-other',
+      attachments: [{ id: 'att-other', kind: 'image' }]
+    }
+
+    actions.setSideAttachments(firstId, [{ id: 'att-first', kind: 'image' }])
+
+    expect(state.sideConversations[firstId].attachments).toEqual([
+      expect.objectContaining({ id: 'att-first' })
+    ])
+    expect(state.sideConversations['side-other'].attachments).toEqual([
+      expect.objectContaining({ id: 'att-other' })
+    ])
+    expect(state.queuedMessages).toEqual([])
+  })
+
+  it('applies draft model and reasoning controls before sending the first side turn', async () => {
+    const { actions, state, provider } = buildHarness()
+    const id = await actions.spawnSideConversation('use the draft controls', {
+      model: 'custom-side-model',
+      providerId: 'custom-side-provider',
+      reasoningEffort: 'low'
+    })
+
+    expect(id).toBe('side_thr_main')
+    expect(state.sideConversations[id!]).toMatchObject({
+      model: 'custom-side-model',
+      providerId: 'custom-side-provider',
+      reasoningEffort: 'low'
+    })
+    expect(provider.sendMock).toHaveBeenCalledWith(
+      id,
+      'use the draft controls',
+      expect.objectContaining({
+        model: 'custom-side-model',
+        providerId: 'custom-side-provider',
+        reasoningEffort: 'low'
+      })
+    )
+  })
+
+  it('keeps the selected provider bound to the side model without changing the main composer', async () => {
+    const { actions, state, provider } = buildHarness({
+      composerModel: 'gpt-5.6-sol',
+      composerProviderId: 'codex',
+      composerPickList: ['gpt-5.6-sol', 'composer-2.5'],
+      composerModelGroups: [{
+        providerId: 'cursor-subscription',
+        accountId: 'cursor-account',
+        label: 'Cursor subscription',
+        modelIds: ['composer-2.5']
+      }]
+    })
+
+    const id = await actions.spawnSideConversation()
+    actions.setSideModel(id!, 'composer-2.5', 'cursor-subscription')
+    const sent = await actions.sendSideMessage(id!, 'route through Cursor')
+
+    expect(id).toBe('side_thr_main')
+    expect(sent).toBe(true)
+    expect(state.sideConversations[id!]).toMatchObject({
+      model: 'composer-2.5',
+      providerId: 'cursor-subscription'
+    })
+    expect(state.composerModel).toBe('gpt-5.6-sol')
+    expect(state.composerProviderId).toBe('codex')
+    expect(provider.sendMock).toHaveBeenCalledWith(
+      id,
+      'route through Cursor',
+      expect.objectContaining({
+        model: 'composer-2.5',
+        providerId: 'cursor-subscription',
+        accountId: 'cursor-account'
+      })
+    )
   })
 
   it('sends the selected side reasoning effort with side turns', async () => {
@@ -347,6 +656,106 @@ describe('chat-store-side-actions', () => {
     expect(state.sideConversations[id]).toBeUndefined()
     expect(signal?.aborted).toBe(true)
     expect(state.busy).toBe(true)
+  })
+
+  it('deduplicates replayed compaction lifecycle events by item id', async () => {
+    const { actions, state, provider } = buildHarness()
+    const id = (await actions.spawnSideConversation())!
+    const sink = provider.subscribeMock.mock.calls.at(-1)?.[2] as ThreadEventSink
+
+    sink.onCompaction({
+      itemId: 'compaction_side_1',
+      summary: 'Compacting context',
+      status: 'running',
+      createdAt: '2026-06-02T00:00:00.000Z'
+    })
+    sink.onCompaction({
+      itemId: 'compaction_side_1',
+      summary: 'Compacted context',
+      status: 'success',
+      createdAt: '2026-06-02T00:00:01.000Z',
+      messagesBefore: 120
+    })
+
+    const blocks = state.sideConversations[id].blocks.filter((block) => block.kind === 'compaction')
+    expect(blocks).toHaveLength(1)
+    expect(blocks[0]).toMatchObject({
+      id: 'compaction_side_1',
+      status: 'success',
+      summary: 'Compacted context',
+      messagesBefore: 120,
+      createdAt: '2026-06-02T00:00:00.000Z'
+    })
+  })
+
+  it('keeps side assistant text intact across tools and replaces it from the authoritative snapshot', async () => {
+    const { actions, state, provider } = buildHarness()
+    const id = (await actions.spawnSideConversation())!
+    const sink = provider.subscribeMock.mock.calls.at(-1)?.[2] as ThreadEventSink
+
+    sink.onDeltas([{
+      seq: 1,
+      threadId: id,
+      turnId: 'turn_side_1',
+      itemId: 'assistant_side_1',
+      createdAt: '2026-06-02T00:00:00.000Z',
+      kind: 'agent_message',
+      text: 'partial '
+    }])
+    sink.onTool({
+      itemId: 'tool_side_1',
+      turnId: 'turn_side_1',
+      summary: 'read',
+      status: 'running'
+    })
+    sink.onDeltas([{
+      seq: 2,
+      threadId: id,
+      turnId: 'turn_side_1',
+      itemId: 'assistant_side_1',
+      kind: 'agent_message',
+      text: 'text'
+    }])
+
+    expect(state.sideConversations[id].liveAssistant).toBe('partial text')
+    expect(state.sideConversations[id].blocks.filter((block) => block.kind === 'assistant')).toEqual([])
+
+    sink.onAssistantItem?.({
+      itemId: 'assistant_side_1',
+      threadId: id,
+      turnId: 'turn_side_1',
+      kind: 'agent_message',
+      status: 'completed',
+      createdAt: '2026-06-02T00:00:00.000Z',
+      text: 'partial missing middle text'
+    })
+
+    expect(state.sideConversations[id].liveAssistant).toBe('')
+    expect(state.sideConversations[id].blocks).toContainEqual({
+      kind: 'assistant',
+      id: 'assistant_side_1',
+      turnId: 'turn_side_1',
+      createdAt: '2026-06-02T00:00:00.000Z',
+      text: 'partial missing middle text'
+    })
+  })
+
+  it('updates approval resolution inside the matching side conversation', async () => {
+    const { actions, state, provider } = buildHarness()
+    const id = (await actions.spawnSideConversation())!
+    const lastCall = provider.subscribeMock.mock.calls.at(-1) as
+      | [string, number, ThreadEventSink, AbortSignal]
+      | undefined
+    const sink = lastCall?.[2]
+    sink?.onApproval({ approvalId: 'appr_side', summary: 'Run remote command' })
+    sink?.onApprovalStatus?.({ approvalId: 'appr_side', status: 'expired' })
+
+    expect(state.sideConversations[id].blocks).toContainEqual(expect.objectContaining({
+      kind: 'approval',
+      approvalId: 'appr_side',
+      status: 'expired'
+    }))
+    expect(state.blocks).toEqual([])
   })
 
   it('promoteSideConversation clears the relation by PATCH /v1/threads/{id} and refreshes the thread list', async () => {

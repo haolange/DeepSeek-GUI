@@ -8,18 +8,29 @@ import {
 } from '../../shared/app-settings'
 import {
   buildKunServeArgs,
-  resolveKunExecutable
+  resolveKunExecutable,
+  resolveKunRuntimeBuildId
 } from '../resolve-kun-binary'
 import {
   isKunChildRunning,
+  getKunServiceManagerBinding,
   reclaimKunPort,
   resolveAvailableKunPort,
-  startKunChild,
+  startKunSharedRuntime,
   stopKunChildAndWait
 } from '../kun-process'
 import { getKunBaseUrl } from '../kun-base-url'
+import type { RuntimeDiscoveryRecord } from '../../../kun/src/server/runtime-discovery.js'
+import {
+  inspectSharedRuntime,
+  runtimeMatchesExpectedBuild,
+  stopSharedRuntime
+} from '../../../kun/src/cli/shared-runtime.js'
+import { resolveCliRuntimeFlavor } from '../../../kun/src/cli/runtime-flavor.js'
+import { sameCanonicalPath } from '../../../kun/src/manager/canonical-path.js'
 
 const KUN_RUNTIME_ID = 'kun' as const
+let resolvedConnection: RuntimeDiscoveryRecord | null = null
 
 function appRoot(): string {
   return app.isPackaged
@@ -43,20 +54,45 @@ export const kunRuntimeAdapter = {
   },
 
   ensureRunning(settings: AppSettingsV1): Promise<void> {
-    return startKunChild(settings)
+    return ensureResolvedKunRuntime(settings)
   },
 
-  stopAndWait(): Promise<void> {
-    return stopKunChildAndWait()
+  /**
+   * Release GUI-local runtime state only. The detached shared daemon belongs
+   * to the data directory, not to this Electron process, so ordinary client
+   * shutdown must never stop it.
+   */
+  async stopAndWait(): Promise<void> {
+    resolvedConnection = null
+    await stopKunChildAndWait()
   },
 
   isChildRunning(): boolean {
+    if (resolvedConnection) {
+      // Shared runtimes are detached; a cached discovery record can outlive the
+      // process. Treat a dead PID as "not running" so watchdog recovery takes the
+      // missing/ensure fast path instead of waiting out unresponsive retries (#1116).
+      if (processIsAlive(resolvedConnection.pid)) return true
+      resolvedConnection = null
+    }
     return isKunChildRunning()
   },
 
   getBaseUrl(settings: AppSettingsV1): string {
+    if (resolvedConnection) return resolvedConnection.baseUrl
     const runtime = getKunRuntimeSettings(settings)
     return getKunBaseUrl(runtime.port)
+  },
+
+  resolveConnection(settings: AppSettingsV1): Promise<boolean> {
+    return refreshResolvedKunRuntime(settings)
+  },
+
+  async stopSharedAndWait(settings: AppSettingsV1): Promise<void> {
+    const dataDir = expandDataDir(getKunRuntimeSettings(settings).dataDir)
+    await stopSharedRuntime(dataDir, fetch, sharedRuntimeScope(dataDir))
+    resolvedConnection = null
+    await stopKunChildAndWait()
   },
 
   reclaimPort(port: number): Promise<{ ok: true } | { ok: false; message: string }> {
@@ -72,20 +108,136 @@ export function getRuntimeBaseUrlForSettings(settings: AppSettingsV1): string {
   return kunRuntimeAdapter.getBaseUrl(settings)
 }
 
+/** Resolve the bearer token for the active Kun connection. */
+export function getRuntimeAuthToken(settings: AppSettingsV1): string {
+  const runtime = getKunRuntimeSettings(settings)
+  return resolvedConnection?.runtimeToken ?? runtime.runtimeToken.trim()
+}
+
 /** Build the bearer-token authorization header for Kun requests. */
 export function runtimeAuthHeaders(settings: AppSettingsV1): Headers {
-  const runtime = getKunRuntimeSettings(settings)
   const headers = new Headers()
-  if (runtime.runtimeToken.trim()) {
-    headers.set('Authorization', `Bearer ${runtime.runtimeToken.trim()}`)
+  const token = getRuntimeAuthToken(settings)
+  if (token) {
+    headers.set('Authorization', `Bearer ${token}`)
   }
   return headers
+}
+
+async function ensureResolvedKunRuntime(settings: AppSettingsV1): Promise<void> {
+  if (await refreshResolvedKunRuntime(settings)) return
+  const connection = await startKunSharedRuntime(settings)
+  resolvedConnection = connection?.discovery ?? null
+}
+
+async function refreshResolvedKunRuntime(settings: AppSettingsV1): Promise<boolean> {
+  const runtime = getKunRuntimeSettings(settings)
+  const dataDir = expandDataDir(runtime.dataDir)
+  const expectedBuildId = await resolveKunRuntimeBuildId(
+    resolveKunExecutable(runtime.binaryPath.trim() ? '' : appRoot(), runtime.binaryPath)
+  )
+  const inspected = await inspectSharedRuntime(dataDir, fetch, sharedRuntimeScope(dataDir))
+    .catch(() => null)
+  if (!inspected) {
+    resolvedConnection = null
+    return false
+  }
+  const connection = inspected.connection
+  if (
+    connection &&
+    !runtimeMatchesExpectedBuild(connection, expectedBuildId) &&
+    (connection.activeTurnCount ?? 0) === 0
+  ) {
+    resolvedConnection = null
+    return false
+  }
+  // Preserve the real endpoint while a live runtime is temporarily
+  // unresponsive. Health recovery must probe this process, not the legacy
+  // configured port, and must never elect a second writer for the data dir.
+  resolvedConnection = inspected.discovery
+  return true
+}
+
+function sharedRuntimeScope(dataDir: string): {
+  runtimeFlavor: ReturnType<typeof resolveCliRuntimeFlavor>
+  manager?: NonNullable<ReturnType<typeof getKunServiceManagerBinding>>
+} {
+  const runtimeFlavor = resolveCliRuntimeFlavor({ env: process.env })
+  const manager = getKunServiceManagerBinding()
+  return {
+    runtimeFlavor,
+    ...(manager && sameCanonicalPath(manager.discovery.dataDir, dataDir) ? { manager } : {})
+  }
+}
+
+function expandDataDir(value: string): string {
+  return value.replace(/^~(?=$|[\\/])/, homedir())
+}
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    // EPERM means the process exists but we cannot signal it.
+    return (error as NodeJS.ErrnoException)?.code === 'EPERM'
+  }
+}
+
+/** Test-only: inject a cached discovery record for dead-PID recovery coverage. */
+export function setResolvedKunRuntimeConnectionForTests(
+  connection: RuntimeDiscoveryRecord | null
+): void {
+  resolvedConnection = connection
 }
 
 export type RuntimeRequestInit = {
   method?: string
   body?: string
   headers?: Record<string, string>
+  signal?: AbortSignal
+  timeoutMs?: number
+}
+
+/**
+ * Immutable identity for one Main-process HTTP operation.
+ *
+ * The discovery record can be replaced by a concurrent managed-runtime
+ * restart. Callers that bind authorization material to a request (notably
+ * protected approvals) must snapshot the endpoint and token together after
+ * ensure and use that snapshot exactly once.
+ */
+export type RuntimeRequestLease = Readonly<{
+  baseUrl: string
+  runtimeToken: string
+  runtimeInstanceId?: string
+}>
+
+const DEFAULT_RUNTIME_GET_TIMEOUT_MS = 15_000
+const DEFAULT_RUNTIME_POST_TIMEOUT_MS = 60_000
+const MODEL_CONNECTION_EVENTS_TIMEOUT_MARGIN_MS = 5_000
+const MAX_MODEL_CONNECTION_EVENTS_WAIT_MS = 120_000
+
+export function resolveRuntimeRequestTimeoutMs(
+  pathNorm: string,
+  method: string,
+  requestedTimeoutMs?: number
+): number {
+  if (requestedTimeoutMs !== undefined) return requestedTimeoutMs
+  const fallback = method === 'POST'
+    ? DEFAULT_RUNTIME_POST_TIMEOUT_MS
+    : DEFAULT_RUNTIME_GET_TIMEOUT_MS
+  if (method !== 'GET' || !pathNorm.startsWith('/v1/model-connections/events?')) {
+    return fallback
+  }
+  const query = pathNorm.slice(pathNorm.indexOf('?') + 1)
+  const waitMs = Number(new URLSearchParams(query).get('wait_ms'))
+  if (!Number.isSafeInteger(waitMs) || waitMs <= 0) return fallback
+  return Math.max(
+    fallback,
+    Math.min(waitMs, MAX_MODEL_CONNECTION_EVENTS_WAIT_MS) +
+      MODEL_CONNECTION_EVENTS_TIMEOUT_MARGIN_MS
+  )
 }
 
 export async function runtimeRequestViaHost(
@@ -94,27 +246,118 @@ export async function runtimeRequestViaHost(
   init: RuntimeRequestInit,
   ensureRuntime: (settings: AppSettingsV1) => Promise<AppSettingsV1 | void>
 ): Promise<{ ok: boolean; status: number; body: string }> {
+  init.signal?.throwIfAborted()
   const ensuredSettings = await ensureRuntime(settings)
+  init.signal?.throwIfAborted()
   const requestSettings = ensuredSettings ?? settings
-  const base = getRuntimeBaseUrlForSettings(requestSettings)
+  const method = (init.method ?? 'GET').toUpperCase()
+  const lease = snapshotRuntimeRequestLease(requestSettings)
   const pathNorm = pathAndQuery.startsWith('/') ? pathAndQuery : `/${pathAndQuery}`
-  const url = `${base}${pathNorm}`
-  const hdrs = runtimeAuthHeaders(requestSettings)
+  try {
+    return await fetchRuntimeRequest(lease, pathNorm, method, init)
+  } catch (error) {
+    if (init.signal?.aborted) throw error
+    // A request timeout is local to that operation. Let the watchdog decide
+    // whether the process is globally unhealthy instead of turning one slow
+    // attachment preview into an immediate managed-runtime restart.
+    if (!isRuntimeConnectionFailure(error)) throw error
+    const retrySettings = await ensureRuntime(requestSettings)
+    init.signal?.throwIfAborted()
+    const nextSettings = retrySettings ?? requestSettings
+    const nextLease = snapshotRuntimeRequestLease(nextSettings)
+    const safeToRetry = method === 'GET' || method === 'HEAD' ||
+      nextLease.baseUrl !== lease.baseUrl
+    if (!safeToRetry) throw error
+    return fetchRuntimeRequest(nextLease, pathNorm, method, init)
+  }
+}
+
+/** Acquire one endpoint/token snapshot after the managed runtime is ready. */
+export async function acquireRuntimeRequestLease(
+  settings: AppSettingsV1,
+  ensureRuntime: (settings: AppSettingsV1) => Promise<AppSettingsV1 | void>
+): Promise<RuntimeRequestLease> {
+  const ensuredSettings = await ensureRuntime(settings)
+  return snapshotRuntimeRequestLease(ensuredSettings ?? settings)
+}
+
+/**
+ * Send exactly one request through an already acquired lease.
+ *
+ * This deliberately performs no ensure, endpoint rebinding, or retry. A
+ * non-idempotent request must fail against the runtime identity for which its
+ * authorization material was created.
+ */
+export function runtimeRequestViaLease(
+  lease: RuntimeRequestLease,
+  pathAndQuery: string,
+  init: RuntimeRequestInit
+): Promise<{ ok: boolean; status: number; body: string }> {
+  init.signal?.throwIfAborted()
+  const method = (init.method ?? 'GET').toUpperCase()
+  const pathNorm = pathAndQuery.startsWith('/') ? pathAndQuery : `/${pathAndQuery}`
+  return fetchRuntimeRequest(lease, pathNorm, method, init)
+}
+
+function snapshotRuntimeRequestLease(settings: AppSettingsV1): RuntimeRequestLease {
+  const connection = resolvedConnection
+  return Object.freeze({
+    baseUrl: connection?.baseUrl ?? getRuntimeBaseUrlForSettings(settings),
+    runtimeToken: connection?.runtimeToken ?? getKunRuntimeSettings(settings).runtimeToken.trim(),
+    ...(connection?.instanceId ? { runtimeInstanceId: connection.instanceId } : {})
+  })
+}
+
+async function fetchRuntimeRequest(
+  lease: RuntimeRequestLease,
+  pathNorm: string,
+  method: string,
+  init: RuntimeRequestInit
+): Promise<{ ok: boolean; status: number; body: string }> {
+  const url = `${lease.baseUrl}${pathNorm}`
+  const hdrs = new Headers()
   for (const [key, value] of Object.entries(init.headers ?? {})) {
     hdrs.set(key, value)
+  }
+  // Runtime identity is owned by Main. A caller-supplied header must never
+  // replace (or synthesize, when absent) the lease authorization.
+  if (lease.runtimeToken) {
+    hdrs.set('Authorization', `Bearer ${lease.runtimeToken}`)
+  } else {
+    hdrs.delete('Authorization')
   }
   hdrs.set('Accept', 'application/json')
   if (init.body && !hdrs.has('Content-Type')) {
     hdrs.set('Content-Type', 'application/json')
   }
   const res = await fetch(url, {
-    method: init.method ?? 'GET',
+    method,
     headers: hdrs,
     body: init.body,
-    signal: AbortSignal.timeout(init.method === 'POST' ? 60_000 : 15_000)
+    signal: requestSignal(
+      init.signal,
+      resolveRuntimeRequestTimeoutMs(pathNorm, method, init.timeoutMs)
+    )
   })
   const text = await res.text()
   return { ok: res.ok, status: res.status, body: text }
+}
+
+function requestSignal(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
+  const timeout = AbortSignal.timeout(timeoutMs)
+  return signal ? AbortSignal.any([signal, timeout]) : timeout
+}
+
+function isRuntimeConnectionFailure(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  const text = `${error.name} ${error.message} ${String((error as { cause?: unknown }).cause ?? '')}`.toLowerCase()
+  return (
+    text.includes('fetch failed') ||
+    text.includes('econnrefused') ||
+    text.includes('econnreset') ||
+    text.includes('socket') ||
+    text.includes('connect')
+  )
 }
 
 export { buildKunServeArgs, resolveKunExecutable }

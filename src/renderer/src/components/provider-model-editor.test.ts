@@ -36,6 +36,10 @@ function chatForm(
 }
 
 describe('provider-model-editor', () => {
+  it('defaults new chat models to a 256k context window', () => {
+    expect(newProviderModelForm('chat', provider()).contextWindowTokens).toBe(256_000)
+  })
+
   it('derives the reasoning protocol from the provider connection', () => {
     expect(defaultReasoningProtocolForProvider(provider())).toBe('deepseek-chat-completions')
     expect(
@@ -66,6 +70,7 @@ describe('provider-model-editor', () => {
     const next = applyProviderModelForm(target, chatForm(target, {
       modelId: 'New-Model',
       contextWindowTokens: 256_000,
+      maxOutputTokens: 16_000,
       visionInput: true,
       supportsToolCalling: false
     }))
@@ -73,6 +78,7 @@ describe('provider-model-editor', () => {
     const profile = next.modelProfiles['new-model']
     expect(profile).toEqual({
       contextWindowTokens: 256_000,
+      maxOutputTokens: 16_000,
       inputModalities: ['text', 'image'],
       outputModalities: ['text'],
       supportsToolCalling: false,
@@ -122,6 +128,7 @@ describe('provider-model-editor', () => {
         'seeing-thinker': {
           aliases: ['st-alias'],
           contextWindowTokens: 1_000_000,
+          maxOutputTokens: 32_000,
           inputModalities: ['text', 'image'],
           outputModalities: ['text'],
           supportsToolCalling: true,
@@ -136,6 +143,7 @@ describe('provider-model-editor', () => {
     })
     const form = providerModelFormForExisting(target, 'chat', 'seeing-thinker')
     expect(form.contextWindowTokens).toBe(1_000_000)
+    expect(form.maxOutputTokens).toBe(32_000)
     expect(form.visionInput).toBe(true)
     expect(form.reasoningEnabled).toBe(true)
     expect(form.reasoningEfforts).toEqual(['off', 'high'])
@@ -282,6 +290,10 @@ describe('provider-model-editor', () => {
       chatForm(target, { modelId: 'ok', contextWindowTokens: -5 }),
       target
     )).toContainEqual({ code: 'invalidContextWindow' })
+    expect(validateProviderModelForm(
+      chatForm(target, { modelId: 'ok', maxOutputTokens: 0 }),
+      target
+    )).toContainEqual({ code: 'invalidMaxOutput' })
     expect(validateProviderModelForm(
       chatForm(target, { modelId: 'ok', reasoningEnabled: true, reasoningEfforts: [] }),
       target

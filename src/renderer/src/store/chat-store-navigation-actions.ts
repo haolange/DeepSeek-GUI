@@ -3,6 +3,7 @@ import { getProvider } from '../agent/registry'
 import { rendererRuntimeClient } from '../agent/runtime-client'
 import i18n from '../i18n'
 import {
+  applyChatContentMaxWidth,
   applyCursorSpotlight,
   applyCursorSpotlightColor,
   applyTheme,
@@ -26,9 +27,23 @@ import {
   saveThreadForkRegistry
 } from '../lib/thread-fork-registry'
 import { workspaceLabelFromPath } from '../lib/workspace-label'
-import { isInternalTemporaryWorkspace, normalizeWorkspaceRoot } from '../lib/workspace-path'
-import { buildClawRuntimePrompt, getActiveAgentApiKey } from '@shared/app-settings'
+import {
+  showWorkspaceMissingDialog,
+  workspaceDirectoryExists,
+  workspaceMissingError
+} from '../lib/workspace-availability'
+import {
+  isConversationWorkspacePath,
+  isInternalDeepSeekGuiWorkspace,
+  isInternalTemporaryWorkspace,
+  normalizeWorkspaceRoot,
+  workspaceRootIdentityKey
+} from '../lib/workspace-path'
+import { resolveProjectWorkspacePath } from '../lib/worktree-project-path'
+import { readThreadWorktreeRegistry } from '../lib/thread-worktree-registry'
+import { buildClawRuntimePrompt } from '@shared/app-settings'
 import type { ChatState, ChatStoreGet, ChatStoreSet } from './chat-store-types'
+import { invalidateThreadSnapshot } from './thread-snapshot-cache'
 import {
   activeClawChannel,
   forgetCodeWorkspaceRoot,
@@ -36,7 +51,6 @@ import {
   isClawThread,
   optimisticUserModelLabel,
   readCodeWorkspaceRoots,
-  readStoredComposerModel,
   rememberCodeWorkspaceRoots,
   rememberTurnModel,
   reconcileCodeWorkspaceRoots,
@@ -56,7 +70,7 @@ import {
   activeWriteThreadForWorkspace,
   forgetWriteThread,
   hydrateWriteThreadRegistry,
-  isWriteThreadId,
+  isWriteAssistantThread,
   markWriteThread,
   pruneWriteThreadRegistry,
   readWriteThreadRegistry,
@@ -64,6 +78,18 @@ import {
   writeThreadBelongsToWorkspace,
   writeWorkspaceForThreadId
 } from '../write/write-thread-registry'
+import { useWriteWorkspaceStore } from '../write/write-workspace-store'
+import {
+  DESIGN_ASSISTANT_THREAD_TITLE,
+  activeDesignThreadForWorkspace,
+  designDocKey,
+  forgetDesignThread,
+  isDesignThreadId,
+  markDesignThread,
+  readDesignThreadRegistry,
+  saveDesignThreadRegistry
+} from '../design/design-thread-registry'
+import { persistDesignChatMetaForDoc } from '../design/design-chat-transcript'
 import {
   isSddAssistantThread,
   readSddThreadRegistry
@@ -83,6 +109,7 @@ import {
   flushLiveBlocks,
   forkedMessageCount,
   forkedTurnCount,
+  isCodeSidebarThread,
   isCodeThread,
   latestThread,
   looksLikeActiveTurnError,
@@ -93,6 +120,7 @@ import {
   runtimeStreamRecoveringMessage,
   shouldOpenSettingsForError,
   syncTurnCompletionPoll,
+  turnCompleteNotificationSource,
   watchTurnCompletionNotification
 } from './chat-store-runtime'
 
@@ -111,25 +139,49 @@ let trayActionUnsubscribe: (() => void) | null = null
 
 export function createNavigationActions(
   { set, get, sseAbortRef }: StoreActionContext
-): Pick<ChatState, 'openCode' | 'openWrite' | 'ensureWriteThreadForWorkspace' | 'createWriteThread' | 'selectWriteThread' | 'probeRuntime' | 'boot' | 'chooseWorkspace' | 'selectWorkspaceRoot' | 'clearWorkspace' | 'deleteWorkspace' | 'refreshThreads' | 'setThreadSearch' | 'setShowArchivedThreads'> {
+): Pick<ChatState, 'openCode' | 'openWrite' | 'openDesign' | 'clearActiveThreadSelection' | 'ensureWriteThreadForWorkspace' | 'createWriteThread' | 'selectWriteThread' | 'ensureDesignThreadForWorkspace' | 'createDesignThread' | 'probeRuntime' | 'boot' | 'chooseWorkspace' | 'selectWorkspaceRoot' | 'clearWorkspace' | 'deleteWorkspace' | 'refreshThreads' | 'setThreadSearch' | 'setShowArchivedThreads'> {
   return {
   openCode: async () => {
     const state = get()
+    const designRegistry = readDesignThreadRegistry()
+    const writeRegistry = readWriteThreadRegistry()
+    const sddRegistry = readSddThreadRegistry()
     const activeThread = state.activeThreadId
       ? state.threads.find((thread) => thread.id === state.activeThreadId) ?? null
       : null
-    if (activeThread && isCodeThread(activeThread, state.clawChannels)) {
+    // 当前会话已经是 Code 工作台会话(含仍处于需求阶段的需求 AI 会话)时保持不动。
+    if (
+      activeThread &&
+      activeThread.archived !== true &&
+      isCodeSidebarThread(activeThread, state.clawChannels, writeRegistry, designRegistry, sddRegistry)
+    ) {
       set({ route: 'chat' })
       return
     }
 
-    const codeThreads = state.threads.filter((thread) => isCodeThread(thread, state.clawChannels))
+    const codeThreads = state.threads.filter((thread) =>
+      isCodeThread(thread, state.clawChannels, writeRegistry, designRegistry, sddRegistry)
+    )
+    // 返回 Code 工作台时优先恢复上次选中的会话,而不是默认选择更新时间最新的会话。
+    const rememberedId = state.lastCodeThreadId?.trim()
+    const rememberedThread = rememberedId
+      ? state.threads.find((thread) => thread.id === rememberedId) ?? null
+      : null
+    const rememberedIsCodeTarget = rememberedThread != null &&
+      rememberedThread.archived !== true &&
+      isCodeSidebarThread(rememberedThread, state.clawChannels, writeRegistry, designRegistry, sddRegistry)
+
+    set({ route: 'chat' })
+    if (rememberedThread && rememberedIsCodeTarget && state.runtimeConnection === 'ready') {
+      await get().selectThread(rememberedThread.id)
+      return
+    }
+
     const selectedWorkspace = normalizeWorkspaceRoot(state.workspaceRoot)
     const target =
       latestThread(codeThreads.filter((thread) => threadBelongsToWorkspace(thread, selectedWorkspace))) ??
       latestThread(codeThreads)
 
-    set({ route: 'chat' })
     if (target && state.runtimeConnection === 'ready') {
       await get().selectThread(target.id)
       return
@@ -141,11 +193,64 @@ export function createNavigationActions(
     const nextWatch = { ...state.watchTurnCompletion }
     if (state.activeThreadId && state.busy) {
       nextWatch[state.activeThreadId] = true
-      watchTurnCompletionNotification(state.activeThreadId)
+      watchTurnCompletionNotification(
+        state.activeThreadId,
+        Date.now(),
+        turnCompleteNotificationSource(state.activeThreadId, state)
+      )
     }
     set({
       ...clearedThreadSelection(),
       route: 'chat',
+      watchTurnCompletion: nextWatch
+    })
+    syncTurnCompletionPoll(set, get)
+  },
+
+  openDesign: () => {
+    const state = get()
+    if (isDesignThreadId(state.activeThreadId)) {
+      set({ route: 'design' })
+      return
+    }
+
+    const nextWatch = { ...state.watchTurnCompletion }
+    if (state.activeThreadId && state.busy) {
+      nextWatch[state.activeThreadId] = true
+      watchTurnCompletionNotification(
+        state.activeThreadId,
+        Date.now(),
+        turnCompleteNotificationSource(state.activeThreadId, state)
+      )
+    }
+    sseAbortRef.current?.abort()
+    sseAbortRef.current = null
+    clearBusyWatchdog()
+    set({
+      ...clearedThreadSelection(),
+      route: 'design',
+      watchTurnCompletion: nextWatch
+    })
+    syncTurnCompletionPoll(set, get)
+  },
+
+  clearActiveThreadSelection: () => {
+    const state = get()
+    if (!state.activeThreadId && state.blocks.length === 0 && !state.busy) return
+    const nextWatch = { ...state.watchTurnCompletion }
+    if (state.activeThreadId && state.busy) {
+      nextWatch[state.activeThreadId] = true
+      watchTurnCompletionNotification(
+        state.activeThreadId,
+        Date.now(),
+        turnCompleteNotificationSource(state.activeThreadId, state)
+      )
+    }
+    sseAbortRef.current?.abort()
+    sseAbortRef.current = null
+    clearBusyWatchdog()
+    set({
+      ...clearedThreadSelection(),
       watchTurnCompletion: nextWatch
     })
     syncTurnCompletionPoll(set, get)
@@ -192,7 +297,11 @@ export function createNavigationActions(
     const nextWatch = { ...state.watchTurnCompletion }
     if (state.activeThreadId && state.busy) {
       nextWatch[state.activeThreadId] = true
-      watchTurnCompletionNotification(state.activeThreadId)
+      watchTurnCompletionNotification(
+        state.activeThreadId,
+        Date.now(),
+        turnCompleteNotificationSource(state.activeThreadId, state)
+      )
     }
     set({
       ...clearedThreadSelection(),
@@ -202,13 +311,21 @@ export function createNavigationActions(
     syncTurnCompletionPoll(set, get)
   },
 
-  ensureWriteThreadForWorkspace: async (workspaceRoot) => {
+  ensureWriteThreadForWorkspace: async (workspaceRoot, activeFilePath) => {
     const state = get()
     const targetWorkspace = normalizeWorkspaceRoot(workspaceRoot) || (await readActiveWriteWorkspace(state.workspaceRoot))
     if (!targetWorkspace) {
       set({ error: i18n.t('common:workspaceRequiredToCreateThread') })
       return null
     }
+    const writeState = useWriteWorkspaceStore.getState()
+    const targetFilePath = activeFilePath !== undefined
+      ? activeFilePath.trim() || undefined
+      : (
+          workspaceRootIdentityKey(writeState.workspaceRoot) === workspaceRootIdentityKey(targetWorkspace)
+            ? writeState.activeFilePath?.trim() || undefined
+            : undefined
+        )
     if (state.runtimeConnection !== 'ready') {
       set({ error: i18n.t('common:runtimeActionNeedsConnection') })
       return null
@@ -223,22 +340,27 @@ export function createNavigationActions(
     const activeThread = state.activeThreadId
       ? state.threads.find((thread) => thread.id === state.activeThreadId) ?? null
       : null
-    if (activeThread && writeThreadBelongsToWorkspace(activeThread, targetWorkspace, registry)) {
+    const existing = activeWriteThreadForWorkspace(
+      targetWorkspace,
+      state.threads,
+      registry,
+      targetFilePath
+    )
+    if (activeThread && existing?.id === activeThread.id) {
       set({ route: 'write', error: null })
       return activeThread.id
     }
 
-    const existing = activeWriteThreadForWorkspace(targetWorkspace, state.threads, registry)
     if (existing) {
       set({ route: 'write' })
       await get().selectThread(existing.id)
       return existing.id
     }
 
-    return get().createWriteThread(targetWorkspace)
+    return get().createWriteThread(targetWorkspace, targetFilePath)
   },
 
-  createWriteThread: async (workspaceRoot) => {
+  createWriteThread: async (workspaceRoot, activeFilePath) => {
     const targetWorkspace = normalizeWorkspaceRoot(workspaceRoot) || (await readActiveWriteWorkspace(get().workspaceRoot))
     if (!targetWorkspace) {
       set({ error: i18n.t('common:workspaceRequiredToCreateThread') })
@@ -248,14 +370,25 @@ export function createNavigationActions(
       set({ error: i18n.t('common:runtimeActionNeedsConnection') })
       return null
     }
+    if (!(await workspaceDirectoryExists(targetWorkspace))) {
+      set({ error: workspaceMissingError() })
+      await showWorkspaceMissingDialog(targetWorkspace)
+      return null
+    }
     try {
       const p = getProvider()
       const thread = await p.createThread({
         workspace: targetWorkspace,
         title: WRITE_ASSISTANT_THREAD_TITLE,
-        mode: 'agent'
+        mode: 'agent',
+        agentSurface: 'write'
       })
-      saveWriteThreadRegistry(markWriteThread(targetWorkspace, thread.id))
+      saveWriteThreadRegistry(markWriteThread(
+        targetWorkspace,
+        thread.id,
+        readWriteThreadRegistry(),
+        activeFilePath
+      ))
       set((s) => ({
         route: 'write',
         threads: s.threads.some((item) => item.id === thread.id) ? s.threads : [thread, ...s.threads],
@@ -287,6 +420,152 @@ export function createNavigationActions(
     }
     set({ route: 'write' })
     await get().selectThread(targetId)
+  },
+
+  ensureDesignThreadForWorkspace: async (workspaceRoot, docId) => {
+    const state = get()
+    const targetWorkspace =
+      normalizeWorkspaceRoot(workspaceRoot) || normalizeWorkspaceRoot(state.workspaceRoot)
+    if (!targetWorkspace) {
+      set({ error: i18n.t('common:workspaceRequiredToCreateThread') })
+      return null
+    }
+    if (state.runtimeConnection !== 'ready') {
+      set({ error: i18n.t('common:runtimeActionNeedsConnection') })
+      return null
+    }
+    const targetDoc = (docId ?? '').trim()
+    const registry = readDesignThreadRegistry()
+    const record = registry.workspaces[designDocKey(targetWorkspace, targetDoc)]
+    const activeThread = state.activeThreadId
+      ? state.threads.find((thread) => thread.id === state.activeThreadId) ?? null
+      : null
+    // Reuse the active thread only when it is THIS 设计稿's registered thread (a
+    // thread id belongs to exactly one (workspace, 设计稿) scope).
+    if (activeThread && record && record.threadIds.includes(activeThread.id)) {
+      set({ route: 'design', error: null })
+      return activeThread.id
+    }
+    const existing = activeDesignThreadForWorkspace(targetWorkspace, targetDoc, state.threads, registry)
+    if (existing) {
+      set({ route: 'design' })
+      await get().selectThread(existing.id)
+      return get().activeThreadId === existing.id ? existing.id : null
+    }
+    return get().createDesignThread(targetWorkspace, targetDoc)
+  },
+
+  createDesignThread: async (workspaceRoot, docId, options = {}) => {
+    const activate = options.activate !== false
+    const targetWorkspace =
+      normalizeWorkspaceRoot(workspaceRoot) || normalizeWorkspaceRoot(get().workspaceRoot)
+    if (!targetWorkspace) {
+      set({ error: i18n.t('common:workspaceRequiredToCreateThread') })
+      return null
+    }
+    if (get().runtimeConnection !== 'ready') {
+      set({ error: i18n.t('common:runtimeActionNeedsConnection') })
+      return null
+    }
+    if (!(await workspaceDirectoryExists(targetWorkspace))) {
+      set({ error: workspaceMissingError() })
+      if (!options.suppressSettingsRedirect) {
+        await showWorkspaceMissingDialog(targetWorkspace)
+      }
+      return null
+    }
+    const targetDoc = (docId ?? '').trim()
+    try {
+      const provider = getProvider()
+      const pickedAgentId = get().composerAgentId?.trim() ?? ''
+      const personaProfile = pickedAgentId
+        ? (await rendererRuntimeClient.getSettings()).agents?.kun?.subagents?.profiles?.find(
+          (profile) => profile.id === pickedAgentId &&
+            profile.enabled &&
+            (profile.mode === 'primary' || profile.mode === 'all')
+        )
+        : undefined
+      const thread = await provider.createThread({
+        workspace: targetWorkspace,
+        title: DESIGN_ASSISTANT_THREAD_TITLE,
+        titleAuto: true,
+        mode: 'agent',
+        agentSurface: 'design',
+        ...(personaProfile?.providerId?.trim()
+          ? { providerId: personaProfile.providerId.trim() }
+          : {}),
+        ...(personaProfile?.model?.trim() ? { model: personaProfile.model.trim() } : {}),
+        ...(personaProfile ? {
+          agentId: personaProfile.id,
+          ...(personaProfile.systemPrompt ? { systemPrompt: personaProfile.systemPrompt } : {})
+        } : {})
+      })
+      const nextRegistry = markDesignThread(targetWorkspace, targetDoc, thread.id)
+      saveDesignThreadRegistry(nextRegistry)
+      const record = nextRegistry.workspaces[designDocKey(targetWorkspace, targetDoc)]
+      const bindingPersisted = Boolean(record) && await persistDesignChatMetaForDoc({
+        workspaceRoot: targetWorkspace,
+        docId: targetDoc,
+        stampThreadId: thread.id,
+        record
+      })
+      if (!bindingPersisted) {
+        let cleanupError: unknown = null
+        try {
+          await provider.deleteThread(thread.id)
+          invalidateThreadSnapshot(thread.id)
+          saveDesignThreadRegistry(forgetDesignThread(thread.id, readDesignThreadRegistry()))
+        } catch (error) {
+          cleanupError = error
+          // Keep a recoverable binding so the first-submit rollback can retry
+          // deletion instead of losing the new runtime thread's identity.
+          saveDesignThreadRegistry(markDesignThread(
+            targetWorkspace,
+            targetDoc,
+            thread.id,
+            readDesignThreadRegistry()
+          ))
+        }
+        const cleanupDetail = cleanupError
+          ? ` Runtime cleanup also failed: ${formatRuntimeError(cleanupError)}`
+          : ''
+        throw new Error(`Could not persist the Design drawing conversation binding.${cleanupDetail}`)
+      }
+      // If another renderer registry write raced the disk operation, restore
+      // the live binding before exposing the thread to the Design controller.
+      saveDesignThreadRegistry(markDesignThread(
+        targetWorkspace,
+        targetDoc,
+        thread.id,
+        readDesignThreadRegistry()
+      ))
+      if (activate) get().clearActiveThreadSelection?.()
+      set((s) => ({
+        ...(activate
+          ? {
+              ...clearedThreadSelection(),
+              route: 'design' as const,
+              activeThreadId: thread.id,
+              activeThreadRelation: 'primary' as const
+            }
+          : {}),
+        threads: s.threads.some((item) => item.id === thread.id) ? s.threads : [thread, ...s.threads],
+        ...(activate ? { error: null } : {})
+      }))
+      // A new thread is known to be empty and is already present in the local
+      // list. Do not refresh before its first turn: an eventually-consistent
+      // list response could omit the fresh id and clear the atomic selection.
+      // The accepted Design turn performs background list reconciliation.
+      return thread.id
+    } catch (e) {
+      set({
+        error: formatRuntimeError(e),
+        ...(!options.suppressSettingsRedirect && shouldOpenSettingsForError(e)
+          ? { route: 'settings' as const, settingsSection: 'agents' as const }
+          : {})
+      })
+      return null
+    }
   },
 
   probeRuntime: async (mode = 'user', options) => {
@@ -371,9 +650,10 @@ export function createNavigationActions(
           preservedWorkspaceRoots: [workspaceRoot]
         })
         saveCodeWorkspaceRoots(codeWorkspaceRoots)
-        const needsInitialSetup = !getActiveAgentApiKey(settings).trim()
+        const needsInitialSetup = settings.initialSetupCompleted !== true
         applyTheme(settings.theme)
         applyUiFontScale(settings.uiFontScale)
+        applyChatContentMaxWidth(settings.chatContentMaxWidthPx)
         applyCursorSpotlight(settings.cursorSpotlight !== false)
         applyCursorSpotlightColor(settings.cursorSpotlightColor)
         if (settings.write?.typography) applyWriteTypography(settings.write.typography)
@@ -443,14 +723,18 @@ export function createNavigationActions(
             })()
           })
         }
+        const stateBeforeBootCommit = get()
         set({
-          route: 'chat',
-          initialSetupOpen: needsInitialSetup,
+          route: stateBeforeBootCommit.route === 'settings' ? 'settings' : 'chat',
+          initialSetupOpen: needsInitialSetup || stateBeforeBootCommit.initialSetupOpen,
           initialSetupMode: 'required',
           workspaceRoot,
           codeWorkspaceRoots,
           workspaceLabel: workspaceLabelFromPath(workspaceRoot),
+          conversationWorkspaceRoot: settings.conversationWorkspaceRoot || '',
           disabledSkillIds: settings.disabledSkillIds,
+          graphEnabled: settings.agents.kun.graph?.enabled === true,
+          composerOrchestration: 'direct',
           clawChannels: settings.claw.channels,
           activeClawChannelId: settings.claw.channels.find((channel) => channel.enabled)?.id ?? '',
           runtimeConnection: needsInitialSetup ? 'idle' : get().runtimeConnection,
@@ -458,11 +742,6 @@ export function createNavigationActions(
           runtimeErrorDetail: needsInitialSetup ? null : get().runtimeErrorDetail
         })
         if (needsInitialSetup) return
-        const initialPick = get().composerPickList
-        const fromStorage = readStoredComposerModel(initialPick)
-        if (fromStorage) {
-          set({ composerModel: fromStorage })
-        }
         scheduleStartupRuntimeProbe(get)
       } catch (e) {
         set({
@@ -493,6 +772,13 @@ export function createNavigationActions(
         if (createThreadAfter) {
           set({ error: i18n.t('common:workspaceRequiredToCreateThread') })
         }
+        return null
+      }
+      // 拒绝把对话工作目录下的文件夹当作项目加入:对话文件夹会被持续自动管理,
+      // 建议用户先拷贝到其他位置再加入。
+      const conversationRoot = get().conversationWorkspaceRoot
+      if (isConversationWorkspacePath(picked.path, conversationRoot)) {
+        set({ error: i18n.t('common:workspaceInsideConversationDir') })
         return null
       }
       const next = await rendererRuntimeClient.setSettings({ workspaceRoot: picked.path })
@@ -544,6 +830,11 @@ export function createNavigationActions(
     if (!normalized) return null
     if (get().runtimeConnection !== 'ready') {
       set({ error: i18n.t('common:runtimeActionNeedsConnection') })
+      return null
+    }
+    // 拒绝把对话工作目录下的文件夹切换为当前项目目录(同 chooseWorkspace 守卫)。
+    if (isConversationWorkspacePath(normalized, get().conversationWorkspaceRoot)) {
+      set({ error: i18n.t('common:workspaceInsideConversationDir') })
       return null
     }
     // Already on this directory with an empty composer — nothing to switch.
@@ -613,6 +904,7 @@ export function createNavigationActions(
     try {
       for (const th of workspaceThreads) {
         await p.deleteThread(th.id)
+        invalidateThreadSnapshot(th.id)
       }
       const removeIds = new Set(workspaceThreads.map((th) => th.id))
       const codeWorkspaceRoots = forgetCodeWorkspaceRoot(get().codeWorkspaceRoots, normalizedPath)
@@ -668,7 +960,10 @@ export function createNavigationActions(
       const p = getProvider()
       let rawThreads: NormalizedThread[]
       try {
-        rawThreads = await p.listThreads({ limit: 200, includeArchived: true })
+        // Omitting `limit` is intentional: migrated and long-lived profiles
+        // must expose the complete inventory instead of silently hiding older
+        // conversations after an arbitrary client-side cutoff.
+        rawThreads = await p.listThreads({ includeArchived: true })
       } catch {
         rawThreads = await p.listThreads()
       }
@@ -677,8 +972,8 @@ export function createNavigationActions(
         workspace: normalizeWorkspaceRoot(thread.workspace)
       }))
       const sddThreadRegistry = readSddThreadRegistry()
-      const sidebarThreads = (await filterThreadsForSidebar(threads, p))
-        .filter((thread) => !isSddAssistantThread(thread, sddThreadRegistry))
+      const designRegistry = readDesignThreadRegistry()
+      const sidebarThreads = await filterThreadsForSidebar(threads, p)
       const forkRegistry = hydrateThreadForkRegistry(sidebarThreads, readThreadForkRegistry())
       saveThreadForkRegistry(forkRegistry)
       const enrichedThreads = enrichThreadsWithForkInfo(sidebarThreads, forkRegistry)
@@ -733,12 +1028,27 @@ export function createNavigationActions(
         const writeWorkspace = writeWorkspaceForThreadId(thread.id, writeRegistry)
         return writeWorkspace ? { ...thread, workspace: writeWorkspace } : thread
       })
+      const threadWorktreeRegistry = readThreadWorktreeRegistry().worktrees
+      const workspaceCandidates = [
+        get().workspaceRoot,
+        ...get().codeWorkspaceRoots,
+        ...threads.map((thread) => thread.workspace),
+        ...displayThreads.map((thread) => thread.workspace)
+      ].filter((path): path is string => Boolean(path))
       const codeThreadWorkspaceRoots = [
         ...threads,
         ...displayThreads
       ]
-        .filter((thread) => isCodeThread(thread, get().clawChannels, writeRegistry))
-        .map((thread) => thread.workspace)
+        .filter((thread) => isCodeThread(thread, get().clawChannels, writeRegistry, designRegistry))
+        .map((thread) => {
+          const record = threadWorktreeRegistry[thread.id]
+          if (record?.projectPath?.trim()) return record.projectPath.trim()
+          return resolveProjectWorkspacePath(thread.workspace ?? '', {
+            threadWorktrees: threadWorktreeRegistry,
+            candidateProjectPaths: workspaceCandidates
+          })
+        })
+        .filter(Boolean)
       const codeWorkspaceRoots = reconcileCodeWorkspaceRoots({
         currentRoots: get().codeWorkspaceRoots,
         codeThreadWorkspaceRoots,
@@ -753,14 +1063,24 @@ export function createNavigationActions(
       const activeThreadIsManagedInCodeRoute =
         get().route === 'chat' &&
         activeThread != null &&
-        (isWriteThreadId(activeThread.id, writeRegistry) ||
-          isClawThread(activeThread, get().clawChannels))
+        (activeThread.agentSurface === 'write' ||
+          activeThread.agentSurface === 'design' ||
+          isWriteAssistantThread(activeThread, writeRegistry) ||
+          isClawThread(activeThread, get().clawChannels) ||
+          isDesignThreadId(activeThread.id, designRegistry) ||
+          isInternalDeepSeekGuiWorkspace(activeThread.workspace))
       const shouldClearSelection =
         activeThreadId != null && !displayThreads.some((thread) => thread.id === activeThreadId)
       if (shouldClearSelection) {
         sseAbortRef.current?.abort()
         sseAbortRef.current = null
       }
+      // 记忆中的 Code 会话被删除或归档后清理,避免长期保存悬空 ID。
+      const rememberedCodeThreadId = get().lastCodeThreadId?.trim() ?? ''
+      const staleCodeThreadMemory = Boolean(
+        rememberedCodeThreadId &&
+        !threads.some((thread) => thread.id === rememberedCodeThreadId && thread.archived !== true)
+      )
       const validIds = new Set(displayThreads.map((t) => t.id))
       set((s) => {
         const w: Record<string, boolean> = {}
@@ -780,6 +1100,7 @@ export function createNavigationActions(
           codeWorkspaceRoots,
           watchTurnCompletion: w,
           unreadThreadIds: u,
+          ...(staleCodeThreadMemory ? { lastCodeThreadId: null } : {}),
           ...(shouldClearSelection ? clearedThreadSelection() : {})
         }
       })

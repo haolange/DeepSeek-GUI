@@ -16,6 +16,7 @@ import {
 } from './claw-schedule-mcp-config'
 import {
   defaultClawSettings,
+  defaultDesignSettings,
   defaultKeyboardShortcuts,
   defaultKunRuntimeSettings,
   defaultModelProviderSettings,
@@ -34,16 +35,19 @@ function createSettings(patch: Partial<AppSettingsV1['schedule']['internal']> = 
     locale: 'en',
     theme: 'system',
     uiFontScale: 0.82,
+    chatContentMaxWidthPx: 896,
+    composerSendKey: 'enter',
     provider: defaultModelProviderSettings(),
     agents: {
       kun: defaultKunRuntimeSettings()
     },
     workspaceRoot: '/tmp/workspace',
+    conversationWorkspaceRoot: '~/Documents/Kun',
     log: {
       enabled: true,
       retentionDays: 2
     },
-    checkpointCleanup: { enabled: false, intervalDays: 3 },
+    checkpointCleanup: { createEnabled: false, enabled: false, intervalDays: 3 },
     notifications: {
       turnComplete: true
     },
@@ -58,6 +62,7 @@ function createSettings(patch: Partial<AppSettingsV1['schedule']['internal']> = 
       }
     },
     workflow: defaultWorkflowSettings(),
+    design: defaultDesignSettings(),
     terminal: defaultTerminalSettings(),
     guiUpdate: {
       channel: 'stable'

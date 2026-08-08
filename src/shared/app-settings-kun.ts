@@ -1,29 +1,49 @@
 import {
+  DEFAULT_APPROVAL_REVIEWER,
   DEFAULT_APPROVAL_POLICY,
   DEFAULT_DEEPSEEK_BASE_URL,
   DEFAULT_IMAGE_GENERATION_PROTOCOL,
+  DEFAULT_IMAGE_GENERATION_RESOLUTION,
+  IMAGE_GENERATION_QUALITIES,
+  IMAGE_GENERATION_RESOLUTIONS,
   DEFAULT_KUN_DATA_DIR,
   DEFAULT_KUN_MODEL,
   DEFAULT_KUN_PORT,
   DEFAULT_MUSIC_GENERATION_PROTOCOL,
+  DEFAULT_PROMPT_OPTIMIZATION_PROMPT,
   MIN_KUN_LOCAL_PORT,
   DEFAULT_MODEL_ENDPOINT_FORMAT,
+  DEFAULT_MODEL_REQUEST_RETRY_HTTP_STATUS_CODES,
+  DEFAULT_MODEL_REQUEST_RETRY_INITIAL_DELAY_MS,
+  DEFAULT_MODEL_REQUEST_RETRY_MAX_ATTEMPTS,
   DEFAULT_SANDBOX_MODE,
+  DEFAULT_TOOL_OUTPUT_MAX_BYTES,
+  DEFAULT_TOOL_OUTPUT_MAX_LINES,
   DEFAULT_SPEECH_TO_TEXT_PROTOCOL,
   DEFAULT_TEXT_TO_SPEECH_PROTOCOL,
   DEFAULT_VIDEO_GENERATION_PROTOCOL,
   MODEL_REASONING_EFFORTS,
   MODEL_REASONING_REQUEST_PROTOCOLS,
+  kunToolPermissionModeSettings,
   normalizeModelEndpointFormat,
   type AppSettingsV1,
   type KunComputerUseSettingsV1,
+  type KunBrowserUseSettingsV1,
   type KunContextCompactionSettingsV1,
   type KunDesignQualitySettingsV1,
   type KunDesignQualityStrictness,
   type KunHistoryHygieneSettingsV1,
   type KunImageGenerationSettingsV1,
+  type KunInstructionSettingsV1,
+  type KunLabSettingsPatchV1,
+  type KunLabSettingsV1,
+  type KunLlmDebugSettingsV1,
+  type ImageGenerationQuality,
+  type ImageGenerationResolution,
   type KunMcpSearchSettingsV1,
+  type KunProjectConfigSettingsV1,
   type KunMusicGenerationSettingsV1,
+  type KunPromptOptimizationSettingsV1,
   type KunRuntimeTuningSettingsV1,
   type KunRuntimeSettingsPatchV1,
   type KunRuntimeSettingsV1,
@@ -31,6 +51,7 @@ import {
   type KunSettingsEnvelopeV1,
   type KunSpeechToTextSettingsV1,
   type KunStorageSettingsV1,
+  type KunToolOutputLimitsSettingsV1,
   type KunTextToSpeechSettingsV1,
   type KunTokenEconomySettingsV1,
   type KunVideoGenerationSettingsV1,
@@ -47,8 +68,17 @@ import {
   type TextToSpeechProtocol,
   type VideoGenerationProtocol,
   type ApprovalPolicy,
+  type ApprovalReviewer,
   type SandboxMode
 } from './app-settings-types'
+import {
+  defaultKunGraphSettings,
+  normalizeKunGraphSettings
+} from './app-settings-graph'
+export {
+  defaultKunGraphSettings,
+  normalizeKunGraphSettings
+} from './app-settings-graph'
 import {
   normalizeModelProviderSettings,
   resolveKunRuntimeSettings
@@ -60,6 +90,7 @@ import {
 
 const LEGACY_COREAGENT_DATA_DIR = '~/.deepseekgui/coreagent'
 const LEGACY_KUN_DEFAULT_MODEL = 'deepseek-chat'
+const LEGACY_KUN_STREAM_IDLE_TIMEOUT_MS = 45_000
 // 旧版真实落盘默认值, 用于把升级前配置迁移到当前 Kun 默认端口。
 const LEGACY_LOCAL_HTTP_DEFAULT_PORT = 7878
 const PREVIOUS_KUN_DEFAULT_PORT = 8899
@@ -74,6 +105,7 @@ type LegacyLocalHttpRuntimeSettingsV1 = {
   extraCorsOrigins: string[]
   approvalPolicy: ApprovalPolicy
   sandboxMode: SandboxMode
+  approvalReviewer: ApprovalReviewer
 }
 
 type LegacyReasoningEffort = 'low' | 'medium' | 'high' | 'max'
@@ -104,7 +136,8 @@ function legacyLocalHttpRuntimeDefaults(port = LEGACY_LOCAL_HTTP_DEFAULT_PORT): 
     runtimeToken: '',
     extraCorsOrigins: ['http://localhost:5173', 'http://127.0.0.1:5173'],
     approvalPolicy: DEFAULT_APPROVAL_POLICY,
-    sandboxMode: DEFAULT_SANDBOX_MODE
+    sandboxMode: DEFAULT_SANDBOX_MODE,
+    approvalReviewer: DEFAULT_APPROVAL_REVIEWER
   }
 }
 
@@ -131,27 +164,78 @@ export function defaultKunRuntimeSettings(
     baseUrl: '',
     providerId: '',
     endpointFormat: DEFAULT_MODEL_ENDPOINT_FORMAT,
+    retry: {
+      maxAttempts: DEFAULT_MODEL_REQUEST_RETRY_MAX_ATTEMPTS,
+      initialDelayMs: DEFAULT_MODEL_REQUEST_RETRY_INITIAL_DELAY_MS,
+      httpStatusCodes: [...DEFAULT_MODEL_REQUEST_RETRY_HTTP_STATUS_CODES]
+    },
     runtimeToken: '',
     dataDir: DEFAULT_KUN_DATA_DIR,
     model: DEFAULT_KUN_MODEL,
-    approvalPolicy: DEFAULT_APPROVAL_POLICY,
-    sandboxMode: DEFAULT_SANDBOX_MODE,
+    ...kunToolPermissionModeSettings('full-access'),
     tokenEconomyMode: false,
     tokenEconomy: defaultKunTokenEconomySettings(),
+    toolOutputLimits: defaultKunToolOutputLimitsSettings(),
     insecure: false,
     mcpSearch: defaultKunMcpSearchSettings(),
+    projectConfig: defaultKunProjectConfigSettings(),
     storage: defaultKunStorageSettings(),
     contextCompaction: defaultKunContextCompactionSettings(),
     runtimeTuning: defaultKunRuntimeTuningSettings(),
+    llmDebug: defaultKunLlmDebugSettings(),
     imageGeneration: defaultKunImageGenerationSettings(),
     speechToText: defaultKunSpeechToTextSettings(),
     textToSpeech: defaultKunTextToSpeechSettings(),
+    promptOptimization: defaultKunPromptOptimizationSettings(),
     musicGeneration: defaultKunMusicGenerationSettings(),
     videoGeneration: defaultKunVideoGenerationSettings(),
     modelProfiles: {},
     memoryEnabled: false,
+    instructions: defaultKunInstructionSettings(),
     computerUse: defaultKunComputerUseSettings(),
-    quality: defaultKunQualitySettings()
+    browserUse: defaultKunBrowserUseSettings(),
+    quality: defaultKunQualitySettings(),
+    graph: defaultKunGraphSettings(),
+    lab: defaultKunLabSettings()
+  }
+}
+
+/**
+ * Compatibility-only base for normalizing already persisted settings. Keep
+ * this separate from the fresh-profile default so an older partial record can
+ * never acquire Full access merely because a new field was absent.
+ */
+function legacyKunRuntimeSettingsDefaults(
+  port = DEFAULT_KUN_PORT
+): KunRuntimeSettingsV1 {
+  return {
+    ...defaultKunRuntimeSettings(port),
+    approvalPolicy: DEFAULT_APPROVAL_POLICY,
+    sandboxMode: DEFAULT_SANDBOX_MODE,
+    approvalReviewer: DEFAULT_APPROVAL_REVIEWER
+  }
+}
+
+function normalizeApprovalReviewer(value: unknown): ApprovalReviewer {
+  return value === 'agent' ? 'agent' : DEFAULT_APPROVAL_REVIEWER
+}
+
+export function defaultKunInstructionSettings(): KunInstructionSettingsV1 {
+  return {
+    enabled: true
+  }
+}
+
+export function defaultKunLlmDebugSettings(): KunLlmDebugSettingsV1 {
+  return {
+    defaultThreadCaptureEnabled: false
+  }
+}
+
+export function defaultKunToolOutputLimitsSettings(): KunToolOutputLimitsSettingsV1 {
+  return {
+    maxLines: DEFAULT_TOOL_OUTPUT_MAX_LINES,
+    maxBytes: DEFAULT_TOOL_OUTPUT_MAX_BYTES
   }
 }
 
@@ -174,6 +258,21 @@ export function defaultKunComputerUseSettings(): KunComputerUseSettingsV1 {
   }
 }
 
+export function defaultKunBrowserUseSettings(): KunBrowserUseSettingsV1 {
+  return {
+    enabled: true,
+    mode: 'public',
+    approvalMode: 'auto-safe',
+    maxTabs: 2,
+    maxObservationActionsPerTurn: 30,
+    maxInteractionActionsPerTurn: 12,
+    maxSnapshotNodes: 250,
+    maxSnapshotTextChars: 20_000,
+    maxImageDimension: 1280,
+    idleTimeoutMs: 5 * 60_000
+  }
+}
+
 export function defaultKunImageGenerationSettings(): KunImageGenerationSettingsV1 {
   return {
     enabled: false,
@@ -182,7 +281,9 @@ export function defaultKunImageGenerationSettings(): KunImageGenerationSettingsV
     baseUrl: '',
     apiKey: '',
     model: '',
+    defaultResolution: DEFAULT_IMAGE_GENERATION_RESOLUTION,
     defaultSize: '',
+    quality: 'auto',
     timeoutMs: 180_000
   }
 }
@@ -212,6 +313,16 @@ export function defaultKunTextToSpeechSettings(): KunTextToSpeechSettingsV1 {
     voice: '',
     format: 'mp3',
     timeoutMs: 120_000
+  }
+}
+
+export function defaultKunPromptOptimizationSettings(): KunPromptOptimizationSettingsV1 {
+  return {
+    enabled: false,
+    providerId: '',
+    model: '',
+    prompt: '',
+    timeoutMs: 60_000
   }
 }
 
@@ -254,6 +365,10 @@ export function defaultKunMcpSearchSettings(): KunMcpSearchSettingsV1 {
   }
 }
 
+export function defaultKunProjectConfigSettings(): KunProjectConfigSettingsV1 {
+  return { grants: [] }
+}
+
 export function defaultKunTokenEconomySettings(): KunTokenEconomySettingsV1 {
   return {
     enabled: false,
@@ -282,27 +397,38 @@ export function defaultKunStorageSettings(): KunStorageSettingsV1 {
   }
 }
 
+export const KUN_CONTEXT_COMPACTION_DEFAULTS_VERSION = 2
+export const KUN_RUNTIME_TUNING_DEFAULTS_VERSION = 1
+export const DEFAULT_KUN_STREAM_IDLE_TIMEOUT_MS = 450_000
+
+const LEGACY_KUN_CONTEXT_COMPACTION_DEFAULTS = [
+  { soft: 16_000, hard: 24_000 },
+  { soft: 96_000, hard: 108_800 }
+] as const
+
 export function defaultKunContextCompactionSettings(): KunContextCompactionSettingsV1 {
   return {
-    defaultSoftThreshold: 96_000,
-    defaultHardThreshold: 108_800,
+    defaultsVersion: KUN_CONTEXT_COMPACTION_DEFAULTS_VERSION,
+    defaultSoftThreshold: 192_000,
+    defaultHardThreshold: 217_600,
     // Default to model-generated summaries (codex-style): the model writes a
     // structured recap of the folded turns instead of a mechanical item list.
     // Falls back to the heuristic summary automatically on timeout/failure.
     summaryMode: 'model',
     summaryTimeoutMs: 15_000,
-    summaryMaxTokens: 1_200,
+    summaryMaxTokens: 2_048,
     summaryInputMaxBytes: 96 * 1024
   }
 }
 
 export function defaultKunRuntimeTuningSettings(): KunRuntimeTuningSettingsV1 {
   return {
-    streamIdleTimeoutMs: 45_000,
+    defaultsVersion: KUN_RUNTIME_TUNING_DEFAULTS_VERSION,
+    maxConcurrentTurns: 256,
+    maxWallTimeMs: 86_400_000,
+    streamIdleTimeoutMs: DEFAULT_KUN_STREAM_IDLE_TIMEOUT_MS,
     toolStorm: {
-      enabled: true,
-      windowSize: 8,
-      threshold: 3
+      enabled: true
     },
     toolArgumentRepair: {
       maxStringBytes: 512 * 1024
@@ -314,7 +440,15 @@ export function getKunRuntimeSettings(
   settings: AppSettingsV1
 ): KunRuntimeSettingsV1 {
   const raw = (settings as { agents?: { kun?: Partial<KunRuntimeSettingsV1> } }).agents?.kun
-  return mergeKunRuntimeSettings(defaultKunRuntimeSettings(), raw)
+  return mergeKunRuntimeSettings(
+    raw ? legacyKunRuntimeSettingsDefaults() : defaultKunRuntimeSettings(),
+    raw
+      ? {
+          ...raw,
+          runtimeTuning: migrateKunRuntimeTuningDefaults(raw.runtimeTuning)
+        }
+      : raw
+  )
 }
 
 export function kunSettingsEnvelope(
@@ -338,6 +472,9 @@ export function mergeKunRuntimeSettings(
     ...currentMcpSearch,
     ...(patch?.mcpSearch ?? {})
   })
+  const nextProjectConfig = normalizeKunProjectConfigSettings(
+    patch?.projectConfig ?? current.projectConfig
+  )
   const currentTokenEconomy = normalizeKunTokenEconomySettings(
     current.tokenEconomy,
     current.tokenEconomyMode
@@ -359,6 +496,11 @@ export function mergeKunRuntimeSettings(
     ...patchedTokenEconomy,
     enabled: tokenEconomyEnabled
   }
+  const currentToolOutputLimits = normalizeKunToolOutputLimitsSettings(current.toolOutputLimits)
+  const nextToolOutputLimits = normalizeKunToolOutputLimitsSettings({
+    ...currentToolOutputLimits,
+    ...(patch?.toolOutputLimits ?? {})
+  })
   const currentStorage = normalizeKunStorageSettings(current.storage)
   const nextStorage = normalizeKunStorageSettings({
     ...currentStorage,
@@ -392,6 +534,11 @@ export function mergeKunRuntimeSettings(
     ...currentTextToSpeech,
     ...(patch?.textToSpeech ?? {})
   })
+  const currentPromptOptimization = normalizeKunPromptOptimizationSettings(current.promptOptimization)
+  const nextPromptOptimization = normalizeKunPromptOptimizationSettings({
+    ...currentPromptOptimization,
+    ...(patch?.promptOptimization ?? {})
+  })
   const currentMusicGeneration = normalizeKunMusicGenerationSettings(current.musicGeneration)
   const nextMusicGeneration = normalizeKunMusicGenerationSettings({
     ...currentMusicGeneration,
@@ -407,16 +554,67 @@ export function mergeKunRuntimeSettings(
     ...currentComputerUse,
     ...(patch?.computerUse ?? {})
   })
+  const currentBrowserUse = normalizeKunBrowserUseSettings(current.browserUse)
+  const nextBrowserUse = normalizeKunBrowserUseSettings({
+    ...currentBrowserUse,
+    ...(patch?.browserUse ?? {})
+  })
   const currentQuality = normalizeKunQualitySettings(current.quality)
   const nextQuality = normalizeKunQualitySettings({
     ...currentQuality,
     ...(patch?.quality ?? {})
+  })
+  const nextGraph = normalizeKunGraphSettings({
+    ...current.graph,
+    ...(patch?.graph ?? {}),
+    workerModel: {
+      ...current.graph?.workerModel,
+      ...(patch?.graph?.workerModel ?? {})
+    },
+    scheduler: {
+      ...current.graph?.scheduler,
+      ...(patch?.graph?.scheduler ?? {})
+    },
+    context: {
+      ...current.graph?.context,
+      ...(patch?.graph?.context ?? {})
+    },
+    mailbox: {
+      ...current.graph?.mailbox,
+      ...(patch?.graph?.mailbox ?? {})
+    },
+    supervision: {
+      ...current.graph?.supervision,
+      ...(patch?.graph?.supervision ?? {})
+    },
+    writeIsolation: {
+      ...current.graph?.writeIsolation,
+      ...(patch?.graph?.writeIsolation ?? {})
+    },
+    routing: {
+      ...current.graph?.routing,
+      ...(patch?.graph?.routing ?? {})
+    },
+    learning: {
+      ...current.graph?.learning,
+      ...(patch?.graph?.learning ?? {})
+    },
+    retention: {
+      ...current.graph?.retention,
+      ...(patch?.graph?.retention ?? {})
+    }
   })
   const currentRuntimeTuning = normalizeKunRuntimeTuningSettings(current.runtimeTuning)
   const nextRuntimeTuning = normalizeKunRuntimeTuningSettings({
     ...currentRuntimeTuning,
     ...(patch?.runtimeTuning
       ? {
+          ...(patch.runtimeTuning.maxWallTimeMs !== undefined
+            ? { maxWallTimeMs: patch.runtimeTuning.maxWallTimeMs }
+            : {}),
+          ...(patch.runtimeTuning.maxConcurrentTurns !== undefined
+            ? { maxConcurrentTurns: patch.runtimeTuning.maxConcurrentTurns }
+            : {}),
           ...(patch.runtimeTuning.streamIdleTimeoutMs !== undefined
             ? { streamIdleTimeoutMs: patch.runtimeTuning.streamIdleTimeoutMs }
             : {}),
@@ -431,45 +629,82 @@ export function mergeKunRuntimeSettings(
         }
       : {})
   })
+  const nextLlmDebug = normalizeKunLlmDebugSettings({
+    ...current.llmDebug,
+    ...(patch?.llmDebug ?? {})
+  })
   const nextModelProfiles = normalizeKunModelProfiles(current.modelProfiles, patch?.modelProfiles)
+  const nextInstructions = {
+    enabled: patch?.instructions?.enabled ?? current.instructions?.enabled ?? true
+  }
   const nextPort = normalizeKunLocalPort(patch?.port ?? current.port, DEFAULT_KUN_PORT)
   // Optional role/small-model slots (agents.kun.*). Patch wins when the key is
   // present (even as empty string => clear); otherwise inherit current. Empty/
   // whitespace strings are dropped so the field is omitted entirely.
   const nextRoleModelSlots = mergeOptionalModelSlot(current, patch)
   const nextRoleReasoningSlots = mergeOptionalReasoningSlot(current, patch)
-  // NOTE: approvalPolicy/sandboxMode are merged through verbatim from the patch.
-  // The unified 5-mode UI selector already resolves a mode to its concrete
-  // {approvalPolicy, sandboxMode} pair via kunToolPermissionModeSettings before
-  // dispatching the patch. We must NOT re-canonicalize here: the mode->settings
-  // mapping is lossy (only 5 of the 6x4 policy/sandbox combos are representable),
-  // so round-tripping would silently rewrite valid non-UI values — e.g. demote
-  // approvalPolicy 'never'/'suggest' to 'on-request', or escalate a 'read-only'/
-  // 'external-sandbox' sandbox to 'danger-full-access' — on every settings merge.
+  const nextSubagents = mergeKunSubagentsSettings(current.subagents, patch?.subagents)
+  const nextLab = mergeKunLabSettings(current.lab, patch?.lab)
+  // Do not let the nested partial patch leak through the broad object spread;
+  // `nextSubagents` below is the fully materialized authoritative value.
+  // Primary `model` is handled separately: empty strings must not wipe the
+  // chat model (settings:set rejects model: '' via modelIdSchema.min(1)).
+  const {
+    subagents: _subagentsPatch,
+    projectConfig: _projectConfigPatch,
+    graph: _graphPatch,
+    llmDebug: _llmDebugPatch,
+    lab: _labPatch,
+    model: _modelPatch,
+    ...flatPatch
+  } = patch ?? {}
+  void _subagentsPatch
+  void _projectConfigPatch
+  void _graphPatch
+  void _llmDebugPatch
+  void _labPatch
+  void _modelPatch
+  const nextModel = nonEmptyStringOrFallback(
+    patch?.model,
+    nonEmptyStringOrFallback(current.model, DEFAULT_KUN_MODEL)
+  )
+  // NOTE: approvalPolicy/sandboxMode/reviewer are merged through verbatim from
+  // the patch. The three-mode UI selector resolves a deliberate selection to
+  // its complete authority snapshot before dispatching the patch. We must NOT
+  // re-canonicalize here: the projection is lossy for legacy raw combinations,
+  // so round-tripping it would silently broaden or otherwise rewrite them.
   const merged: KunRuntimeSettingsV1 = {
     ...current,
-    ...(patch ?? {}),
+    ...flatPatch,
+    model: nextModel,
+    approvalReviewer: normalizeApprovalReviewer(
+      patch?.approvalReviewer ?? current.approvalReviewer
+    ),
     port: nextPort,
     tokenEconomyMode: nextTokenEconomy.enabled,
     tokenEconomy: nextTokenEconomy,
+    toolOutputLimits: nextToolOutputLimits,
     mcpSearch: nextMcpSearch,
+    projectConfig: nextProjectConfig,
     storage: nextStorage,
     contextCompaction: nextContextCompaction,
     runtimeTuning: nextRuntimeTuning,
+    llmDebug: nextLlmDebug,
     imageGeneration: nextImageGeneration,
     speechToText: nextSpeechToText,
     textToSpeech: nextTextToSpeech,
+    promptOptimization: nextPromptOptimization,
     musicGeneration: nextMusicGeneration,
     videoGeneration: nextVideoGeneration,
     modelProfiles: nextModelProfiles,
     memoryEnabled: patch?.memoryEnabled ?? current.memoryEnabled ?? false,
+    instructions: nextInstructions,
     computerUse: nextComputerUse,
+    browserUse: nextBrowserUse,
     quality: nextQuality,
-    ...(patch?.subagents !== undefined
-      ? { subagents: patch.subagents }
-      : current.subagents !== undefined
-        ? { subagents: current.subagents }
-        : {})
+    graph: nextGraph,
+    lab: nextLab,
+    ...(nextSubagents !== undefined ? { subagents: nextSubagents } : {})
   }
   // Optional model slots are authoritative from mergeOptionalModelSlot: strip any
   // verbatim copies leaked by the spreads above, then re-apply only the non-empty
@@ -479,15 +714,94 @@ export function mergeKunRuntimeSettings(
   return { ...merged, ...nextRoleModelSlots, ...nextRoleReasoningSlots }
 }
 
+function mergeKunSubagentsSettings(
+  current: KunRuntimeSettingsV1['subagents'],
+  patch: KunRuntimeSettingsPatchV1['subagents']
+): KunRuntimeSettingsV1['subagents'] {
+  if (patch === undefined) return current
+  return {
+    ...(current ?? { enabled: true, useExistingAgents: true, profiles: [] }),
+    ...patch,
+    enabled: patch.enabled ?? current?.enabled ?? true,
+    useExistingAgents: patch.useExistingAgents ?? current?.useExistingAgents ?? true,
+    // A roster diff is an intentional whole-array replacement (including []
+    // for deleting every custom profile). Omitting it keeps the current roster.
+    profiles: patch.profiles !== undefined
+      ? [...patch.profiles]
+      : [...(current?.profiles ?? [])]
+  }
+}
+
+export function defaultKunLabSettings(): KunLabSettingsV1 {
+  return {
+    exploreAgent: {
+      enabled: true,
+      model: '',
+      providerId: '',
+      fast: false
+    }
+  }
+}
+
+/**
+ * Merge the experimental Lab section. Nested fields merge field-by-field;
+ * a half-configured model override (only one of model/providerId set) is
+ * treated as "follow the main session" and dropped, mirroring the pairing
+ * rule enforced by the Kun runtime config schema.
+ */
+export function mergeKunLabSettings(
+  current: KunLabSettingsV1 | undefined,
+  patch: KunLabSettingsPatchV1 | undefined
+): KunLabSettingsV1 {
+  const base = current ?? defaultKunLabSettings()
+  if (!patch) return base
+  const baseAgent = base.exploreAgent
+  const rawModel = stringOrFallback(patch.exploreAgent?.model, baseAgent.model).trim()
+  const rawProviderId = stringOrFallback(patch.exploreAgent?.providerId, baseAgent.providerId).trim()
+  const paired = rawModel !== '' && rawProviderId !== ''
+  return {
+    exploreAgent: {
+      enabled: patch.exploreAgent?.enabled ?? baseAgent.enabled,
+      model: paired ? rawModel : '',
+      providerId: paired ? rawProviderId : '',
+      ...(patch.exploreAgent?.reasoningEffort !== undefined
+        ? isModelReasoningEffortValue(patch.exploreAgent.reasoningEffort)
+          ? { reasoningEffort: patch.exploreAgent.reasoningEffort }
+          : baseAgent.reasoningEffort !== undefined
+            ? { reasoningEffort: baseAgent.reasoningEffort }
+            : {}
+        : baseAgent.reasoningEffort !== undefined
+          ? { reasoningEffort: baseAgent.reasoningEffort }
+          : {}),
+      fast: patch.exploreAgent?.fast ?? baseAgent.fast
+    }
+  }
+}
+
+function stringOrFallback(value: string | undefined, fallback: string): string {
+  return typeof value === 'string' ? value : fallback
+}
+
+function isModelReasoningEffortValue(value: unknown): value is ModelReasoningEffort {
+  return typeof value === 'string' && MODEL_REASONING_EFFORTS.includes(value as ModelReasoningEffort)
+}
+
 const OPTIONAL_MODEL_SLOT_KEYS = [
   'smallModel',
   'smallModelProviderId',
+  'smallModelAccountId',
   'titleModel',
   'titleProviderId',
+  'titleAccountId',
   'summaryModel',
   'summaryProviderId',
+  'summaryAccountId',
   'codeReviewModel',
-  'codeReviewProviderId'
+  'codeReviewProviderId',
+  'codeReviewAccountId',
+  'planModel',
+  'planProviderId',
+  'planAccountId'
 ] as const
 
 type OptionalModelSlotKey = (typeof OPTIONAL_MODEL_SLOT_KEYS)[number]
@@ -551,13 +865,31 @@ function normalizeKunImageGenerationSettings(
     baseUrl: typeof input?.baseUrl === 'string' ? input.baseUrl.trim() : defaults.baseUrl,
     apiKey: typeof input?.apiKey === 'string' ? input.apiKey.trim() : defaults.apiKey,
     model: typeof input?.model === 'string' ? input.model.trim() : defaults.model,
+    defaultResolution: normalizeKunImageGenerationResolution(input?.defaultResolution),
     defaultSize: /^(auto|\d+x\d+)$/.test(defaultSize) ? defaultSize : '',
+    quality: normalizeKunImageGenerationQuality(input?.quality),
     timeoutMs: boundedPositiveInt(input?.timeoutMs, defaults.timeoutMs, 600_000)
   }
 }
 
+function normalizeKunImageGenerationResolution(value: unknown): ImageGenerationResolution {
+  return IMAGE_GENERATION_RESOLUTIONS.includes(value as ImageGenerationResolution)
+    ? value as ImageGenerationResolution
+    : DEFAULT_IMAGE_GENERATION_RESOLUTION
+}
+
+function normalizeKunImageGenerationQuality(value: unknown): ImageGenerationQuality {
+  return IMAGE_GENERATION_QUALITIES.includes(value as ImageGenerationQuality)
+    ? value as ImageGenerationQuality
+    : 'auto'
+}
+
 function normalizeKunImageGenerationProtocol(value: unknown): ImageGenerationProtocol {
-  return value === 'minimax-image' ? 'minimax-image' : DEFAULT_IMAGE_GENERATION_PROTOCOL
+  if (value === 'minimax-image') return 'minimax-image'
+  if (value === 'codex-responses-image') return 'codex-responses-image'
+  if (value === 'grok-imagine-image') return 'grok-imagine-image'
+  if (value === 'volcengine-ark-image') return 'volcengine-ark-image'
+  return DEFAULT_IMAGE_GENERATION_PROTOCOL
 }
 
 function normalizeKunSpeechToTextSettings(
@@ -581,7 +913,11 @@ function normalizeKunSpeechToTextSettings(
 
 function normalizeKunSpeechToTextProtocol(value: unknown): SpeechToTextProtocol {
   if (value === 'local-whisper') return 'local-whisper'
-  return value === 'mimo-asr' ? 'mimo-asr' : DEFAULT_SPEECH_TO_TEXT_PROTOCOL
+  if (value === 'mimo-asr') return 'mimo-asr'
+  if (value === 'xai-stt') return 'xai-stt'
+  if (value === 'gemini-audio') return 'gemini-audio'
+  if (value === 'gemini-cli-audio') return 'gemini-cli-audio'
+  return DEFAULT_SPEECH_TO_TEXT_PROTOCOL
 }
 
 function normalizeKunTextToSpeechSettings(
@@ -605,6 +941,24 @@ function normalizeKunTextToSpeechProtocol(value: unknown): TextToSpeechProtocol 
   return value === 'minimax-t2a' || value === 'mimo-tts'
     ? value
     : DEFAULT_TEXT_TO_SPEECH_PROTOCOL
+}
+
+function normalizeKunPromptOptimizationSettings(
+  input: Partial<KunPromptOptimizationSettingsV1> | undefined
+): KunPromptOptimizationSettingsV1 {
+  const defaults = defaultKunPromptOptimizationSettings()
+  return {
+    enabled: input?.enabled === true,
+    providerId: typeof input?.providerId === 'string' ? input.providerId.trim() : defaults.providerId,
+    model: typeof input?.model === 'string' ? input.model.trim() : defaults.model,
+    prompt: typeof input?.prompt === 'string' ? input.prompt.trim() : defaults.prompt,
+    timeoutMs: boundedPositiveInt(input?.timeoutMs, defaults.timeoutMs, 600_000)
+  }
+}
+
+export function resolveKunPromptOptimizationPrompt(settings: KunRuntimeSettingsV1): string {
+  const configured = settings.promptOptimization?.prompt?.trim() ?? ''
+  return configured || DEFAULT_PROMPT_OPTIMIZATION_PROMPT
 }
 
 function normalizeKunMusicGenerationSettings(
@@ -648,6 +1002,8 @@ function normalizeKunVideoGenerationSettings(
 }
 
 function normalizeKunVideoGenerationProtocol(value: unknown): VideoGenerationProtocol {
+  if (value === 'grok-imagine-video') return 'grok-imagine-video'
+  if (value === 'volcengine-ark-video') return 'volcengine-ark-video'
   return value === 'minimax-video' ? 'minimax-video' : DEFAULT_VIDEO_GENERATION_PROTOCOL
 }
 
@@ -663,6 +1019,42 @@ function normalizeKunComputerUseSettings(
     mode,
     maxImageDimension: boundedPositiveInt(input?.maxImageDimension, defaults.maxImageDimension, 4096),
     maxActionsPerTurn: boundedPositiveInt(input?.maxActionsPerTurn, defaults.maxActionsPerTurn, 1000)
+  }
+}
+
+function normalizeKunBrowserUseSettings(
+  input: Partial<KunBrowserUseSettingsV1> | undefined
+): KunBrowserUseSettingsV1 {
+  const defaults = defaultKunBrowserUseSettings()
+  return {
+    enabled: input?.enabled !== false,
+    mode: input?.mode === 'local-development' ? 'local-development' : 'public',
+    approvalMode: input?.approvalMode === 'always-ask' ? 'always-ask' : 'auto-safe',
+    maxTabs: boundedPositiveInt(input?.maxTabs, defaults.maxTabs, 3),
+    maxObservationActionsPerTurn: boundedPositiveInt(
+      input?.maxObservationActionsPerTurn,
+      defaults.maxObservationActionsPerTurn,
+      100
+    ),
+    maxInteractionActionsPerTurn: boundedPositiveInt(
+      input?.maxInteractionActionsPerTurn,
+      defaults.maxInteractionActionsPerTurn,
+      50
+    ),
+    maxSnapshotNodes: boundedPositiveInt(input?.maxSnapshotNodes, defaults.maxSnapshotNodes, 500),
+    maxSnapshotTextChars: boundedPositiveInt(
+      input?.maxSnapshotTextChars,
+      defaults.maxSnapshotTextChars,
+      50_000
+    ),
+    maxImageDimension: Math.max(
+      320,
+      boundedPositiveInt(input?.maxImageDimension, defaults.maxImageDimension, 2048)
+    ),
+    idleTimeoutMs: Math.max(
+      30_000,
+      boundedPositiveInt(input?.idleTimeoutMs, defaults.idleTimeoutMs, 30 * 60_000)
+    )
   }
 }
 
@@ -682,6 +1074,16 @@ function normalizeKunTokenEconomySettings(
     compressToolResults: input?.compressToolResults !== false,
     conciseResponses: input?.conciseResponses !== false,
     historyHygiene: normalizeKunHistoryHygieneSettings(input?.historyHygiene)
+  }
+}
+
+function normalizeKunToolOutputLimitsSettings(
+  input: Partial<KunToolOutputLimitsSettingsV1> | undefined
+): KunToolOutputLimitsSettingsV1 {
+  const defaults = defaultKunToolOutputLimitsSettings()
+  return {
+    maxLines: boundedPositiveInt(input?.maxLines, defaults.maxLines, 1_000_000),
+    maxBytes: boundedPositiveInt(input?.maxBytes, defaults.maxBytes, 64 * 1024 * 1024)
   }
 }
 
@@ -725,6 +1127,22 @@ function normalizeKunMcpSearchSettings(
   }
 }
 
+export function normalizeKunProjectConfigSettings(
+  input: Partial<KunProjectConfigSettingsV1> | undefined
+): KunProjectConfigSettingsV1 {
+  const grants = Array.isArray(input?.grants) ? input.grants : []
+  const unique = new Map<string, { workspaceRoot: string; configDigest: string }>()
+  for (const grant of grants.slice(0, 64)) {
+    const workspaceRoot = typeof grant?.workspaceRoot === 'string' ? grant.workspaceRoot.trim() : ''
+    const configDigest = typeof grant?.configDigest === 'string'
+      ? grant.configDigest.trim().toLowerCase()
+      : ''
+    if (!workspaceRoot || !/^[a-f0-9]{64}$/.test(configDigest)) continue
+    unique.set(workspaceRoot, { workspaceRoot, configDigest })
+  }
+  return { grants: [...unique.values()] }
+}
+
 function positiveInt(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) && value > 0
     ? Math.floor(value)
@@ -748,6 +1166,12 @@ function boundedNonNegativeInt(value: unknown, fallback: number, max = Number.MA
   return Math.min(Math.floor(value), max)
 }
 
+function boundedRatio(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1
+    ? value
+    : fallback
+}
+
 function normalizeKunStorageSettings(
   input: Partial<KunStorageSettingsV1> | undefined
 ): KunStorageSettingsV1 {
@@ -764,12 +1188,14 @@ function normalizeKunContextCompactionSettings(
   input: Partial<KunContextCompactionSettingsV1> | undefined
 ): KunContextCompactionSettingsV1 {
   const defaults = defaultKunContextCompactionSettings()
-  const defaultSoftThreshold = boundedPositiveInt(input?.defaultSoftThreshold, defaults.defaultSoftThreshold)
-  const defaultHardThreshold = input?.defaultSoftThreshold !== undefined && input?.defaultHardThreshold === undefined
+  const upgraded = migrateKunContextCompactionDefaults(input)
+  const defaultSoftThreshold = boundedPositiveInt(upgraded.defaultSoftThreshold, defaults.defaultSoftThreshold)
+  const defaultHardThreshold = upgraded.defaultSoftThreshold !== undefined && upgraded.defaultHardThreshold === undefined
     ? defaultSoftThreshold
     : defaults.defaultHardThreshold
-  const requestedHardThreshold = boundedPositiveInt(input?.defaultHardThreshold, defaultHardThreshold)
+  const requestedHardThreshold = boundedPositiveInt(upgraded.defaultHardThreshold, defaultHardThreshold)
   return {
+    defaultsVersion: KUN_CONTEXT_COMPACTION_DEFAULTS_VERSION,
     defaultSoftThreshold,
     defaultHardThreshold: Math.max(defaultSoftThreshold, requestedHardThreshold),
     // Compaction is always model-based now (the heuristic fold survives only as
@@ -777,11 +1203,42 @@ function normalizeKunContextCompactionSettings(
     // longer a user-selectable mode, so any stored value coerces to 'model' —
     // this self-heals stale 'heuristic' configs from the removed UI toggle.
     summaryMode: 'model',
-    summaryTimeoutMs: boundedPositiveInt(input?.summaryTimeoutMs, defaults.summaryTimeoutMs, 120_000),
-    summaryMaxTokens: boundedPositiveInt(input?.summaryMaxTokens, defaults.summaryMaxTokens, 16_000),
-    summaryInputMaxBytes: boundedPositiveInt(input?.summaryInputMaxBytes, defaults.summaryInputMaxBytes, 8 * 1024 * 1024),
-    ...(typeof input?.summaryModel === 'string' && input.summaryModel.trim() ? { summaryModel: input.summaryModel.trim() } : {}),
-    ...(typeof input?.summaryProviderId === 'string' && input.summaryProviderId.trim() ? { summaryProviderId: input.summaryProviderId.trim() } : {})
+    summaryTimeoutMs: boundedPositiveInt(upgraded.summaryTimeoutMs, defaults.summaryTimeoutMs, 120_000),
+    summaryMaxTokens: boundedPositiveInt(upgraded.summaryMaxTokens, defaults.summaryMaxTokens, 16_000),
+    summaryInputMaxBytes: boundedPositiveInt(upgraded.summaryInputMaxBytes, defaults.summaryInputMaxBytes, 8 * 1024 * 1024),
+    ...(typeof upgraded.summaryModel === 'string' && upgraded.summaryModel.trim() ? { summaryModel: upgraded.summaryModel.trim() } : {}),
+    ...(typeof upgraded.summaryProviderId === 'string' && upgraded.summaryProviderId.trim() ? { summaryProviderId: upgraded.summaryProviderId.trim() } : {})
+  }
+}
+
+export function migrateKunContextCompactionDefaults(
+  input: KunContextCompactionSettingsV1
+): KunContextCompactionSettingsV1
+export function migrateKunContextCompactionDefaults(
+  input: Partial<KunContextCompactionSettingsV1> | undefined
+): Partial<KunContextCompactionSettingsV1>
+export function migrateKunContextCompactionDefaults(
+  input: Partial<KunContextCompactionSettingsV1> | undefined
+): Partial<KunContextCompactionSettingsV1> {
+  const current = input ?? {}
+  const defaultsVersion = boundedPositiveInt(current.defaultsVersion, 0)
+  if (defaultsVersion >= KUN_CONTEXT_COMPACTION_DEFAULTS_VERSION) return current
+
+  const matchesLegacyDefaults = LEGACY_KUN_CONTEXT_COMPACTION_DEFAULTS.some(
+    ({ soft, hard }) =>
+      current.defaultSoftThreshold === soft &&
+      current.defaultHardThreshold === hard
+  )
+  const defaults = defaultKunContextCompactionSettings()
+  return {
+    ...current,
+    defaultsVersion: KUN_CONTEXT_COMPACTION_DEFAULTS_VERSION,
+    ...(matchesLegacyDefaults
+      ? {
+          defaultSoftThreshold: defaults.defaultSoftThreshold,
+          defaultHardThreshold: defaults.defaultHardThreshold
+        }
+      : {})
   }
 }
 
@@ -789,24 +1246,62 @@ function normalizeKunRuntimeTuningSettings(
   input: Partial<KunRuntimeTuningSettingsV1> | undefined
 ): KunRuntimeTuningSettingsV1 {
   const defaults = defaultKunRuntimeTuningSettings()
+  const migrated = migrateKunRuntimeTuningDefaults(input)
   return {
+    defaultsVersion: KUN_RUNTIME_TUNING_DEFAULTS_VERSION,
+    maxConcurrentTurns: boundedPositiveInt(
+      migrated.maxConcurrentTurns,
+      defaults.maxConcurrentTurns,
+      256
+    ),
+    maxWallTimeMs: boundedPositiveInt(
+      migrated.maxWallTimeMs,
+      defaults.maxWallTimeMs,
+      86_400_000
+    ),
     streamIdleTimeoutMs: boundedNonNegativeInt(
-      input?.streamIdleTimeoutMs,
+      migrated.streamIdleTimeoutMs,
       defaults.streamIdleTimeoutMs,
       3_600_000
     ),
     toolStorm: {
-      enabled: input?.toolStorm?.enabled !== false,
-      windowSize: boundedPositiveInt(input?.toolStorm?.windowSize, defaults.toolStorm.windowSize, 128),
-      threshold: Math.max(2, boundedPositiveInt(input?.toolStorm?.threshold, defaults.toolStorm.threshold, 128))
+      enabled: migrated.toolStorm?.enabled !== false
     },
     toolArgumentRepair: {
       maxStringBytes: boundedPositiveInt(
-        input?.toolArgumentRepair?.maxStringBytes,
+        migrated.toolArgumentRepair?.maxStringBytes,
         defaults.toolArgumentRepair.maxStringBytes,
         16 * 1024 * 1024
       )
     }
+  }
+}
+
+function normalizeKunLlmDebugSettings(
+  input: Partial<KunLlmDebugSettingsV1> | undefined
+): KunLlmDebugSettingsV1 {
+  return {
+    defaultThreadCaptureEnabled: input?.defaultThreadCaptureEnabled === true
+  }
+}
+
+export function kunRuntimeTuningDefaultsMigrationNeeded(
+  input: Partial<KunRuntimeTuningSettingsV1> | undefined
+): boolean {
+  return boundedPositiveInt(input?.defaultsVersion, 0) < KUN_RUNTIME_TUNING_DEFAULTS_VERSION
+}
+
+export function migrateKunRuntimeTuningDefaults(
+  input: Partial<KunRuntimeTuningSettingsV1> | undefined
+): Partial<KunRuntimeTuningSettingsV1> {
+  const current = input ?? {}
+  if (!kunRuntimeTuningDefaultsMigrationNeeded(current)) return current
+  return {
+    ...current,
+    defaultsVersion: KUN_RUNTIME_TUNING_DEFAULTS_VERSION,
+    ...(current.streamIdleTimeoutMs === LEGACY_KUN_STREAM_IDLE_TIMEOUT_MS
+      ? { streamIdleTimeoutMs: DEFAULT_KUN_STREAM_IDLE_TIMEOUT_MS }
+      : {})
   }
 }
 
@@ -875,6 +1370,11 @@ function normalizeKunModelProfile(
     input.contextWindowTokens > 0
     ? input.contextWindowTokens
     : undefined
+  const maxOutputTokens = typeof input?.maxOutputTokens === 'number' &&
+    Number.isInteger(input.maxOutputTokens) &&
+    input.maxOutputTokens > 0
+    ? input.maxOutputTokens
+    : undefined
   const reasoning = normalizeKunReasoningCapability(input?.reasoning)
   const endpointFormat = typeof input?.endpointFormat === 'string' && input.endpointFormat.trim()
     ? normalizeModelEndpointFormat(input.endpointFormat)
@@ -884,6 +1384,7 @@ function normalizeKunModelProfile(
       ? { aliases: normalizeKunProfileAliases(input?.aliases) }
       : {}),
     ...(contextWindowTokens ? { contextWindowTokens } : {}),
+    ...(maxOutputTokens ? { maxOutputTokens } : {}),
     inputModalities,
     outputModalities: normalizeKunModelInputModalities(input?.outputModalities),
     supportsToolCalling: input?.supportsToolCalling !== false,
@@ -1006,7 +1507,7 @@ export function applyKunRuntimePatch(
 }
 
 export function isKunRuntimeInsecure(runtime: Pick<KunRuntimeSettingsV1, 'insecure' | 'runtimeToken'>): boolean {
-  return runtime.insecure || !runtime.runtimeToken.trim()
+  return runtime.insecure === true
 }
 
 export function getActiveAgentApiKey(settings: AppSettingsV1): string {
@@ -1077,7 +1578,7 @@ export function migrateLegacyAppSettings(parsed: LegacyAppSettingsShape): Partia
   const isReasoningLegacy = rawAgentProvider === 'reasonix'
   const hasProviderSettings = typeof parsed.provider === 'object' && parsed.provider !== null
   const defaults = legacyLocalHttpRuntimeDefaults()
-  const kunDefaults = defaultKunRuntimeSettings()
+  const kunDefaults = legacyKunRuntimeSettingsDefaults()
   const legacyDeepseek = parsed.deepseek ?? {}
   const legacyLocalHttp = {
     ...defaults,
@@ -1100,21 +1601,27 @@ export function migrateLegacyAppSettings(parsed: LegacyAppSettingsShape): Partia
     baseUrl: legacySource.baseUrl,
     providerId: '',
     endpointFormat: DEFAULT_MODEL_ENDPOINT_FORMAT,
+    retry: kunDefaults.retry,
     runtimeToken: isReasoningLegacy ? kunDefaults.runtimeToken : legacyLocalHttp.runtimeToken,
     model: isReasoningLegacy ? legacyReasoning.model : kunDefaults.model,
     approvalPolicy: isReasoningLegacy ? kunDefaults.approvalPolicy : legacyLocalHttp.approvalPolicy,
-    sandboxMode: isReasoningLegacy ? kunDefaults.sandboxMode : legacyLocalHttp.sandboxMode
+    sandboxMode: isReasoningLegacy ? kunDefaults.sandboxMode : legacyLocalHttp.sandboxMode,
+    approvalReviewer: DEFAULT_APPROVAL_REVIEWER
   }
   const provider = normalizeModelProviderSettings({
+    ...parsed.provider,
     apiKey: hasProviderSettings
       ? parsed.provider?.apiKey
       : nonEmptyStringOrFallback(explicitKun.apiKey, legacySeed.apiKey),
     baseUrl: hasProviderSettings
       ? parsed.provider?.baseUrl
       : nonEmptyStringOrFallback(explicitKun.baseUrl, legacySeed.baseUrl),
-    providers: parsed.provider?.providers
+    proxy: parsed.provider?.proxy,
+    providers: parsed.provider?.providers,
+    routePools: parsed.provider?.routePools,
+    localGateway: parsed.provider?.localGateway
   })
-  const kun = {
+  const kun: KunRuntimeSettingsV1 = {
     ...kunDefaults,
     ...legacySeed,
     ...explicitKun,
@@ -1124,6 +1631,9 @@ export function migrateLegacyAppSettings(parsed: LegacyAppSettingsShape): Partia
     runtimeToken: nonEmptyStringOrFallback(explicitKun.runtimeToken, legacySeed.runtimeToken),
     dataDir: upgradeLegacyKunDefaultDataDir(explicitKun.dataDir),
     model: upgradeLegacyKunDefaultModel(explicitKun.model, legacySeed.model),
+    approvalReviewer: normalizeApprovalReviewer(
+      explicitKun.approvalReviewer ?? legacySeed.approvalReviewer
+    ),
     tokenEconomyMode: typeof explicitKun.tokenEconomy?.enabled === 'boolean'
       ? explicitKun.tokenEconomy.enabled
       : explicitKun.tokenEconomyMode ?? kunDefaults.tokenEconomyMode,
@@ -1131,10 +1641,13 @@ export function migrateLegacyAppSettings(parsed: LegacyAppSettingsShape): Partia
       explicitKun.tokenEconomy,
       explicitKun.tokenEconomyMode ?? kunDefaults.tokenEconomyMode
     ),
+    toolOutputLimits: normalizeKunToolOutputLimitsSettings(explicitKun.toolOutputLimits),
     mcpSearch: normalizeKunMcpSearchSettings(explicitKun.mcpSearch),
+    projectConfig: normalizeKunProjectConfigSettings(explicitKun.projectConfig),
     storage: normalizeKunStorageSettings(explicitKun.storage),
     contextCompaction: normalizeKunContextCompactionSettings(explicitKun.contextCompaction),
     runtimeTuning: normalizeKunRuntimeTuningSettings(explicitKun.runtimeTuning),
+    llmDebug: normalizeKunLlmDebugSettings(explicitKun.llmDebug),
     imageGeneration: normalizeKunImageGenerationSettings(explicitKun.imageGeneration),
     speechToText: normalizeKunSpeechToTextSettings(explicitKun.speechToText),
     textToSpeech: normalizeKunTextToSpeechSettings(explicitKun.textToSpeech),

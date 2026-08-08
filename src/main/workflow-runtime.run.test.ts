@@ -1,6 +1,10 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   defaultClawSettings,
+  defaultDesignSettings,
   defaultKeyboardShortcuts,
   defaultKunRuntimeSettings,
   defaultModelProviderSettings,
@@ -19,6 +23,8 @@ import {
   type WorkflowV1
 } from '../shared/app-settings'
 import { createWorkflowRuntime } from './workflow-runtime'
+
+let workflowWorkspaceRoot = ''
 
 // Loose fixture builders — normalizeWorkflow fills name/position/disabled and
 // per-kind config defaults at runtime, so tests pass partial nodes. The single
@@ -47,11 +53,14 @@ function settingsWithWorkflows(workflows: WorkflowV1[], modules: WorkflowCustomM
     locale: 'en',
     theme: 'system',
     uiFontScale: 0.82,
+    chatContentMaxWidthPx: 896,
+    composerSendKey: 'enter',
     provider: defaultModelProviderSettings(),
     agents: { kun: { ...defaultKunRuntimeSettings(), model: 'test-model', apiKey: 'test-key' } },
-    workspaceRoot: '/tmp/workflow-workspace',
+    workspaceRoot: workflowWorkspaceRoot,
+    conversationWorkspaceRoot: '~/Documents/Kun',
     log: { enabled: true, retentionDays: 7 },
-    checkpointCleanup: { enabled: false, intervalDays: 3 },
+    checkpointCleanup: { createEnabled: false, enabled: false, intervalDays: 3 },
     notifications: { turnComplete: true },
     appBehavior: { openAtLogin: false, startMinimized: false, closeToTray: false },
     keyboardShortcuts: defaultKeyboardShortcuts(),
@@ -59,6 +68,7 @@ function settingsWithWorkflows(workflows: WorkflowV1[], modules: WorkflowCustomM
     claw: defaultClawSettings(),
     schedule: defaultScheduleSettings(),
     workflow: normalizeWorkflowSettings({ enabled: true, workflows, modules }),
+    design: defaultDesignSettings(),
     terminal: defaultTerminalSettings(),
     guiUpdate: { channel: 'stable' },
     codePromptPrefix: '',
@@ -74,6 +84,13 @@ function createStore(initial: AppSettingsV1) {
       current = { ...current, workflow: mergeWorkflowSettings(current.workflow, partial.workflow) }
       return current
     },
+    update: async (
+      mutation: (settings: AppSettingsV1) => AppSettingsV1 | Promise<AppSettingsV1>
+    ) => {
+      current = await mutation(current)
+      return current
+    },
+    replace: (next: AppSettingsV1) => { current = next },
     read: () => current
   }
 }
@@ -97,8 +114,54 @@ function requireOk(result: WorkflowRunResult): string {
 }
 
 describe('WorkflowRuntime end-to-end execution', () => {
+  beforeEach(() => {
+    workflowWorkspaceRoot = mkdtempSync(join(tmpdir(), 'kun-workflow-run-'))
+  })
+
   afterEach(() => {
     vi.unstubAllGlobals()
+    if (workflowWorkspaceRoot) {
+      rmSync(workflowWorkspaceRoot, { recursive: true, force: true })
+      workflowWorkspaceRoot = ''
+    }
+  })
+
+  it('preserves the latest webhook endpoint while reconciling a stale workflow snapshot', async () => {
+    const workflow = buildWorkflow({
+      id: 'wf-scheduled',
+      name: 'Scheduled',
+      enabled: true,
+      nextRunAt: '',
+      nodes: [{
+        id: 'schedule',
+        type: 'schedule-trigger',
+        config: { schedule: { kind: 'interval', everyMinutes: 10 } }
+      }],
+      connections: []
+    })
+    const initial = settingsWithWorkflows([workflow])
+    const store = createStore(initial)
+    const runtime = createWorkflowRuntime({
+      store: store as never,
+      runtimeRequest: vi.fn() as never,
+      logError: vi.fn()
+    })
+    store.replace({
+      ...initial,
+      workflow: {
+        ...initial.workflow,
+        webhookPort: 28799,
+        webhookSecret: 'latest-secret'
+      }
+    })
+
+    await (runtime as unknown as {
+      ensureNextRuns: (settings: AppSettingsV1) => Promise<void>
+    }).ensureNextRuns(initial)
+
+    expect(store.read().workflow.webhookPort).toBe(28799)
+    expect(store.read().workflow.webhookSecret).toBe('latest-secret')
+    expect(store.read().workflow.workflows[0].nextRunAt).not.toBe('')
   })
 
   it('runs trigger → AI → condition(true) → delay and skips the false branch', async () => {
@@ -707,6 +770,73 @@ describe('WorkflowRuntime end-to-end execution', () => {
     expect(rejectedBranch === undefined || rejectedBranch.status === 'skipped').toBe(true)
     runtime.stop()
   }, 20_000)
+
+  it('stop cancels a nested in-flight HTTP node and waits for terminal persistence', async () => {
+    const child = buildWorkflow({
+      id: 'shutdown-child',
+      name: 'Shutdown child',
+      enabled: true,
+      nodes: [
+        { id: 'child-trigger', type: 'manual-trigger', config: {} },
+        {
+          id: 'child-http',
+          type: 'http-request',
+          config: {
+            method: 'GET',
+            url: 'https://example.test/slow',
+            headers: [],
+            body: '',
+            parseJson: false,
+            timeoutMs: 60_000
+          }
+        }
+      ],
+      connections: [
+        { id: 'child-edge', source: 'child-trigger', target: 'child-http' }
+      ]
+    })
+    const parent = buildWorkflow({
+      id: 'shutdown-parent',
+      name: 'Shutdown parent',
+      enabled: true,
+      nodes: [
+        { id: 'parent-trigger', type: 'manual-trigger', config: {} },
+        { id: 'parent-sub', type: 'subworkflow', config: { workflowId: child.id } }
+      ],
+      connections: [
+        { id: 'parent-edge', source: 'parent-trigger', target: 'parent-sub' }
+      ]
+    })
+    let requestSignal: AbortSignal | undefined
+    let requestStarted!: () => void
+    const started = new Promise<void>((resolve) => { requestStarted = resolve })
+    vi.stubGlobal('fetch', vi.fn((_url: string, init: RequestInit) => {
+      requestSignal = init.signal as AbortSignal
+      requestStarted()
+      return new Promise<Response>((_resolve, reject) => {
+        requestSignal?.addEventListener('abort', () => {
+          reject(new DOMException('Aborted', 'AbortError'))
+        }, { once: true })
+      })
+    }))
+    const store = createStore(settingsWithWorkflows([child, parent]))
+    const runtime = createWorkflowRuntime({
+      store: store as never,
+      runtimeRequest: vi.fn() as never,
+      logError: vi.fn()
+    })
+
+    const runId = requireOk(await runtime.runWorkflow(parent.id))
+    await started
+    await runtime.stop()
+
+    expect(requestSignal?.aborted).toBe(true)
+    const run = store.read().workflow.workflows
+      .find((workflow) => workflow.id === parent.id)!
+      .runs.find((entry) => entry.id === runId)
+    expect(run).toMatchObject({ status: 'error', message: 'Canceled.' })
+    expect((await runtime.status()).runningWorkflowIds).toEqual([])
+  })
 
   it('runForHook runs a bound workflow with the hook payload as {{json.*}}', async () => {
     const workflow = buildWorkflow({

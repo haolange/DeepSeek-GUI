@@ -2,6 +2,7 @@
 node_modules/
 out/
 dist/
+resources/bundled-extensions/
 .cache/
 .deepseek/
 *.log
@@ -45,6 +46,14 @@ rad.json
 *.flf
 #Test results file
 TestResults.xml
+
+### Tool data
+.workbuddy/
+.kun-design/
+.kun/images/
+.kun-canvas/
+.kunsdd/
+openspec/
 
 ### Internal docs
 docs/R2_RELEASE.md

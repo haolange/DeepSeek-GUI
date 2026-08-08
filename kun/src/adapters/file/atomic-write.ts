@@ -18,23 +18,47 @@ export async function atomicWriteFile(
   contents: string,
   options: AtomicWriteFileOptions = {}
 ): Promise<void> {
-  await mkdir(dirname(path), { recursive: true })
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 })
   const tmp = `${path}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`
   try {
-    await writeFile(tmp, contents, 'utf-8')
+    await writeFile(tmp, contents, { encoding: 'utf-8', mode: 0o600 })
     try {
       await renameWithRetry(tmp, path, options.renameRetry)
     } catch (error) {
       if (!shouldFallbackToDirectWrite(error)) {
         throw error
       }
-      await writeFile(path, contents, 'utf-8')
+      await writeFile(path, contents, { encoding: 'utf-8', mode: 0o600 })
     }
   } catch (error) {
     await rm(tmp, { force: true }).catch(() => undefined)
-    throw error
+    throw describeAtomicWriteError(path, error)
   }
   await rm(tmp, { force: true }).catch(() => undefined)
+}
+
+/**
+ * Preserves Node fs error fields (`code`, `errno`, `syscall`, `path`) while
+ * prefixing a stable `atomic write failed (CODE) for <path>` message so
+ * manager/runtime logs clearly attribute disk exhaustion (ENOSPC) or
+ * permission failures to the exact lease/config file instead of a bare
+ * "Internal server error" / "fetch failed".
+ */
+function describeAtomicWriteError(path: string, error: unknown): unknown {
+  if (!(error instanceof Error)) return error
+  const source = error as NodeJS.ErrnoException
+  const code = String(source.code ?? '')
+  const prefixed = new Error(
+    `atomic write failed${code ? ` (${code})` : ''} for ${path}: ${error.message}`,
+    { cause: error }
+  )
+  Object.assign(prefixed, {
+    ...(source.code !== undefined ? { code: source.code } : {}),
+    ...(source.errno !== undefined ? { errno: source.errno } : {}),
+    ...(source.syscall !== undefined ? { syscall: source.syscall } : {}),
+    ...(source.path !== undefined ? { path: source.path } : {})
+  })
+  return prefixed
 }
 
 async function renameWithRetry(

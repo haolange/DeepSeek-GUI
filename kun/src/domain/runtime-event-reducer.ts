@@ -1,5 +1,10 @@
 import type { RuntimeEvent } from '../contracts/events.js'
 import type { TurnItem } from '../contracts/items.js'
+import type {
+  ApprovalPolicy,
+  ApprovalReviewer,
+  SandboxMode
+} from '../contracts/policy.js'
 import type { UsageSnapshot } from '../contracts/usage.js'
 import { emptyUsageSnapshot } from '../contracts/usage.js'
 import { addUsage } from './usage.js'
@@ -12,6 +17,9 @@ export type EventSourcedTurnProjection = {
   status: EventSourcedTurnStatus
   startedAt?: string
   finishedAt?: string
+  approvalPolicy?: ApprovalPolicy
+  sandboxMode?: SandboxMode
+  approvalReviewer?: ApprovalReviewer
   steering: string[]
   itemIds: string[]
 }
@@ -28,6 +36,7 @@ export type EventSourcedChildRunProjection = {
   /** Observability metrics carried on the child lifecycle events. */
   model?: string
   profile?: string
+  profileName?: string
   toolPolicy?: 'readOnly' | 'inherit'
   prefixReused?: boolean
   inheritedHistoryItems?: number
@@ -51,6 +60,7 @@ export type EventSourcedRuntimeProjection = {
   items: TurnItem[]
   usage: UsageSnapshot
   childRuns: EventSourcedChildRunProjection[]
+  approvalReviews: EventSourcedApprovalReviewProjection[]
   compactions: Array<{
     itemId?: string
     turnId?: string
@@ -79,10 +89,27 @@ export type EventSourcedRuntimeProjection = {
   }>
 }
 
+export type EventSourcedApprovalReviewProjection = {
+  reviewId: string
+  approvalId: string
+  turnId?: string
+  toolName: string
+  reviewer: 'agent'
+  status: 'in-progress' | 'approved' | 'denied' | 'timed-out' | 'failed-closed' | 'aborted'
+  summary: string
+  action?: Extract<RuntimeEvent, { kind: 'approval_review_started' }>['action']
+  decision?: 'allow' | 'deny'
+  riskLevel?: 'low' | 'medium' | 'high' | 'critical'
+  rationale?: string
+  startedAt?: string
+  finishedAt?: string
+}
+
 type MutableProjection = EventSourcedRuntimeProjection & {
   turns: EventSourcedTurnProjection[]
   items: TurnItem[]
   childRuns: EventSourcedChildRunProjection[]
+  approvalReviews: EventSourcedApprovalReviewProjection[]
   errors: EventSourcedRuntimeProjection['errors']
   compactions: EventSourcedRuntimeProjection['compactions']
 }
@@ -95,6 +122,7 @@ export function createRuntimeEventProjection(threadId = ''): EventSourcedRuntime
     items: [],
     usage: emptyUsageSnapshot(),
     childRuns: [],
+    approvalReviews: [],
     compactions: [],
     errors: []
   }
@@ -142,11 +170,15 @@ export function applyRuntimeEvent(
       break
     case 'assistant_text_delta':
     case 'assistant_reasoning_delta':
-      upsertItem(next, event.item, 'append-delta')
+      upsertItem(next, event.item, 'append-delta', event.deltaOffset)
       break
     case 'approval_requested':
     case 'approval_resolved':
       upsertApprovalFromEvent(next, event)
+      break
+    case 'approval_review_started':
+    case 'approval_review_completed':
+      upsertApprovalReviewFromEvent(next, event)
       break
     case 'user_input_requested':
     case 'user_input_resolved':
@@ -223,6 +255,9 @@ function applyTurnEvent(
     case 'turn_started':
       turn.status = 'running'
       turn.startedAt = turn.startedAt ?? event.timestamp
+      if (event.approvalPolicy) turn.approvalPolicy = event.approvalPolicy
+      if (event.sandboxMode) turn.sandboxMode = event.sandboxMode
+      if (event.approvalReviewer) turn.approvalReviewer = event.approvalReviewer
       break
     case 'turn_completed':
       turn.status = 'completed'
@@ -260,6 +295,7 @@ function upsertChildRun(
     ...(event.text ? { text: event.text } : {}),
     ...(child.childModel ? { model: child.childModel } : {}),
     ...(child.childProfile ? { profile: child.childProfile } : {}),
+    ...(child.childProfileName ? { profileName: child.childProfileName } : {}),
     ...(child.childToolPolicy ? { toolPolicy: child.childToolPolicy } : {}),
     ...(child.prefixReused !== undefined ? { prefixReused: child.prefixReused } : {}),
     ...(child.inheritedHistoryItems !== undefined ? { inheritedHistoryItems: child.inheritedHistoryItems } : {}),
@@ -316,7 +352,18 @@ function upsertApprovalFromEvent(
   const existing = projection.items.find((item) => item.kind === 'approval' && item.approvalId === event.approvalId)
   const status = event.status
   const item: TurnItem = existing?.kind === 'approval'
-    ? { ...existing, status, ...(status !== 'pending' ? { finishedAt: event.timestamp } : {}) }
+    ? {
+        ...existing,
+        status,
+        ...(event.approvalReviewer
+          ? { approvalReviewer: event.approvalReviewer }
+          : {}),
+        ...(event.decisionSource
+          ? { decisionSource: event.decisionSource }
+          : {}),
+        ...(event.reason ? { reason: event.reason } : {}),
+        ...(status !== 'pending' ? { finishedAt: event.timestamp } : {})
+      }
     : {
         id: event.itemId ?? `item_${event.approvalId}`,
         turnId: event.turnId,
@@ -328,9 +375,52 @@ function upsertApprovalFromEvent(
         toolName: event.toolName,
         summary: event.summary ?? '',
         status,
+        ...(event.approvalReviewer
+          ? { approvalReviewer: event.approvalReviewer }
+          : {}),
+        ...(event.decisionSource
+          ? { decisionSource: event.decisionSource }
+          : {}),
+        ...(event.reason ? { reason: event.reason } : {}),
         ...(status !== 'pending' ? { finishedAt: event.timestamp } : {})
       }
   upsertItem(projection, item, 'replace')
+}
+
+function upsertApprovalReviewFromEvent(
+  projection: MutableProjection,
+  event: Extract<RuntimeEvent, {
+    kind: 'approval_review_started' | 'approval_review_completed'
+  }>
+): void {
+  const index = projection.approvalReviews.findIndex(
+    (review) => review.reviewId === event.reviewId
+  )
+  const existing = index >= 0 ? projection.approvalReviews[index] : undefined
+  const review: EventSourcedApprovalReviewProjection = {
+    reviewId: event.reviewId,
+    approvalId: event.approvalId,
+    ...(event.turnId ? { turnId: event.turnId } : {}),
+    toolName: event.toolName,
+    reviewer: 'agent',
+    status: event.status,
+    summary: event.summary,
+    ...(existing?.action ? { action: existing.action } : {}),
+    ...(existing?.startedAt ? { startedAt: existing.startedAt } : {}),
+    ...(event.kind === 'approval_review_started'
+      ? {
+          ...(event.action ? { action: event.action } : {}),
+          startedAt: event.timestamp
+        }
+      : {
+          finishedAt: event.timestamp,
+          ...(event.decision ? { decision: event.decision } : {}),
+          ...(event.riskLevel ? { riskLevel: event.riskLevel } : {}),
+          rationale: event.rationale
+        })
+  }
+  if (index >= 0) projection.approvalReviews[index] = review
+  else projection.approvalReviews.push(review)
 }
 
 function upsertUserInputFromEvent(
@@ -355,17 +445,22 @@ function upsertUserInputFromEvent(
         status,
         ...(status !== 'pending' ? { finishedAt: event.timestamp } : {})
       }
+  if (item.kind === 'user_input') {
+    if (event.questions) item.questions = event.questions
+    if (event.answers) item.answers = event.answers
+  }
   upsertItem(projection, item, 'replace')
 }
 
 function upsertItem(
   projection: MutableProjection,
   item: TurnItem,
-  mode: 'replace' | 'append-delta'
+  mode: 'replace' | 'append-delta',
+  deltaOffset?: number
 ): void {
   const index = projection.items.findIndex((candidate) => candidate.id === item.id)
   const nextItem = index >= 0 && mode === 'append-delta'
-    ? appendDelta(projection.items[index]!, item)
+    ? appendDelta(projection.items[index]!, item, deltaOffset)
     : item
   if (index >= 0) projection.items[index] = nextItem
   else projection.items.push(nextItem)
@@ -373,19 +468,30 @@ function upsertItem(
   if (!turn.itemIds.includes(item.id)) turn.itemIds.push(item.id)
 }
 
-function appendDelta(existing: TurnItem, delta: TurnItem): TurnItem {
+function appendDelta(existing: TurnItem, delta: TurnItem, deltaOffset?: number): TurnItem {
   if (
     (existing.kind === 'assistant_text' && delta.kind === 'assistant_text') ||
     (existing.kind === 'assistant_reasoning' && delta.kind === 'assistant_reasoning')
   ) {
     return {
       ...existing,
-      text: `${existing.text}${delta.text}`,
+      text: mergeAssistantDelta(existing.text, delta.text, deltaOffset),
       status: delta.status,
       finishedAt: delta.finishedAt ?? existing.finishedAt
     }
   }
   return delta
+}
+
+function mergeAssistantDelta(existing: string, fragment: string, offset?: number): string {
+  if (offset === undefined || !Number.isSafeInteger(offset) || offset < 0 || offset > existing.length) {
+    return `${existing}${fragment}`
+  }
+  const overlapLength = Math.min(existing.length - offset, fragment.length)
+  if (existing.slice(offset, offset + overlapLength) !== fragment.slice(0, overlapLength)) {
+    return `${existing}${fragment}`
+  }
+  return `${existing}${fragment.slice(overlapLength)}`
 }
 
 function ensureTurn(
@@ -418,6 +524,10 @@ function cloneProjection(projection: EventSourcedRuntimeProjection): MutableProj
     items: projection.items.map((item) => ({ ...item }) as TurnItem),
     usage: { ...projection.usage },
     childRuns: projection.childRuns.map((run) => ({ ...run })),
+    approvalReviews: projection.approvalReviews.map((review) => ({
+      ...review,
+      ...(review.action ? { action: structuredClone(review.action) } : {})
+    })),
     compactions: projection.compactions.map((compaction) => ({ ...compaction })),
     errors: projection.errors.map((error) => ({ ...error })),
     ...(projection.toolCatalog ? { toolCatalog: { ...projection.toolCatalog } } : {})
@@ -434,6 +544,7 @@ function freezeProjection(projection: MutableProjection): EventSourcedRuntimePro
     })),
     items: [...projection.items],
     childRuns: [...projection.childRuns],
+    approvalReviews: [...projection.approvalReviews],
     compactions: [...projection.compactions],
     errors: [...projection.errors]
   }

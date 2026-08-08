@@ -38,6 +38,7 @@ export type CompactionPlan = {
 
 export type CompactionTriggerOptions = {
   model?: string
+  providerId?: string
   /** Provider-reported prompt token count for the last request, when known. */
   promptTokens?: number
   frozenMessageCount?: number
@@ -48,6 +49,27 @@ export type CompactionTriggerOptions = {
    * `promptTokens` is available.
    */
   overheadTokens?: number
+  /**
+   * Exact local input-token estimate of the already-constructed request
+   * (history + dynamic context + attachments + tools). Acts as a floor on
+   * the input pressure; it never replaces provider usage or the stored-item
+   * estimate, it just prevents the compaction heuristic from under-counting
+   * parts of the request that are not part of the stored history.
+   */
+  requestInputTokens?: number
+  /**
+   * Tokens reserved for the model output on this request. When combined with
+   * `requestHardCapTokens` it lets compaction fire *before* the send-time
+   * `input + output` guard rejects the request, closing the dead zone where
+   * input is below the soft threshold but the full budget is over the cap.
+   */
+  outputBudgetTokens?: number
+  /**
+   * Same hard cap used by the send-time guard (`input + output` may not
+   * exceed it). Only when both this and `outputBudgetTokens` are present
+   * does the budget-driven force compaction apply.
+   */
+  requestHardCapTokens?: number
 }
 
 /**
@@ -61,6 +83,9 @@ export class ContextCompactor {
   private readonly softThreshold: number
   private readonly hardThreshold: number
   private readonly modelProfiles: readonly ModelContextProfile[]
+  private readonly profilesForProvider?: (
+    providerId: string | undefined
+  ) => readonly ModelContextProfile[]
 
   constructor(options?: {
     estimator?: ContextEstimator
@@ -68,6 +93,9 @@ export class ContextCompactor {
     hardThreshold?: number
     contextCompaction?: ContextCompactionConfig
     models?: ModelConfig
+    profilesForProvider?: (
+      providerId: string | undefined
+    ) => readonly ModelContextProfile[]
   }) {
     const contextCompaction = options?.contextCompaction
     this.estimator = options?.estimator ?? new ContextEstimator()
@@ -83,6 +111,7 @@ export class ContextCompactor {
       contextCompaction,
       models: options?.models
     })
+    this.profilesForProvider = options?.profilesForProvider
   }
 
   estimate(items: TurnItem[]): number {
@@ -94,7 +123,7 @@ export class ContextCompactor {
   }
 
   planCompaction(items: TurnItem[], options?: CompactionTriggerOptions): CompactionPlan | null {
-    const thresholds = this.thresholds(options?.model)
+    const thresholds = this.thresholds(options?.model, options?.providerId)
     const frozenMessageCount = normalizeFrozenMessageCount(options?.frozenMessageCount, items.length)
     const compactableItems = frozenMessageCount > 0 ? items.slice(frozenMessageCount) : items
     // `overheadTokens` accounts for the system prompt and tool schemas that
@@ -115,13 +144,36 @@ export class ContextCompactor {
     // estimate of what we sent by a wide margin, so when the reported count
     // blows past it we distrust the provider and fall back to the estimate.
     const promptTokens = trustworthyPromptTokens(reportedPromptTokens, estimatedTokens, options?.model)
-    const tokens = Math.max(estimatedTokens, promptTokens ?? 0)
-    if (tokens < thresholds.softThreshold) return null
+    const inputPressure = Math.max(
+      estimatedTokens,
+      promptTokens ?? 0,
+      finiteNonNegative(options?.requestInputTokens)
+    )
+    const outputBudgetTokens = finiteNonNegative(options?.outputBudgetTokens)
+    const requestHardCapTokens = finiteNonNegative(options?.requestHardCapTokens)
+    // Budget-driven force compaction: the send-time guard rejects any request
+    // whose input + reserved output exceeds the hard cap. Compacting only on
+    // input thresholds leaves a dead zone when the output budget is larger
+    // than (hard - soft): input can sit below soft while input + output is
+    // already over the cap. Mirror the exact `>` boundary of the guard so
+    // equality never spuriously compacts.
+    if (
+      requestHardCapTokens > 0 &&
+      outputBudgetTokens > 0 &&
+      inputPressure + outputBudgetTokens > requestHardCapTokens
+    ) {
+      return {
+        mode: 'force',
+        keepRecent: 1,
+        reason: `request budget ${inputPressure} input + ${outputBudgetTokens} output exceeds ${requestHardCapTokens}-token hard cap`
+      }
+    }
+    if (inputPressure < thresholds.softThreshold) return null
     const aggressiveThreshold = aggressiveCompactionThreshold(thresholds)
     const mode: CompactionMode =
-      tokens >= thresholds.hardThreshold
+      inputPressure >= thresholds.hardThreshold
         ? 'force'
-        : tokens >= aggressiveThreshold
+        : inputPressure >= aggressiveThreshold
           ? 'aggressive'
           : 'normal'
     const source = promptTokens !== undefined && promptTokens >= estimatedTokens ? 'usage prompt_tokens' : 'estimated prompt tokens'
@@ -129,7 +181,7 @@ export class ContextCompactor {
     return {
       mode,
       keepRecent,
-      reason: `${source} ${tokens} reached ${mode} compaction threshold`
+      reason: `${source} ${inputPressure} reached ${mode} compaction threshold`
     }
   }
 
@@ -158,18 +210,27 @@ export class ContextCompactor {
     summaryItem: TurnItem
     replacedTokens: number
   } {
+    // Goal context is durable model history, but it is neither conversation
+    // content nor an instruction that a compaction summary may paraphrase.
+    // Pull it out before calculating frozen/head/tail boundaries so exactly
+    // one original record survives after the newly-created summary.
+    const goalContexts = input.history.filter((item) => item.kind === 'goal_context')
+    const compactableInput = input.history.filter((item) => item.kind !== 'goal_context')
     const frozenMessageCount = normalizeFrozenMessageCount(
       input.frozenMessageCount,
-      input.history.length
+      compactableInput.length
     )
-    const frozen = frozenMessageCount > 0 ? input.history.slice(0, frozenMessageCount) : []
-    const history = trimTrailingToolCalls(input.history.slice(frozenMessageCount))
+    const frozen = frozenMessageCount > 0 ? compactableInput.slice(0, frozenMessageCount) : []
+    const history = trimTrailingToolCalls(compactableInput.slice(frozenMessageCount))
+    // Preserve exact order on no-op paths. It avoids a needless cache miss on
+    // a short goal turn merely because compaction was considered.
+    const unchangedNext = goalContexts.length > 0 ? [...input.history] : [...frozen, ...history]
     const requestedKeepRecent = Math.max(0, input.keepRecent ?? 4)
     const keepRecent =
       history.length <= 1 ? history.length : Math.min(requestedKeepRecent, history.length - 1)
     if (history.length <= 1 || history.length - keepRecent <= 0) {
       return {
-        next: [...frozen, ...history],
+        next: unchangedNext,
         summaryItem: makeCompactionItem({
           id: `compaction_${input.turnId}_noop`,
           turnId: input.turnId,
@@ -185,16 +246,59 @@ export class ContextCompactor {
     const tailStart = keepRecent === 0
       ? history.length
       : repairTailStartForToolResults(history, history.length - keepRecent)
+    if (tailStart === 0) {
+      return {
+        next: unchangedNext,
+        summaryItem: makeCompactionItem({
+          id: `compaction_${input.turnId}_noop`,
+          turnId: input.turnId,
+          threadId: input.threadId,
+          summary: 'compaction skipped to preserve a complete tool interaction',
+          replacedTokens: 0,
+          pinnedConstraints: input.prefix.pinnedConstraints,
+          auto: input.auto
+        }),
+        replacedTokens: 0
+      }
+    }
     const head = history.slice(0, tailStart)
     const tail = history.slice(tailStart)
+    // Re-summarizing only the previous summary cannot reclaim any conversation
+    // history. Provider usage counters can remain above a threshold after a
+    // successful compaction (notably when cached tokens are cumulative), which
+    // used to create a fresh compaction item on every following model step.
+    if (head.length > 0 && head.every((item) => item.kind === 'compaction')) {
+      return {
+        next: unchangedNext,
+        summaryItem: makeCompactionItem({
+          id: `compaction_${input.turnId}_noop`,
+          turnId: input.turnId,
+          threadId: input.threadId,
+          summary: 'no new history to compact',
+          replacedTokens: 0,
+          pinnedConstraints: input.prefix.pinnedConstraints,
+          auto: input.auto
+        }),
+        replacedTokens: 0
+      }
+    }
     const replacedTokens = this.estimator.estimateItems(head)
     const sourceDigest = computeShortHash(compactedItemsDigestSource(head))
     const digestMarker = createToolDigestMarker(sourceDigest)
+    // The tail is sent verbatim after this summary. Summarizing it as well
+    // duplicates the current user request (and can make the model treat one
+    // instruction as two). Keep the summary source explicitly limited to the
+    // folded head; the retained tail remains the single source of truth for
+    // recent instructions.
     const summaryBase = input.summaryOverride?.trim() || buildCompactionSummary({
-      history,
+      history: head,
       head,
       tail,
       prefix: input.prefix,
+      // A skill pin in the retained tail is already sent verbatim with the
+      // request. Copy only folded pins into the summary so the tail has one
+      // source of truth, just like ordinary user instructions.
+      skillPins: extractSkillPins(head),
       reason: input.reason,
       mode: input.mode,
       budgetTokens: input.budgetTokens
@@ -212,19 +316,22 @@ export class ContextCompactor {
       digestMarker,
       sourceItemIds: head.map((item) => item.id)
     })
-    return { next: [...frozen, summaryItem, ...tail], summaryItem, replacedTokens }
+    return { next: [...frozen, summaryItem, ...goalContexts, ...tail], summaryItem, replacedTokens }
   }
 
   /** Hard cap used by the loop to enforce an upper bound on the conversation. */
-  hardCap(model?: string): number {
-    return this.thresholds(model).hardThreshold
+  hardCap(model?: string, providerId?: string): number {
+    return this.thresholds(model, providerId).hardThreshold
   }
 
-  thresholds(model?: string): ModelContextThresholds {
+  thresholds(model?: string, providerId?: string): ModelContextThresholds {
+    const profiles = providerId
+      ? this.profilesForProvider?.(providerId) ?? this.modelProfiles
+      : this.modelProfiles
     return contextThresholdsForModel(model, {
       softThreshold: this.softThreshold,
       hardThreshold: this.hardThreshold
-    }, this.modelProfiles)
+    }, profiles)
   }
 }
 
@@ -239,21 +346,70 @@ export function trimTrailingToolCalls(history: TurnItem[]): TurnItem[] {
 }
 
 function repairTailStartForToolResults(history: TurnItem[], start: number): number {
-  const tailStart = Math.max(0, Math.min(history.length, start))
-  const tail = history.slice(tailStart)
-  if (!hasOrphanToolResult(tail)) return tailStart
-  for (let index = tailStart - 1; index >= 0; index -= 1) {
-    if (history[index].kind === 'user_message') return index > 0 ? index : tailStart
+  let tailStart = Math.max(0, Math.min(history.length, start))
+  while (tailStart > 0) {
+    const orphanCallIds = orphanToolResultCallIds(history.slice(tailStart))
+    if (orphanCallIds.length === 0) return tailStart
+
+    const latestUserStart = findLatestUserMessageBefore(history, tailStart)
+    if (latestUserStart > 0) return latestUserStart
+
+    let expandedStart = tailStart
+    for (const callId of orphanCallIds) {
+      const callIndex = findMatchingToolCallBefore(history, callId, tailStart)
+      if (callIndex < 0) {
+        // The persisted history is already malformed. Leave it unchanged
+        // instead of committing a compaction that would strand a result
+        // behind the summary and silently drop it during model-history repair.
+        return 0
+      }
+      expandedStart = Math.min(expandedStart, toolCallBatchStart(history, callIndex))
+    }
+    if (expandedStart >= tailStart) return 0
+    tailStart = expandedStart
   }
   return tailStart
 }
 
-function hasOrphanToolResult(items: TurnItem[]): boolean {
+function findLatestUserMessageBefore(history: TurnItem[], before: number): number {
+  for (let index = Math.min(before, history.length) - 1; index >= 0; index -= 1) {
+    if (history[index].kind === 'user_message') return index
+  }
+  return -1
+}
+
+function orphanToolResultCallIds(items: TurnItem[]): string[] {
   const callIds = new Set<string>()
   for (const item of items) {
     if (item.kind === 'tool_call') callIds.add(item.callId)
   }
-  return items.some((item) => item.kind === 'tool_result' && !callIds.has(item.callId))
+  return [...new Set(
+    items
+      .filter((item): item is Extract<TurnItem, { kind: 'tool_result' }> => item.kind === 'tool_result')
+      .filter((item) => !callIds.has(item.callId))
+      .map((item) => item.callId)
+  )]
+}
+
+function findMatchingToolCallBefore(history: TurnItem[], callId: string, before: number): number {
+  for (let index = Math.min(before, history.length) - 1; index >= 0; index -= 1) {
+    const item = history[index]
+    if (item.kind === 'tool_call' && item.callId === callId) return index
+  }
+  return -1
+}
+
+function toolCallBatchStart(history: TurnItem[], callIndex: number): number {
+  const turnId = history[callIndex]?.turnId
+  let start = callIndex
+  while (
+    start > 0 &&
+    history[start - 1]?.kind === 'tool_call' &&
+    history[start - 1]?.turnId === turnId
+  ) {
+    start -= 1
+  }
+  return start
 }
 
 function aggressiveCompactionThreshold(thresholds: ModelContextThresholds): number {
@@ -263,6 +419,7 @@ function aggressiveCompactionThreshold(thresholds: ModelContextThresholds): numb
 
 const inflationWarnedAt = new Map<string, number>()
 const INFLATION_WARN_INTERVAL_MS = 60_000
+const MAX_INFLATION_WARNING_MODELS = 256
 
 /**
  * Returns the provider `prompt_tokens` when it is consistent with our local
@@ -287,7 +444,12 @@ function warnInflatedPromptTokens(reported: number, estimate: number, model?: st
   const key = model || 'unknown'
   const now = Date.now()
   if (now - (inflationWarnedAt.get(key) ?? 0) < INFLATION_WARN_INTERVAL_MS) return
+  inflationWarnedAt.delete(key)
   inflationWarnedAt.set(key, now)
+  if (inflationWarnedAt.size > MAX_INFLATION_WARNING_MODELS) {
+    const oldest = inflationWarnedAt.keys().next().value
+    if (oldest !== undefined) inflationWarnedAt.delete(oldest)
+  }
   console.warn(
     `[kun] ignoring inflated prompt_tokens for model "${key}": reported ${reported} vs local estimate ${estimate} ` +
       `(>${PROMPT_TOKEN_TRUST_FACTOR}x). Falling back to the estimate for context/compaction; the provider is likely ` +
@@ -312,6 +474,7 @@ function buildCompactionSummary(input: {
   head: TurnItem[]
   tail: TurnItem[]
   prefix: ImmutablePrefix
+  skillPins?: readonly string[]
   reason?: string
   mode?: CompactionMode
   budgetTokens?: number
@@ -335,7 +498,7 @@ function buildCompactionSummary(input: {
       lines.push(`- ${pinned}`)
     }
   }
-  const skillPins = extractSkillPins(input.history)
+  const skillPins = input.skillPins ?? extractSkillPins(input.history)
   if (skillPins.length > 0) {
     lines.push('Pinned skills (preserved across compaction):')
     for (const skillPin of skillPins) {
@@ -347,10 +510,21 @@ function buildCompactionSummary(input: {
   lines.push(
     `Summarized ${input.history.length} item(s); ${input.tail.length} recent item(s) are also kept verbatim for the current request.`
   )
+  const durableOutlineLines = fitLinesToBudget(
+    extractDurableOutlineLines(input.history),
+    Math.floor(contentBudget * 0.75)
+  )
+  if (durableOutlineLines.length > 0) {
+    lines.push('Durable outline and open items:')
+    lines.push(...durableOutlineLines)
+    lines.push('')
+  }
   lines.push('Conversation and work summary:')
+  const usedBudget = lines.join('\n').length
+  const remainingBudget = Math.max(1_200, contentBudget - usedBudget)
   const summaryLines = fitLinesToBudget(
     selectSummaryLines(input.history.map(summarizeItem).filter((line) => line.length > 0)),
-    contentBudget
+    remainingBudget
   )
   if (summaryLines.length === 0) {
     lines.push('- No user-visible content before compaction.')
@@ -360,7 +534,7 @@ function buildCompactionSummary(input: {
   return lines.join('\n')
 }
 
-function extractSkillPins(history: TurnItem[]): string[] {
+export function extractSkillPins(history: readonly TurnItem[]): string[] {
   const pins = new Set<string>()
   for (const item of history) {
     if (item.kind !== 'assistant_text' && item.kind !== 'user_message' && item.kind !== 'compaction') continue
@@ -376,14 +550,112 @@ function extractSkillPins(history: TurnItem[]): string[] {
 }
 
 function summaryCharBudget(budgetTokens: number | undefined): number {
-  if (budgetTokens === undefined) return 4_000
-  return Math.max(1_200, Math.min(12_000, budgetTokens * 4))
+  if (budgetTokens === undefined) return 12_000
+  return Math.max(1_200, Math.min(24_000, budgetTokens * 4))
+}
+
+function extractDurableOutlineLines(history: TurnItem[]): string[] {
+  const lines: string[] = []
+  for (const item of history) {
+    switch (item.kind) {
+      case 'user_message':
+        lines.push(...durableTextLines('User request', item.text, { fallback: true }))
+        break
+      case 'goal_context':
+        break
+      case 'assistant_text':
+        lines.push(...durableTextLines('Assistant finding', item.text))
+        break
+      case 'compaction':
+        if (item.replacedTokens > 0) {
+          lines.push(...durableTextLines('Earlier compaction', item.summary))
+        }
+        break
+      case 'tool_call': {
+        const text = item.summary || stringifyCompact(item.arguments)
+        if (isDurableTextLine(text)) {
+          lines.push(`- Tool call ${item.toolName}: ${clipText(text, 520)}`)
+        }
+        break
+      }
+      case 'tool_result': {
+        const text = stringifyCompact(item.output)
+        if (item.isError || isDurableTextLine(text)) {
+          lines.push(`- Tool result ${item.toolName}${item.isError ? ' error' : ''}: ${clipText(text, 520)}`)
+        }
+        break
+      }
+      case 'approval':
+        if (item.status !== 'allowed') {
+          lines.push(`- Approval ${item.status} for ${item.toolName}: ${clipText(item.summary, 520)}`)
+        }
+        break
+      case 'user_input':
+        lines.push(`- User input ${item.status}: ${clipText(item.prompt, 520)}`)
+        break
+      case 'review':
+        lines.push(...durableTextLines('Review', item.reviewText || stringifyCompact(item.output)))
+        break
+      case 'error':
+        lines.push(`- Error${item.code ? ` ${item.code}` : ''}: ${clipText(item.message, 520)}`)
+        break
+      case 'assistant_reasoning':
+        break
+    }
+  }
+  return dedupeLines(lines)
+}
+
+function durableTextLines(
+  label: string,
+  text: string,
+  options?: { fallback?: boolean }
+): string[] {
+  const rawLines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+  const selected = rawLines.filter(isDurableTextLine)
+  if (selected.length === 0 && options?.fallback) {
+    const clipped = clipText(text, 520)
+    return clipped ? [`- ${label}: ${clipped}`] : []
+  }
+  return selected.map((line) => `- ${label}: ${clipText(line, 520)}`)
+}
+
+const DURABLE_OUTLINE_LINE =
+  /^(?:#{1,6}\s+|[-*+]\s+(?:\[[ xX-]\]\s*)?|\d{1,4}[.)]\s+|[A-Za-z][.)]\s+|(?:problems?|issues?|tasks?|todos?|bugs?|fixes?|steps?)\s*#?\d{0,4}\b)/i
+const DURABLE_KEYWORD_LINE =
+  /\b(?:issue|bug|problem|task|todo|open|done|next|remaining|scope|constraint|requirement|decision|root cause|fix|blocked|error|exception|failed|failing|command|test|file|path|must|need|expected|actual)\b/i
+const DURABLE_IDENTIFIER_LINE =
+  /(?:https?:\/\/|#[0-9]+\b|`[^`]+`|(?:^|[ ./])[\w.-]+\.(?:ts|tsx|js|jsx|mjs|cjs|json|md|py|go|rs|java|c|cpp|h|hpp|css|scss|html|yml|yaml)\b|\/[\w./-]+)/
+
+function isDurableTextLine(text: string): boolean {
+  const line = text.trim()
+  if (!line) return false
+  if (DURABLE_OUTLINE_LINE.test(line)) return true
+  if (DURABLE_KEYWORD_LINE.test(line)) return true
+  return DURABLE_IDENTIFIER_LINE.test(line)
+}
+
+function dedupeLines(lines: string[]): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const line of lines) {
+    const key = line.replace(/\s+/g, ' ').trim().toLowerCase()
+    if (!key || seen.has(key)) continue
+    seen.add(key)
+    out.push(line)
+  }
+  return out
 }
 
 function summarizeItem(item: TurnItem): string {
   switch (item.kind) {
     case 'user_message':
       return `- User: ${clipText(item.text)}`
+    case 'goal_context':
+      return ''
     case 'assistant_text':
       return `- Assistant: ${clipText(item.text)}`
     case 'assistant_reasoning':
@@ -408,14 +680,28 @@ function summarizeItem(item: TurnItem): string {
 }
 
 function selectSummaryLines(lines: string[]): string[] {
-  if (lines.length <= 20) return lines
-  const start = lines.slice(0, 4)
-  const end = lines.slice(-14)
-  return [
-    ...start,
-    `- ${lines.length - start.length - end.length} middle item(s) omitted from this compact summary.`,
-    ...end
-  ]
+  if (lines.length <= 40) return lines
+  const start = lines.slice(0, 6)
+  const end = lines.slice(-18)
+  const middle = lines.slice(start.length, lines.length - end.length)
+  const criticalMiddle = middle.filter(isCriticalSummaryLine)
+  const selected = dedupeLines([...start, ...criticalMiddle, ...end])
+  const omitted = lines.length - selected.length
+  if (omitted > 0) {
+    selected.splice(
+      Math.min(start.length + criticalMiddle.length, selected.length),
+      0,
+      `- ${omitted} lower-priority transcript line(s) omitted after preserving detected user requests, task lists, errors, paths, and decisions.`
+    )
+  }
+  return selected
+}
+
+function isCriticalSummaryLine(line: string): boolean {
+  if (/^- User:/.test(line)) return true
+  if (/\b(?:error|failed|failing|exception|denied|cancelled)\b/i.test(line)) return true
+  const content = line.replace(/^- [^:]+:\s*/, '')
+  return isDurableTextLine(content)
 }
 
 function fitLinesToBudget(lines: string[], budget: number): string[] {
@@ -449,4 +735,15 @@ function clipText(text: string, max = 360): string {
   const compact = text.replace(/\s+/g, ' ').trim()
   if (compact.length <= max) return compact
   return `${compact.slice(0, Math.max(0, max - 3)).trim()}...`
+}
+
+/**
+ * Normalizes optional token budget inputs so missing, negative, or
+ * non-finite values never poison the compaction math. Returns 0 for
+ * anything that is not a finite non-negative number, which keeps legacy
+ * callers (that omit these fields entirely) on the old behavior.
+ */
+function finiteNonNegative(value: number | undefined): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 0
+  return Math.max(0, Math.floor(value))
 }

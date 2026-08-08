@@ -4,12 +4,19 @@ import type {
   ThreadGoal,
   ThreadTodoList,
   ThreadRelation,
-  ThreadStatus
+  ThreadStatus,
+  ThreadAgentSurface,
+  ExtensionAgentProfileSnapshot,
+  ExtensionRunBudget,
+  ExtensionThreadVisibility,
+  ExtensionToolCatalogEpoch
 } from '../contracts/threads.js'
 import {
   DEFAULT_APPROVAL_POLICY,
+  DEFAULT_APPROVAL_REVIEWER,
   DEFAULT_SANDBOX_MODE,
   type ApprovalPolicy,
+  type ApprovalReviewer,
   type SandboxMode
 } from '../contracts/policy.js'
 
@@ -25,14 +32,25 @@ export function createThreadRecord(input: {
   title: string
   titleAuto?: boolean
   workspace: string
+  additionalWorkspaces?: string[]
   model: string
+  agentSurface?: ThreadAgentSurface
   providerId?: string
+  ownerExtensionId?: string
+  ownerExtensionVersion?: string
+  accountId?: string
+  extensionVisibility?: ExtensionThreadVisibility
+  extensionProfile?: ExtensionAgentProfileSnapshot
+  extensionBudget?: ExtensionRunBudget
+  toolCatalogEpoch?: ExtensionToolCatalogEpoch
   agentId?: string
   systemPrompt?: string
   mode?: ThreadMode
   status?: ThreadStatus
   approvalPolicy?: ApprovalPolicy
   sandboxMode?: SandboxMode
+  approvalReviewer?: ApprovalReviewer
+  modelRequestCaptureEnabled?: boolean
   pinned?: boolean
   costBudgetUsd?: number
   costBudgetWarningSent?: boolean
@@ -53,14 +71,27 @@ export function createThreadRecord(input: {
     title: input.title,
     ...(input.titleAuto !== undefined ? { titleAuto: input.titleAuto } : {}),
     workspace: input.workspace,
+    additionalWorkspaces: [...new Set(
+      (input.additionalWorkspaces ?? []).map((entry) => entry.trim()).filter((entry) => entry && entry !== input.workspace)
+    )],
     model: input.model,
+    ...(input.agentSurface ? { agentSurface: input.agentSurface } : {}),
     ...(input.providerId ? { providerId: input.providerId } : {}),
+    ...(input.ownerExtensionId ? { ownerExtensionId: input.ownerExtensionId } : {}),
+    ...(input.ownerExtensionVersion ? { ownerExtensionVersion: input.ownerExtensionVersion } : {}),
+    ...(input.accountId ? { accountId: input.accountId } : {}),
+    ...(input.extensionVisibility ? { extensionVisibility: input.extensionVisibility } : {}),
+    ...(input.extensionProfile ? { extensionProfile: input.extensionProfile } : {}),
+    ...(input.extensionBudget ? { extensionBudget: input.extensionBudget } : {}),
+    ...(input.toolCatalogEpoch ? { toolCatalogEpoch: input.toolCatalogEpoch } : {}),
     ...(input.agentId ? { agentId: input.agentId } : {}),
     ...(input.systemPrompt ? { systemPrompt: input.systemPrompt } : {}),
     mode: input.mode ?? 'agent',
     status: input.status ?? 'idle',
     approvalPolicy: input.approvalPolicy ?? DEFAULT_APPROVAL_POLICY,
     sandboxMode: input.sandboxMode ?? DEFAULT_SANDBOX_MODE,
+    approvalReviewer: input.approvalReviewer ?? DEFAULT_APPROVAL_REVIEWER,
+    modelRequestCaptureEnabled: input.modelRequestCaptureEnabled ?? false,
     ...(input.pinned !== undefined ? { pinned: input.pinned } : {}),
     ...(input.costBudgetUsd !== undefined ? { costBudgetUsd: input.costBudgetUsd } : {}),
     ...(input.costBudgetWarningSent !== undefined ? { costBudgetWarningSent: input.costBudgetWarningSent } : {}),
@@ -87,7 +118,9 @@ export function toThreadSummary(
   thread: ThreadEntity
 ): Pick<
   ThreadEntity,
-  'id' | 'title' | 'titleAuto' | 'summary' | 'workspace' | 'model' | 'providerId' | 'agentId' | 'systemPrompt' | 'mode' | 'status' | 'approvalPolicy' | 'sandboxMode' | 'pinned' | 'createdAt' | 'updatedAt'
+  'id' | 'title' | 'titleAuto' | 'summary' | 'workspace' | 'additionalWorkspaces' | 'model' | 'agentSurface' | 'providerId' | 'agentId' | 'systemPrompt' | 'mode' | 'status' | 'approvalPolicy' | 'sandboxMode' | 'approvalReviewer' | 'modelRequestCaptureEnabled' | 'pinned' | 'createdAt' | 'updatedAt'
+  | 'ownerExtensionId' | 'ownerExtensionVersion' | 'accountId' | 'extensionVisibility'
+  | 'extensionProfile' | 'extensionBudget' | 'toolCatalogEpoch'
   | 'costBudgetUsd' | 'costBudgetWarningSent'
   | 'relation' | 'parentThreadId'
   | 'forkedFromThreadId' | 'forkedFromTitle' | 'forkedAt' | 'forkedFromMessageCount' | 'forkedFromTurnCount'
@@ -99,14 +132,25 @@ export function toThreadSummary(
     ...(thread.titleAuto !== undefined ? { titleAuto: thread.titleAuto } : {}),
     ...(thread.summary ? { summary: thread.summary } : {}),
     workspace: thread.workspace,
+    additionalWorkspaces: thread.additionalWorkspaces,
     model: thread.model,
+    agentSurface: resolveThreadAgentSurface(thread),
     ...(thread.providerId ? { providerId: thread.providerId } : {}),
+    ...(thread.ownerExtensionId ? { ownerExtensionId: thread.ownerExtensionId } : {}),
+    ...(thread.ownerExtensionVersion ? { ownerExtensionVersion: thread.ownerExtensionVersion } : {}),
+    ...(thread.accountId ? { accountId: thread.accountId } : {}),
+    ...(thread.extensionVisibility ? { extensionVisibility: thread.extensionVisibility } : {}),
+    ...(thread.extensionProfile ? { extensionProfile: thread.extensionProfile } : {}),
+    ...(thread.extensionBudget ? { extensionBudget: thread.extensionBudget } : {}),
+    ...(thread.toolCatalogEpoch ? { toolCatalogEpoch: thread.toolCatalogEpoch } : {}),
     ...(thread.agentId ? { agentId: thread.agentId } : {}),
     ...(thread.systemPrompt ? { systemPrompt: thread.systemPrompt } : {}),
     mode: thread.mode,
     status: thread.status,
     approvalPolicy: thread.approvalPolicy,
     sandboxMode: thread.sandboxMode,
+    approvalReviewer: thread.approvalReviewer,
+    modelRequestCaptureEnabled: thread.modelRequestCaptureEnabled,
     ...(thread.pinned !== undefined ? { pinned: thread.pinned } : {}),
     ...(thread.costBudgetUsd !== undefined ? { costBudgetUsd: thread.costBudgetUsd } : {}),
     ...(thread.costBudgetWarningSent !== undefined ? { costBudgetWarningSent: thread.costBudgetWarningSent } : {}),
@@ -122,4 +166,21 @@ export function toThreadSummary(
     createdAt: thread.createdAt,
     updatedAt: thread.updatedAt
   }
+}
+
+/**
+ * Resolves legacy ownership without allowing one stray turn to steal a Code
+ * conversation. An explicit thread value is authoritative; otherwise only a
+ * non-empty history whose every turn names the same non-Code surface is
+ * inferred as Write or Design. Empty, mixed, and partially annotated history
+ * remains Code.
+ */
+export function resolveThreadAgentSurface(
+  thread: Pick<ThreadEntity, 'agentSurface' | 'turns'>
+): ThreadAgentSurface {
+  if (thread.agentSurface) return thread.agentSurface
+  if (thread.turns.length === 0) return 'code'
+  const candidate = thread.turns[0]?.agentSurface
+  if (candidate !== 'write' && candidate !== 'design') return 'code'
+  return thread.turns.every((turn) => turn.agentSurface === candidate) ? candidate : 'code'
 }

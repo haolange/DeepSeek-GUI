@@ -8,6 +8,7 @@ import {
   LayoutGrid,
   Moon,
   Plus,
+  Puzzle,
   Settings,
   Smartphone,
   Sun,
@@ -15,7 +16,7 @@ import {
 } from 'lucide-react'
 import type { NormalizedThread } from '../../agent/types'
 import { useChatStore, type SettingsRouteSection } from '../../store/chat-store'
-import type { SddDraft } from '../../sdd/sdd-draft-store'
+import { resolveSddRequirementWorkspace } from '../../sdd/sdd-draft-store'
 import type {
   ClawImChannelV1,
 } from '@shared/app-settings'
@@ -27,7 +28,9 @@ import { ClawAddImDialog } from './SidebarClawDialog'
 import { SidebarMascot } from './AnimatedWorkLogo'
 import { ConnectPhoneSidebarPanel } from './ConnectPhoneView'
 import { SidebarProjectsSection } from './SidebarProjectsSection'
+import { SidebarConversationsSection } from './SidebarConversationsSection'
 import { WorkspaceModeTabs } from './WorkspaceModeTabs'
+import { workspaceLabelFromPath } from '../../lib/workspace-label'
 import {
   SidebarCommandRow,
   SidebarFrame,
@@ -40,6 +43,7 @@ type Props = {
   activeView: 'chat' | 'write' | 'claw' | 'schedule' | 'workflow' | 'subagents'
   connectPhoneSidebarOpen: boolean
   pluginsActive: boolean
+  extensionsActive: boolean
   runtimeReady: boolean
   threadSearch: string
   showArchivedThreads: boolean
@@ -51,19 +55,24 @@ type Props = {
   onDeleteThread: (id: string) => Promise<void>
   onRestoreThread: (id: string) => Promise<void>
   onNewChat: () => void
-  onNewChatInWorkspace: (workspaceRoot: string) => void
+  onNewChatInWorkspace: (
+    workspaceRoot: string,
+    options?: { forceNew?: boolean }
+  ) => Promise<string | null>
   onNewRequirement: () => void
-  onOpenRequirementDraft: (draft: SddDraft) => void
   onOpenSettings: (section?: SettingsRouteSection) => void
   onOpenPlugins: () => void
+  onOpenExtensions: () => void
   onToggleTheme: () => void
   focusModeEnabled: boolean
   onFocusModeChange: (enabled: boolean) => void
   onToggleConnectPhone: () => void
   onCodeOpen: () => void
   onWriteOpen: () => void
+  onDesignOpen: () => void
   onScheduleOpen: () => void
   onWorkflowOpen: () => void
+  onNewConversation: () => void
 }
 
 export function Sidebar({
@@ -72,6 +81,7 @@ export function Sidebar({
   activeView,
   connectPhoneSidebarOpen,
   pluginsActive,
+  extensionsActive,
   runtimeReady,
   threadSearch,
   showArchivedThreads,
@@ -85,17 +95,19 @@ export function Sidebar({
   onNewChat,
   onNewChatInWorkspace,
   onNewRequirement,
-  onOpenRequirementDraft,
   onOpenSettings,
   onOpenPlugins,
+  onOpenExtensions,
   onToggleTheme,
   focusModeEnabled,
   onFocusModeChange,
   onToggleConnectPhone,
   onCodeOpen,
   onWriteOpen,
+  onDesignOpen,
   onScheduleOpen,
-  onWorkflowOpen
+  onWorkflowOpen,
+  onNewConversation
 }: Props): ReactElement {
   const { t, i18n } = useTranslation('common')
   const [isDarkMode, setIsDarkMode] = useState(
@@ -111,6 +123,7 @@ export function Sidebar({
   }, [])
 
   const workspaceRoot = useChatStore((s) => s.workspaceRoot)
+  const conversationWorkspaceRoot = useChatStore((s) => s.conversationWorkspaceRoot)
   const codeWorkspaceRoots = useChatStore((s) => s.codeWorkspaceRoots)
   const chooseWorkspace = useChatStore((s) => s.chooseWorkspace)
   const deleteWorkspace = useChatStore((s) => s.deleteWorkspace)
@@ -124,6 +137,7 @@ export function Sidebar({
   const deleteClawChannel = useChatStore((s) => s.deleteClawChannel)
   const resetClawChannelSession = useChatStore((s) => s.resetClawChannelSession)
   const [imDialogMode, setImDialogMode] = useState<ClawImDialogMode | null>(null)
+  const requirementWorkspace = resolveSddRequirementWorkspace(threads, activeThreadId, workspaceRoot)
 
   const activeClawChannel = useMemo(
     () => clawChannels.find((channel) => channel.id === activeClawChannelId) ?? clawChannels[0] ?? null,
@@ -136,9 +150,9 @@ export function Sidebar({
       title={t('appName')}
       footer={
         <div className="space-y-1">
-          <div className="flex min-h-[42px] items-center justify-center gap-2.5 pb-1">
+          <div className="ds-sidebar-focus-row flex min-h-[42px] items-center justify-center gap-2.5 pb-1">
             {!focusModeEnabled ? (
-              <span className="flex h-[46px] w-[56px] shrink-0 items-center justify-center">
+              <span className="ds-sidebar-mascot-slot flex h-[46px] w-[56px] shrink-0 items-center justify-center">
                 <SidebarMascot />
               </span>
             ) : null}
@@ -151,13 +165,6 @@ export function Sidebar({
               ariaLabel={t('focusModeToggleLabel')}
             />
           </div>
-          <SidebarCommandRow
-            icon={<Smartphone className="h-4 w-4" strokeWidth={1.75} />}
-            label={t('claw')}
-            onClick={onToggleConnectPhone}
-            active={connectPhoneSidebarOpen}
-            variant="footer"
-          />
           <div className="flex items-center gap-1">
             <div className="min-w-0 flex-1">
               <SidebarCommandRow
@@ -167,6 +174,14 @@ export function Sidebar({
                 variant="footer"
               />
             </div>
+            <SidebarIconButton
+              title={t('claw')}
+              ariaLabel={t('claw')}
+              onClick={onToggleConnectPhone}
+              active={connectPhoneSidebarOpen}
+            >
+              <Smartphone className="h-4 w-4" strokeWidth={1.75} />
+            </SidebarIconButton>
             <SidebarIconButton
               title={isDarkMode ? t('switchToLight') : t('switchToDark')}
               ariaLabel={t('toggleTheme')}
@@ -187,6 +202,7 @@ export function Sidebar({
           activeView={activeView}
           onCodeOpen={onCodeOpen}
           onWriteOpen={onWriteOpen}
+          onDesignOpen={onDesignOpen}
         />
 
         {activeView !== 'claw' && activeView !== 'schedule' && activeView !== 'workflow' ? (
@@ -206,6 +222,14 @@ export function Sidebar({
               disabled={!runtimeReady}
               disabledHint={t('runtimeActionNeedsConnection')}
               variant="accent"
+              trailing={requirementWorkspace ? (
+                <span
+                  className="max-w-[92px] truncate text-[11.5px] text-ds-faint"
+                  title={requirementWorkspace}
+                >
+                  {workspaceLabelFromPath(requirementWorkspace)}
+                </span>
+              ) : null}
             />
           </>
         ) : null}
@@ -216,6 +240,12 @@ export function Sidebar({
           active={pluginsActive}
         />
         <SidebarCommandRow
+          icon={<Puzzle className="h-4 w-4" strokeWidth={1.75} />}
+          label={i18n.language.toLowerCase().startsWith('zh') ? '扩展' : 'Extensions'}
+          onClick={onOpenExtensions}
+          active={extensionsActive}
+        />
+        <SidebarCommandRow
           icon={<Clock3 className="h-4 w-4" strokeWidth={1.75} />}
           label={t('schedule')}
           onClick={onScheduleOpen}
@@ -223,7 +253,7 @@ export function Sidebar({
         />
         <SidebarCommandRow
           icon={<Workflow className="h-4 w-4" strokeWidth={1.75} />}
-          label={t('workflow')}
+          label={t('workflowCreate')}
           onClick={onWorkflowOpen}
           active={activeView === 'workflow'}
         />
@@ -268,6 +298,7 @@ export function Sidebar({
           showArchived={showArchivedThreads}
           workspaceRoot={workspaceRoot}
           workspaceRoots={codeWorkspaceRoots}
+          conversationRoot={conversationWorkspaceRoot}
           busy={busy}
           watchTurnCompletion={watchTurnCompletion}
           unreadThreadIds={unreadThreadIds}
@@ -275,7 +306,6 @@ export function Sidebar({
           onPickWorkspace={() => void chooseWorkspace()}
           onRemoveWorkspace={deleteWorkspace}
           onCreateThreadInWorkspace={onNewChatInWorkspace}
-          onOpenRequirementDraft={onOpenRequirementDraft}
           onSelectThread={onSelectThread}
           onRenameThread={onRenameThread}
           onPinThread={onPinThread}
@@ -286,6 +316,7 @@ export function Sidebar({
           t={t}
         />
       ) : (
+      <>
       <SidebarProjectsSection
         threads={threads}
         activeView={activeView === 'write' ? 'write' : 'chat'}
@@ -295,6 +326,7 @@ export function Sidebar({
         showArchived={showArchivedThreads}
         workspaceRoot={workspaceRoot}
         workspaceRoots={codeWorkspaceRoots}
+        conversationRoot={conversationWorkspaceRoot}
         busy={busy}
         watchTurnCompletion={watchTurnCompletion}
         unreadThreadIds={unreadThreadIds}
@@ -302,7 +334,6 @@ export function Sidebar({
         onPickWorkspace={() => void chooseWorkspace()}
         onRemoveWorkspace={deleteWorkspace}
         onCreateThreadInWorkspace={onNewChatInWorkspace}
-        onOpenRequirementDraft={onOpenRequirementDraft}
         onSelectThread={onSelectThread}
         onRenameThread={onRenameThread}
         onPinThread={onPinThread}
@@ -312,6 +343,21 @@ export function Sidebar({
         onSearchQueryChange={onThreadSearchChange}
         t={t}
       />
+      <SidebarConversationsSection
+        threads={threads}
+        activeThreadId={activeThreadId}
+        runtimeReady={runtimeReady}
+        conversationRoot={conversationWorkspaceRoot}
+        onNewConversation={onNewConversation}
+        onSelectThread={onSelectThread}
+        onRenameThread={onRenameThread}
+        onPinThread={onPinThread}
+        onArchiveThread={onArchiveThread}
+        onDeleteThread={onDeleteThread}
+        onRestoreThread={onRestoreThread}
+        t={t}
+      />
+      </>
       )}
 
     </SidebarFrame>
@@ -358,7 +404,7 @@ function FocusModeToggle({
       aria-label={ariaLabel}
       title={`${title} · ${status}`}
       onClick={onToggle}
-      className={`group inline-flex h-8 w-[112px] shrink-0 items-center justify-between overflow-hidden rounded-[10px] border px-2.5 text-[12px] font-medium outline-none transition focus-visible:ring-2 focus-visible:ring-accent/25 ${
+      className={`ds-focus-mode-toggle group inline-flex h-8 w-[112px] shrink-0 items-center justify-between overflow-hidden rounded-[10px] border px-2.5 text-[12px] font-medium outline-none transition focus-visible:ring-2 focus-visible:ring-accent/25 ${
         enabled
           ? 'border-accent/35 bg-[var(--ds-sidebar-row-active)] text-[#1f1f1f] shadow-[0_1px_3px_rgba(20,47,95,0.07),inset_0_0_0_1px_var(--ds-sidebar-row-ring),inset_0_1px_0_rgba(255,255,255,0.72)] dark:text-white'
           : 'border-[var(--ds-sidebar-divider)] bg-[var(--ds-sidebar-field-bg)] text-[#5c6675] shadow-[inset_0_1px_0_rgba(255,255,255,0.46)] hover:bg-[var(--ds-sidebar-row-hover)] hover:text-[#1f2733] dark:text-white/62 dark:shadow-none dark:hover:text-white'
@@ -369,7 +415,7 @@ function FocusModeToggle({
         <span className="min-w-0 truncate">{label}</span>
       </span>
       <span
-        className={`relative h-4 w-7 shrink-0 rounded-full transition ${
+        className={`ds-focus-mode-toggle-track relative h-4 w-7 shrink-0 rounded-full transition ${
           enabled
             ? 'bg-accent/80 shadow-[inset_0_0_0_1px_rgba(0,0,0,0.08)]'
             : 'bg-slate-300/75 shadow-[inset_0_0_0_1px_rgba(100,116,139,0.16)] dark:bg-white/[0.14] dark:shadow-[inset_0_0_0_1px_rgba(255,255,255,0.06)]'
@@ -377,7 +423,7 @@ function FocusModeToggle({
         aria-hidden="true"
       >
         <span
-          className={`absolute left-0.5 top-0.5 h-3 w-3 rounded-full bg-white shadow-[0_1px_3px_rgba(20,47,95,0.24)] transition-transform ${
+          className={`ds-focus-mode-toggle-thumb absolute left-0.5 top-0.5 h-3 w-3 rounded-full bg-white shadow-[0_1px_3px_rgba(20,47,95,0.24)] transition-transform ${
             enabled ? 'translate-x-3' : 'translate-x-0'
           }`}
         />

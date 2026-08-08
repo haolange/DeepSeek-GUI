@@ -1,4 +1,4 @@
-import { readFile, writeFile } from 'node:fs/promises'
+import { readFile, realpath, writeFile } from 'node:fs/promises'
 import { isAbsolute, relative, resolve } from 'node:path'
 import type { ThreadStore, ThreadStoreListOptions } from '../ports/thread-store.js'
 import type { SessionStore } from '../ports/session-store.js'
@@ -12,20 +12,33 @@ import type {
   ThreadRecord,
   ThreadRelation,
   ThreadStatus,
+  ThreadUpdateStatus,
   ThreadTodoItem,
   ThreadTodoList,
   ThreadTodoSource,
   ThreadTodoStatus,
   ThreadSummary
 } from '../contracts/threads.js'
-import type { ApprovalPolicy, SandboxMode } from '../contracts/policy.js'
+import type { ExtensionThreadMetadata } from '../contracts/threads.js'
+import type {
+  ApprovalPolicy,
+  ApprovalReviewer,
+  SandboxMode
+} from '../contracts/policy.js'
 import type { Turn } from '../contracts/turns.js'
-import type { TurnItem } from '../contracts/items.js'
-import { createThreadRecord, toThreadSummary, touchThread } from '../domain/thread.js'
+import { isPublicTurnItem, type TurnItem } from '../contracts/items.js'
+import {
+  createThreadRecord,
+  resolveThreadAgentSurface,
+  toThreadSummary,
+  touchThread
+} from '../domain/thread.js'
 import type { AgentSession } from '../domain/session.js'
 import { repairModelHistoryItems } from '../domain/model-history-repair.js'
 import type { RuntimeEventRecorder } from './runtime-event-recorder.js'
+import type { ThreadLifecycleFence } from './thread-lifecycle-fence.js'
 import { withFileMutationQueue } from '../adapters/tool/file-mutation-queue.js'
+import { withThreadStoreMutation } from './thread-mutation-coordinator.js'
 import { DEFAULT_KUN_MODEL } from '../config/kun-config.js'
 import { isGuiPlanRelativePath } from '../shared/gui-plan.js'
 import {
@@ -39,10 +52,28 @@ import {
 
 export type ThreadServiceOptions = {
   threadStore: ThreadStore
+  /** Raw store used only after the lifecycle fence has been closed and drained. */
+  deleteThreadStore?: ThreadStore
   sessionStore: SessionStore
   events: RuntimeEventRecorder
   ids: IdGenerator
   nowIso: () => string
+  defaultApprovalPolicy?: ApprovalPolicy
+  defaultSandboxMode?: SandboxMode
+  defaultApprovalReviewer?: ApprovalReviewer
+  defaultModelRequestCaptureEnabled?: boolean
+  lifecycleFence?: ThreadLifecycleFence
+  /** Abort in-process work after the fence starts rejecting new writes. */
+  onDeleting?: (threadId: string) => Promise<void> | void
+  onDeleted?: (threadId: string) => Promise<void> | void
+  onStatusChanged?: (
+    threadId: string,
+    status: ThreadStatus
+  ) => Promise<void> | void
+  onForked?: (
+    sourceThreadId: string,
+    targetThreadId: string
+  ) => Promise<void> | void
 }
 
 export type ListThreadsOptions = ThreadStoreListOptions
@@ -51,12 +82,15 @@ export type ForkThreadOptions = {
   relation?: ThreadRelation
   title?: string
   turnId?: string
+  beforeTurn?: boolean
+  approvalReviewer?: ApprovalReviewer
 }
 
 export type ResumeSessionOptions = {
   workspace?: string
   model?: string
   mode?: ThreadMode
+  approvalReviewer?: ApprovalReviewer
 }
 
 export type ResumeSessionResult = {
@@ -74,17 +108,49 @@ export type SyncPlanTodosOptions = {
 
 export class ThreadService {
   private readonly threadStore: ThreadStore
+  private readonly deleteThreadStore: ThreadStore
   private readonly sessionStore: SessionStore
   private readonly events: RuntimeEventRecorder
   private readonly ids: IdGenerator
   private readonly nowIso: () => string
+  private defaultApprovalPolicy: ApprovalPolicy | undefined
+  private defaultSandboxMode: SandboxMode | undefined
+  private defaultApprovalReviewer: ApprovalReviewer | undefined
+  private defaultModelRequestCaptureEnabled: boolean
+  private readonly lifecycleFence?: ThreadLifecycleFence
+  private readonly onDeleting?: (threadId: string) => Promise<void> | void
+  private readonly onDeleted?: (threadId: string) => Promise<void> | void
+  private readonly onStatusChanged?: ThreadServiceOptions['onStatusChanged']
+  private readonly onForked?: ThreadServiceOptions['onForked']
 
   constructor(options: ThreadServiceOptions) {
     this.threadStore = options.threadStore
+    this.deleteThreadStore = options.deleteThreadStore ?? options.threadStore
     this.sessionStore = options.sessionStore
     this.events = options.events
     this.ids = options.ids
     this.nowIso = options.nowIso
+    this.defaultApprovalPolicy = options.defaultApprovalPolicy
+    this.defaultSandboxMode = options.defaultSandboxMode
+    this.defaultApprovalReviewer = options.defaultApprovalReviewer
+    this.defaultModelRequestCaptureEnabled = options.defaultModelRequestCaptureEnabled ?? false
+    this.lifecycleFence = options.lifecycleFence
+    this.onDeleting = options.onDeleting
+    this.onDeleted = options.onDeleted
+    this.onStatusChanged = options.onStatusChanged
+    this.onForked = options.onForked
+  }
+
+  updateRuntimeDefaults(input: {
+    approvalPolicy: ApprovalPolicy
+    sandboxMode: SandboxMode
+    approvalReviewer: ApprovalReviewer
+    modelRequestCaptureEnabled: boolean
+  }): void {
+    this.defaultApprovalPolicy = input.approvalPolicy
+    this.defaultSandboxMode = input.sandboxMode
+    this.defaultApprovalReviewer = input.approvalReviewer
+    this.defaultModelRequestCaptureEnabled = input.modelRequestCaptureEnabled
   }
 
   async list(options: ListThreadsOptions = {}): Promise<ThreadSummary[]> {
@@ -108,6 +174,17 @@ export class ThreadService {
     return this.threadStore.get(threadId)
   }
 
+  /**
+   * Read the thread/turn metadata without hydrating the item history when the
+   * backing store supports it. File/hybrid stores use this on detail and
+   * status routes so the session items are loaded exactly once.
+   */
+  async getMetadata(threadId: string): Promise<ThreadRecord | null> {
+    return this.threadStore.getMetadata
+      ? this.threadStore.getMetadata(threadId)
+      : this.threadStore.get(threadId)
+  }
+
   async create(
     request: CreateThreadRequest,
     options: {
@@ -118,6 +195,8 @@ export class ThreadService {
       relation?: ThreadRelation
       /** Parent thread this thread branches from (used by `side`/`fork` relations). */
       parentThreadId?: string
+      /** Broker-derived metadata. Never populated from the public thread request body. */
+      extensionMetadata?: ExtensionThreadMetadata
     } = {}
   ): Promise<ThreadRecord> {
     // Always advance the id generator so externally-supplied ids
@@ -129,23 +208,42 @@ export class ThreadService {
       title: options.title ?? (request.title?.trim() || 'New chat'),
       ...(request.titleAuto !== undefined ? { titleAuto: request.titleAuto } : {}),
       workspace: request.workspace,
+      additionalWorkspaces: request.additionalWorkspaces,
       model: request.model,
+      ...(request.agentSurface ? { agentSurface: request.agentSurface } : {}),
       ...(request.providerId?.trim() ? { providerId: request.providerId.trim() } : {}),
+      ...(request.accountId?.trim() ? { accountId: request.accountId.trim() } : {}),
+      ...(options.extensionMetadata ?? {}),
       ...(request.agentId?.trim() ? { agentId: request.agentId.trim() } : {}),
       ...(request.systemPrompt?.trim() ? { systemPrompt: request.systemPrompt.trim() } : {}),
       mode: request.mode,
-      approvalPolicy: request.approvalPolicy,
-      sandboxMode: request.sandboxMode,
+      approvalPolicy: request.approvalPolicy ?? this.defaultApprovalPolicy,
+      sandboxMode: request.sandboxMode ?? this.defaultSandboxMode,
+      approvalReviewer: request.approvalReviewer ?? this.defaultApprovalReviewer,
+      modelRequestCaptureEnabled:
+        request.modelRequestCaptureEnabled ?? this.defaultModelRequestCaptureEnabled,
       ...(request.costBudgetUsd !== undefined ? { costBudgetUsd: request.costBudgetUsd } : {}),
       ...(options.relation ? { relation: options.relation } : {}),
       ...(options.parentThreadId ? { parentThreadId: options.parentThreadId } : {}),
       status: options.status
     })
-    await this.threadStore.upsert(thread)
+    // `create` and destructive delete use the same per-thread mutation queue.
+    // Without this, a same-id create could reopen the fence just before a
+    // concurrent delete performs raw rm(), losing the new lifetime.
+    await this.withThreadMutation(thread.id, async () => {
+      // A user-visible create is the only operation allowed to reactivate an
+      // id after deletion. It deliberately starts a fresh generation so
+      // delayed writes captured by the previous lifetime remain stale.
+      this.lifecycleFence?.reopen(id)
+      await this.threadStore.upsert(thread)
+    })
     await this.events.record({
       kind: 'thread_created',
       threadId: thread.id,
-      title: thread.title
+      title: thread.title,
+      approvalPolicy: thread.approvalPolicy,
+      sandboxMode: thread.sandboxMode,
+      approvalReviewer: thread.approvalReviewer
     })
     return thread
   }
@@ -155,41 +253,79 @@ export class ThreadService {
     titleAuto?: boolean
     summary?: string
     workspace?: string
-    status?: ThreadStatus
+    additionalWorkspaces?: string[]
+    mode?: ThreadMode
+    /** Archive or unarchive only; execution and deletion states are internal. */
+    status?: ThreadUpdateStatus
     approvalPolicy?: ApprovalPolicy
     sandboxMode?: SandboxMode
+    approvalReviewer?: ApprovalReviewer
+    modelRequestCaptureEnabled?: boolean
     pinned?: boolean
     costBudgetUsd?: number | null
     costBudgetWarningSent?: boolean
     relation?: ThreadRelation
   }): Promise<ThreadRecord> {
-    const current = await this.threadStore.get(threadId)
-    if (!current) throw new Error(`thread not found: ${threadId}`)
-    const { costBudgetUsd, costBudgetWarningSent, ...standardPatch } = patch
-    const merged: ThreadRecord = { ...current, ...standardPatch }
-    if (costBudgetUsd === null) {
-      delete (merged as { costBudgetUsd?: number }).costBudgetUsd
-      delete (merged as { costBudgetWarningSent?: boolean }).costBudgetWarningSent
-    } else if (costBudgetUsd !== undefined) {
-      merged.costBudgetUsd = costBudgetUsd
-      merged.costBudgetWarningSent = false
-    } else if (costBudgetWarningSent !== undefined) {
-      merged.costBudgetWarningSent = costBudgetWarningSent
-    }
-    if (patch.relation !== undefined && patch.relation !== 'side') {
-      // Promoting a side thread clears the parent link so the thread
-      // surfaces in the default list as a standalone primary thread.
-      delete (merged as { parentThreadId?: string }).parentThreadId
-    }
-    const updated = touchThread(merged, this.nowIso())
-    await this.threadStore.upsert(updated)
+    const updated = await this.withThreadMutation(threadId, async () => {
+      const current = await this.threadStore.get(threadId)
+      if (!current) throw new Error(`thread not found: ${threadId}`)
+      // Keep this runtime check in addition to the request schema/type. The
+      // service is also used directly by internal callers, and accepting an
+      // arbitrary status here could desynchronise durable turn state from the
+      // thread's lifecycle marker.
+      if (patch.status !== undefined && patch.status !== 'idle' && patch.status !== 'archived') {
+        throw new Error(`thread status is managed by the runtime: ${patch.status}`)
+      }
+      const { costBudgetUsd, costBudgetWarningSent, status, ...standardPatch } = patch
+      if (standardPatch.additionalWorkspaces) {
+        standardPatch.additionalWorkspaces = [...new Set(
+          standardPatch.additionalWorkspaces.map((entry) => entry.trim()).filter(Boolean)
+        )].filter((entry) => entry !== (standardPatch.workspace ?? current.workspace))
+      }
+      const merged: ThreadRecord = { ...current, ...standardPatch }
+      if (status === 'archived') {
+        // Archival is a visibility overlay: an already-active turn can settle
+        // but no new turn may be admitted until the thread is restored.
+        merged.status = 'archived'
+      } else if (status === 'idle') {
+        // Restoring an archived thread must not lie about a concurrently
+        // active turn. The per-thread mutation queue serializes this with
+        // TurnService transitions, so the current turns are authoritative.
+        merged.status = threadStatusFromTurns(current.turns)
+      }
+      if (costBudgetUsd === null) {
+        delete (merged as { costBudgetUsd?: number }).costBudgetUsd
+        delete (merged as { costBudgetWarningSent?: boolean }).costBudgetWarningSent
+      } else if (costBudgetUsd !== undefined) {
+        merged.costBudgetUsd = costBudgetUsd
+        merged.costBudgetWarningSent = false
+      } else if (costBudgetWarningSent !== undefined) {
+        merged.costBudgetWarningSent = costBudgetWarningSent
+      }
+      if (patch.relation !== undefined && patch.relation !== 'side') {
+        // Promoting a side thread clears the parent link so the thread
+        // surfaces in the default list as a standalone primary thread.
+        delete (merged as { parentThreadId?: string }).parentThreadId
+      }
+      const next = touchThread(merged, this.nowIso())
+      await this.threadStore.upsert(next)
+      return next
+    })
     await this.events.record({
       kind: 'thread_updated',
       threadId,
       title: updated.title,
       ...(updated.titleAuto !== undefined ? { titleAuto: updated.titleAuto } : {}),
-      status: updated.status
+      status: updated.status,
+      mode: updated.mode,
+      workspace: updated.workspace,
+      additionalWorkspaces: updated.additionalWorkspaces,
+      approvalPolicy: updated.approvalPolicy,
+      sandboxMode: updated.sandboxMode,
+      approvalReviewer: updated.approvalReviewer,
+      modelRequestCaptureEnabled: updated.modelRequestCaptureEnabled
     })
+    await this.onStatusChanged?.(threadId, updated.status)
     return updated
   }
 
@@ -200,34 +336,36 @@ export class ThreadService {
   }
 
   async setGoal(threadId: string, request: SetThreadGoalRequest): Promise<ThreadGoal> {
-    const current = await this.threadStore.get(threadId)
-    if (!current) throw new Error(`thread not found: ${threadId}`)
-    if (!current.goal && !request.objective) {
-      throw new Error(`cannot update goal for thread ${threadId}: no goal exists`)
-    }
+    const goal = await this.withThreadMutation(threadId, async () => {
+      const current = await this.threadStore.get(threadId)
+      if (!current) throw new Error(`thread not found: ${threadId}`)
+      if (!current.goal && !request.objective) {
+        throw new Error(`cannot update goal for thread ${threadId}: no goal exists`)
+      }
 
-    const now = this.nowIso()
-    const existing = current.goal
-    const objective = request.objective?.trim()
-    const goal: ThreadGoal = {
-      threadId,
-      objective: objective ?? existing?.objective ?? '',
-      status: request.status ?? (objective ? 'active' : existing?.status ?? 'active'),
-      ...(request.tokenBudget !== undefined
-        ? request.tokenBudget === null
-          ? {}
-          : { tokenBudget: request.tokenBudget }
-        : existing?.tokenBudget !== undefined
-          ? { tokenBudget: existing.tokenBudget }
-          : {}),
-      tokensUsed: existing?.tokensUsed ?? 0,
-      timeUsedSeconds: existing?.timeUsedSeconds ?? 0,
-      createdAt: existing?.createdAt ?? now,
-      updatedAt: now
-    }
+      const now = this.nowIso()
+      const existing = current.goal
+      const objective = request.objective?.trim()
+      const next: ThreadGoal = {
+        threadId,
+        objective: objective ?? existing?.objective ?? '',
+        status: request.status ?? (objective ? 'active' : existing?.status ?? 'active'),
+        ...(request.tokenBudget !== undefined
+          ? request.tokenBudget === null
+            ? {}
+            : { tokenBudget: request.tokenBudget }
+          : existing?.tokenBudget !== undefined
+            ? { tokenBudget: existing.tokenBudget }
+            : {}),
+        tokensUsed: existing?.tokensUsed ?? 0,
+        timeUsedSeconds: existing?.timeUsedSeconds ?? 0,
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now
+      }
 
-    const updated = touchThread({ ...current, goal }, now)
-    await this.threadStore.upsert(updated)
+      await this.threadStore.upsert(touchThread({ ...current, goal: next }, now))
+      return next
+    })
     await this.events.record({
       kind: 'goal_updated',
       threadId,
@@ -236,15 +374,41 @@ export class ThreadService {
     return goal
   }
 
+  /** Add provider-reported token usage to an active goal and enforce its cap. */
+  async recordGoalUsage(threadId: string, tokenDelta: number): Promise<ThreadGoal | null> {
+    const delta = Math.max(0, Math.floor(tokenDelta))
+    if (delta === 0) return this.getGoal(threadId)
+    const goal = await this.withThreadMutation(threadId, async () => {
+      const current = await this.threadStore.get(threadId)
+      if (!current?.goal || current.goal.status !== 'active') return current?.goal ?? null
+      const nextTokens = current.goal.tokensUsed + delta
+      const next: ThreadGoal = {
+        ...current.goal,
+        tokensUsed: nextTokens,
+        status: current.goal.tokenBudget !== undefined && current.goal.tokenBudget !== null && nextTokens >= current.goal.tokenBudget
+          ? 'usageLimited'
+          : current.goal.status,
+        updatedAt: this.nowIso()
+      }
+      await this.threadStore.upsert(touchThread({ ...current, goal: next }, next.updatedAt))
+      return next
+    })
+    if (!goal) return null
+    await this.events.record({ kind: 'goal_updated', threadId, goal })
+    return goal
+  }
+
   async clearGoal(threadId: string): Promise<boolean> {
-    const current = await this.threadStore.get(threadId)
-    if (!current) throw new Error(`thread not found: ${threadId}`)
-    if (!current.goal) {
-      return false
-    }
-    const updated = touchThread({ ...current }, this.nowIso())
-    delete (updated as { goal?: ThreadGoal }).goal
-    await this.threadStore.upsert(updated)
+    const cleared = await this.withThreadMutation(threadId, async () => {
+      const current = await this.threadStore.get(threadId)
+      if (!current) throw new Error(`thread not found: ${threadId}`)
+      if (!current.goal) return false
+      const updated = touchThread({ ...current }, this.nowIso())
+      delete (updated as { goal?: ThreadGoal }).goal
+      await this.threadStore.upsert(updated)
+      return true
+    })
+    if (!cleared) return false
     await this.events.record({
       kind: 'goal_cleared',
       threadId,
@@ -260,23 +424,40 @@ export class ThreadService {
   }
 
   async setTodos(threadId: string, request: SetThreadTodosRequest): Promise<ThreadTodoList> {
-    const current = await this.threadStore.get(threadId)
-    if (!current) throw new Error(`thread not found: ${threadId}`)
-    const now = this.nowIso()
-    const items = normalizeTodoItems({
-      rawItems: request.todos,
-      existingItems: current.todos?.items ?? [],
-      now,
-      ids: this.ids
+    return this.setTodosInternal(threadId, request, false)
+  }
+
+  async setTodosFromTool(threadId: string, request: SetThreadTodosRequest): Promise<ThreadTodoList> {
+    return this.setTodosInternal(threadId, request, true)
+  }
+
+  private async setTodosInternal(
+    threadId: string,
+    request: SetThreadTodosRequest,
+    preserveExistingSources: boolean
+  ): Promise<ThreadTodoList> {
+    const todos = await this.withThreadMutation(threadId, async () => {
+      const current = await this.threadStore.get(threadId)
+      if (!current) throw new Error(`thread not found: ${threadId}`)
+      const now = this.nowIso()
+      const existingItems = current.todos?.items ?? []
+      const items = normalizeTodoItems({
+        rawItems: preserveExistingSources
+          ? preserveToolTodoSources(request.todos, existingItems)
+          : request.todos,
+        existingItems,
+        now,
+        ids: this.ids
+      })
+      await this.patchPlanMarkdownForTodoStatusChanges(current, items)
+      const next: ThreadTodoList = {
+        threadId,
+        items,
+        updatedAt: now
+      }
+      await this.threadStore.upsert(touchThread({ ...current, todos: next }, now))
+      return next
     })
-    await this.patchPlanMarkdownForTodoStatusChanges(current, items)
-    const todos: ThreadTodoList = {
-      threadId,
-      items,
-      updatedAt: now
-    }
-    const updated = touchThread({ ...current, todos }, now)
-    await this.threadStore.upsert(updated)
     await this.events.record({
       kind: 'todos_updated',
       threadId,
@@ -286,12 +467,16 @@ export class ThreadService {
   }
 
   async clearTodos(threadId: string): Promise<boolean> {
-    const current = await this.threadStore.get(threadId)
-    if (!current) throw new Error(`thread not found: ${threadId}`)
-    if (!current.todos) return false
-    const updated = touchThread({ ...current }, this.nowIso())
-    delete (updated as { todos?: ThreadTodoList }).todos
-    await this.threadStore.upsert(updated)
+    const cleared = await this.withThreadMutation(threadId, async () => {
+      const current = await this.threadStore.get(threadId)
+      if (!current) throw new Error(`thread not found: ${threadId}`)
+      if (!current.todos) return false
+      const updated = touchThread({ ...current }, this.nowIso())
+      delete (updated as { todos?: ThreadTodoList }).todos
+      await this.threadStore.upsert(updated)
+      return true
+    })
+    if (!cleared) return false
     await this.events.record({
       kind: 'todos_cleared',
       threadId,
@@ -301,35 +486,41 @@ export class ThreadService {
   }
 
   async syncTodosFromPlan(threadId: string, options: SyncPlanTodosOptions): Promise<ThreadTodoList> {
-    const current = await this.threadStore.get(threadId)
-    if (!current) throw new Error(`thread not found: ${threadId}`)
-    const relativePath = normalizePlanRelativePath(options.relativePath)
-    if (!isGuiPlanRelativePath(relativePath)) {
-      throw new Error(`invalid GUI plan relative path: ${options.relativePath}`)
-    }
-    const now = this.nowIso()
-    const planItems = extractPlanTodos({
-      markdown: options.markdown,
-      planId: options.planId,
-      relativePath,
-      threadId,
-      now
+    const todos = await this.withThreadMutation(threadId, async () => {
+      const current = await this.threadStore.get(threadId)
+      if (!current) throw new Error(`thread not found: ${threadId}`)
+      const relativePath = normalizePlanRelativePath(options.relativePath)
+      if (!isGuiPlanRelativePath(relativePath)) {
+        throw new Error(`invalid GUI plan relative path: ${options.relativePath}`)
+      }
+      const now = this.nowIso()
+      const planItems = extractPlanTodos({
+        markdown: options.markdown,
+        planId: options.planId,
+        relativePath,
+        threadId,
+        now
+      })
+      const next = mergePlanTodos({
+        threadId,
+        existing: current.todos ?? null,
+        planItems,
+        now,
+        preserveCompleted: options.preserveCompleted ?? true
+      })
+      await this.threadStore.upsert(touchThread({ ...current, todos: next }, now))
+      return next
     })
-    const todos = mergePlanTodos({
-      threadId,
-      existing: current.todos ?? null,
-      planItems,
-      now,
-      preserveCompleted: options.preserveCompleted ?? true
-    })
-    const updated = touchThread({ ...current, todos }, now)
-    await this.threadStore.upsert(updated)
     await this.events.record({
       kind: 'todos_updated',
       threadId,
       todos
     })
     return todos
+  }
+
+  private async withThreadMutation<T>(threadId: string, operation: () => Promise<T>): Promise<T> {
+    return withThreadStoreMutation(this.threadStore, threadId, operation)
   }
 
   private async patchPlanMarkdownForTodoStatusChanges(
@@ -356,7 +547,7 @@ export class ThreadService {
     }
 
     for (const [relativePath, items] of byRelativePath) {
-      const absolutePath = resolveWorkspaceRelativePath(current.workspace, relativePath)
+      const absolutePath = await resolveWorkspaceRelativePath(current.workspace, relativePath)
       await withFileMutationQueue(absolutePath, async () => {
         let markdown = await readFile(absolutePath, 'utf-8')
         let changed = false
@@ -375,14 +566,53 @@ export class ThreadService {
   }
 
   async delete(threadId: string): Promise<boolean> {
-    const ok = await this.threadStore.delete(threadId)
-    if (!ok) return false
-    return true
+    let rawDeleteCommitted = false
+    try {
+      return await this.withThreadMutation(threadId, async () => {
+        // A concurrent delete that arrives after this service already removed
+        // the thread must not reopen its fence on a raw false result.
+        if (this.lifecycleFence?.isDeleted(threadId)) return false
+
+        this.lifecycleFence?.beginClose(threadId)
+        // Stop only this thread's live work. We intentionally do not settle
+        // the turn record here: any late lifecycle writes are now fenced off
+        // and the canonical record is about to be removed.
+        await this.onDeleting?.(threadId)
+        await this.lifecycleFence?.drain(threadId)
+        // Never route deletion through the fenced facade: it is the terminal
+        // raw operation after all old-generation writes have drained.
+        const ok = await this.deleteThreadStore.delete(threadId)
+        if (!ok) {
+          // A failed/no-op deletion must not leave a still-visible thread
+          // permanently unwritable. Existing leases remain invalid because
+          // this is nevertheless a fresh generation.
+          this.lifecycleFence?.reopen(threadId)
+          return false
+        }
+        rawDeleteCommitted = true
+        this.lifecycleFence?.markDeleted(threadId)
+        this.sessionStore.clearThreadMemory(threadId)
+        await this.onDeleted?.(threadId)
+        return true
+      })
+    } catch (error) {
+      // Once raw deletion succeeds, keep the fence closed even when a
+      // best-effort cleanup callback fails; reopening here would let a later
+      // delayed write recreate the directory that was just removed.
+      if (!rawDeleteCommitted) this.lifecycleFence?.reopen(threadId)
+      throw error
+    }
   }
 
   async fork(threadId: string, options: ForkThreadOptions = {}): Promise<ThreadRecord> {
     const current = await this.threadStore.get(threadId)
     if (!current) throw new Error(`thread not found: ${threadId}`)
+    if (
+      options.approvalReviewer !== undefined &&
+      options.approvalReviewer !== current.approvalReviewer
+    ) {
+      throw new Error('fork approval reviewer must inherit the source thread')
+    }
     const now = this.nowIso()
     const forkId = this.ids.next('thr')
     const relation: ThreadRelation = options.relation ?? 'fork'
@@ -394,21 +624,40 @@ export class ThreadService {
       throw new Error(`turn not found: ${targetTurnId}`)
     }
     const sourceTurns = targetTurnId
-      ? current.turns.slice(0, targetTurnIndex + 1)
+      ? current.turns.slice(0, targetTurnIndex + (options.beforeTurn ? 0 : 1))
       : current.turns
     // Snapshot semantics: clone each turn as it stands now. The parent
     // loop keeps mutating its own record; we copy, never borrow.
     const clonedTurns = sourceTurns.map((turn) =>
       cloneTurnForFork(turn, forkId, now, { relation })
     )
-    const clonedItems = clonedTurns.flatMap((turn) => turn.items)
+    const clonedPublicItems = clonedTurns.flatMap((turn) => turn.items)
+    const persistedItems = await this.sessionStore.loadItems(threadId)
+    const clonedSessionItems = cloneSessionItemsForThread({
+      // A pre-boundary FileThreadStore can contain a complete legacy mirror
+      // while its canonical stream is absent. Preserve the internal item in
+      // that recovery path too; cloneTurnForThread above still strips it from
+      // the new ThreadRecord mirror.
+      sourceItems: persistedItems.length > 0
+        ? persistedItems
+        : sourceTurns.flatMap((turn) => turn.items),
+      clonedTurns,
+      threadId: forkId,
+      now
+    })
     const defaultTitle = relation === 'side' ? `${current.title} · side` : `${current.title} fork`
     const forkIncludesLatestTurn = !targetTurnId || clonedTurns.length === current.turns.length
     const fork = createThreadRecord({
       id: forkId,
       title: options.title?.trim() || defaultTitle,
       workspace: current.workspace,
+      additionalWorkspaces: current.additionalWorkspaces,
       model: current.model,
+      agentSurface: resolveThreadAgentSurface(current),
+      ...(current.providerId ? { providerId: current.providerId } : {}),
+      ...(current.accountId ? { accountId: current.accountId } : {}),
+      ...(current.agentId ? { agentId: current.agentId } : {}),
+      ...(current.systemPrompt ? { systemPrompt: current.systemPrompt } : {}),
       // A fork is a fresh conversation branch, not a continuation of the
       // parent's plan workflow — the plan artifact and its workspace belong to
       // the source thread. Inheriting `mode: 'plan'` made a forked "new
@@ -420,12 +669,14 @@ export class ThreadService {
       status: 'idle',
       approvalPolicy: current.approvalPolicy,
       sandboxMode: current.sandboxMode,
+      approvalReviewer: current.approvalReviewer,
+      modelRequestCaptureEnabled: this.defaultModelRequestCaptureEnabled,
       relation,
       parentThreadId: current.id,
       forkedFromThreadId: current.id,
       forkedFromTitle: current.title,
       forkedAt: now,
-      forkedFromMessageCount: clonedItems.filter((item) => item.kind === 'user_message').length,
+      forkedFromMessageCount: clonedPublicItems.filter((item) => item.kind === 'user_message').length,
       forkedFromTurnCount: clonedTurns.length,
       ...(forkIncludesLatestTurn && current.todos ? { todos: cloneTodoListForThread(current.todos, forkId, now) } : {}),
       createdAt: now
@@ -435,15 +686,19 @@ export class ThreadService {
       updatedAt: now,
       turns: clonedTurns
     }
-    for (const item of clonedItems) {
+    for (const item of clonedSessionItems) {
       await this.sessionStore.appendItem(record.id, item)
     }
     await this.threadStore.upsert(record)
     await this.events.record({
       kind: 'thread_created',
       threadId: record.id,
-      title: record.title
+      title: record.title,
+      approvalPolicy: record.approvalPolicy,
+      sandboxMode: record.sandboxMode,
+      approvalReviewer: record.approvalReviewer
     })
+    await this.onForked?.(threadId, record.id)
     return record
   }
 
@@ -453,13 +708,21 @@ export class ThreadService {
   ): Promise<ResumeSessionResult> {
     const sourceThread = await this.threadStore.get(sessionId)
     const sourceSession = await this.sessionStore.loadSession(sessionId)
-    const sourceItems = sourceThread
-      ? sourceThread.turns.flatMap((turn) => turn.items)
+    const persistedItems = await this.sessionStore.loadItems(sessionId)
+    const sourceSessionItems = persistedItems.length > 0
+      ? persistedItems
       : sourceSession?.items.length
         ? sourceSession.items
-        : await this.sessionStore.loadItems(sessionId)
-    if (!sourceThread && !sourceSession && sourceItems.length === 0) {
+        : sourceThread?.turns.flatMap((turn) => turn.items) ?? []
+    if (!sourceThread && !sourceSession && sourceSessionItems.length === 0) {
       throw new Error(`session not found: ${sessionId}`)
+    }
+    if (
+      sourceThread &&
+      options.approvalReviewer !== undefined &&
+      options.approvalReviewer !== sourceThread.approvalReviewer
+    ) {
+      throw new Error('resumed approval reviewer must inherit the source thread')
     }
 
     const now = this.nowIso()
@@ -467,28 +730,41 @@ export class ThreadService {
     const sourceTurns = sourceThread
       ? sourceThread.turns
       : rebuildTurnsFromItems({
-          items: sourceItems,
+          // Reconstructed public turns intentionally exclude internal model
+          // context; the full ordered stream is cloned separately below.
+          items: sourceSessionItems.filter(isPublicTurnItem),
           threadId,
-          fallbackTurnId: sourceSession?.turnId ?? this.ids.next('turn'),
+          fallbackTurnId: sourceSession?.turnId || sourceSessionItems[0]?.turnId || this.ids.next('turn'),
           fallbackPrompt: `Resumed session ${sessionId.slice(0, 8)}`,
           now
         })
     const clonedTurns = sourceTurns.map((turn) => cloneTurnForThread(turn, threadId, now))
-    const clonedItems = clonedTurns.flatMap((turn) => turn.items)
+    const clonedPublicItems = clonedTurns.flatMap((turn) => turn.items)
+    const clonedSessionItems = cloneSessionItemsForThread({
+      sourceItems: sourceSessionItems,
+      clonedTurns,
+      threadId,
+      now
+    })
     const sourceTitle = sourceThread?.title ?? `Session ${sessionId.slice(0, 8)}`
     const record = createThreadRecord({
       id: threadId,
       title: `${sourceTitle} resumed`,
       workspace: options.workspace ?? sourceThread?.workspace ?? '~',
       model: options.model ?? sourceThread?.model ?? DEFAULT_KUN_MODEL,
+      agentSurface: sourceThread
+        ? resolveThreadAgentSurface(sourceThread)
+        : resolveThreadAgentSurface({ turns: sourceTurns }),
       mode: options.mode ?? sourceThread?.mode ?? 'agent',
       status: 'idle',
       approvalPolicy: sourceThread?.approvalPolicy,
       sandboxMode: sourceThread?.sandboxMode,
+      approvalReviewer: sourceThread?.approvalReviewer ?? options.approvalReviewer,
+      modelRequestCaptureEnabled: this.defaultModelRequestCaptureEnabled,
       forkedFromThreadId: sourceThread?.id,
       forkedFromTitle: sourceThread?.title,
       forkedAt: now,
-      forkedFromMessageCount: clonedItems.filter((item) => item.kind === 'user_message').length,
+      forkedFromMessageCount: clonedPublicItems.filter((item) => item.kind === 'user_message').length,
       forkedFromTurnCount: clonedTurns.length,
       ...(sourceThread?.todos ? { todos: cloneTodoListForThread(sourceThread.todos, threadId, now) } : {}),
       createdAt: now
@@ -498,17 +774,20 @@ export class ThreadService {
       updatedAt: now,
       turns: clonedTurns
     }
-    for (const item of clonedItems) {
+    for (const item of clonedSessionItems) {
       await this.sessionStore.appendItem(resumed.id, item)
     }
     await this.threadStore.upsert(resumed)
-    await this.sessionStore.upsertSession(toSessionSnapshot(resumed, now))
+    await this.sessionStore.upsertSession(toSessionSnapshot(resumed, now, clonedSessionItems))
     await this.events.record({
       kind: 'thread_created',
       threadId: resumed.id,
-      title: resumed.title
+      title: resumed.title,
+      approvalPolicy: resumed.approvalPolicy,
+      sandboxMode: resumed.sandboxMode,
+      approvalReviewer: resumed.approvalReviewer
     })
-    return { thread: resumed, sessionId, messageCount: clonedItems.length }
+    return { thread: resumed, sessionId, messageCount: clonedPublicItems.length }
   }
 
   toSummary(thread: ThreadRecord): ThreadSummary {
@@ -517,7 +796,15 @@ export class ThreadService {
 }
 
 function cloneTurnForThread(turn: Turn, threadId: string, now: string): Turn {
-  const items = repairModelHistoryItems(turn.items.map((item) => cloneItemForThread(item, threadId, now)))
+  // ThreadRecord is a renderer-facing mirror. Older on-disk records can
+  // predate the session-only goal-context boundary, so never carry an
+  // internal item into the cloned mirror. `cloneSessionItemsForThread` below
+  // separately retains those records in canonical model history.
+  const items = repairModelHistoryItems(
+    turn.items
+      .filter(isPublicTurnItem)
+      .map((item) => cloneItemForThread(item, threadId, now))
+  )
   const attachmentIds = turn.attachmentIds.length > 0
     ? turn.attachmentIds
     : attachmentIdsFromItems(items)
@@ -567,6 +854,37 @@ function normalizeTodoItems(input: {
       ...(source ? { source } : {}),
       createdAt: existing?.createdAt ?? input.now,
       updatedAt: changed ? input.now : existing.updatedAt
+    }
+  })
+}
+
+function preserveToolTodoSources(
+  rawItems: SetThreadTodosRequest['todos'],
+  existingItems: readonly ThreadTodoItem[]
+): SetThreadTodosRequest['todos'] {
+  const existingById = new Map(existingItems.map((item) => [item.id, item]))
+  const usedIds = new Set<string>()
+  return rawItems.map((raw) => {
+    const content = normalizeTodoContent(raw.content)
+    const requestedId = raw.id?.trim()
+    let existing = requestedId ? existingById.get(requestedId) : undefined
+    if (!existing && !requestedId) {
+      const matches = existingItems.filter((item) =>
+        !usedIds.has(item.id) && normalizeTodoContent(item.content) === content
+      )
+      if (matches.length === 1) existing = matches[0]
+    }
+    if (existing) usedIds.add(existing.id)
+    if (
+      !existing?.source ||
+      normalizeTodoContent(existing.content) !== content
+    ) {
+      return raw
+    }
+    return {
+      ...raw,
+      id: requestedId || existing.id,
+      source: existing.source
     }
   })
 }
@@ -648,9 +966,18 @@ function cloneTodoListForThread(todos: ThreadTodoList, threadId: string, now: st
   }
 }
 
-function resolveWorkspaceRelativePath(workspace: string, relativePath: string): string {
-  const root = resolve(workspace)
-  const target = resolve(root, relativePath)
+async function resolveWorkspaceRelativePath(workspace: string, relativePath: string): Promise<string> {
+  const lexicalRoot = resolve(workspace)
+  const lexicalTarget = resolve(lexicalRoot, relativePath)
+  const lexicalRelative = relative(lexicalRoot, lexicalTarget)
+  if (!lexicalRelative || lexicalRelative.startsWith('..') || isAbsolute(lexicalRelative)) {
+    throw new Error(`plan path escapes workspace: ${relativePath}`)
+  }
+
+  // The plan path is always an existing Markdown file by the time TODO state
+  // is written back. Resolve both ends before opening it so a symlinked
+  // `.kunsdd/plan` cannot redirect a status update outside the workspace.
+  const [root, target] = await Promise.all([realpath(lexicalRoot), realpath(lexicalTarget)])
   const fromRoot = relative(root, target)
   if (!fromRoot || fromRoot.startsWith('..') || isAbsolute(fromRoot)) {
     throw new Error(`plan path escapes workspace: ${relativePath}`)
@@ -715,6 +1042,52 @@ function cloneItemForThread(item: TurnItem, threadId: string, now: string): Turn
   return cloned
 }
 
+/**
+ * Clone the durable session stream while keeping the ThreadRecord's turn
+ * mirror public-only. Public item clones come from `clonedTurns` so side
+ * forks retain their existing in-flight cleanup semantics. Session-only
+ * records, including goal context, retain their position in canonical history.
+ */
+function cloneSessionItemsForThread(input: {
+  sourceItems: readonly TurnItem[]
+  clonedTurns: readonly Turn[]
+  threadId: string
+  now: string
+}): TurnItem[] {
+  const allowedTurnIds = new Set(input.clonedTurns.map((turn) => turn.id))
+  const clonedPublicItems = input.clonedTurns.flatMap((turn) => turn.items)
+  const clonedPublicById = new Map(clonedPublicItems.map((item) => [item.id, item]))
+  const includedIds = new Set<string>()
+  const result: TurnItem[] = []
+
+  for (const sourceItem of input.sourceItems) {
+    if (!allowedTurnIds.has(sourceItem.turnId)) continue
+    if (isPublicTurnItem(sourceItem)) {
+      const cloned = clonedPublicById.get(sourceItem.id)
+      if (!cloned || includedIds.has(cloned.id)) continue
+      result.push(cloned)
+      includedIds.add(cloned.id)
+      continue
+    }
+
+    const cloned = cloneItemForThread(sourceItem, input.threadId, input.now)
+    if (includedIds.has(cloned.id)) continue
+    result.push(cloned)
+    includedIds.add(cloned.id)
+  }
+
+  // Older snapshots can have public turn items without a corresponding
+  // canonical session entry. Retain those at the tail rather than dropping
+  // visible history during fork/resume; new GoalContext records never take
+  // this fallback path because they are session-only by construction.
+  for (const item of clonedPublicItems) {
+    if (includedIds.has(item.id)) continue
+    result.push(item)
+    includedIds.add(item.id)
+  }
+  return result
+}
+
 function matchesThreadSearch(thread: ThreadSummary, query: string): boolean {
   return [
     thread.id,
@@ -725,6 +1098,12 @@ function matchesThreadSearch(thread: ThreadSummary, query: string): boolean {
     thread.forkedFromTitle,
     thread.forkedFromThreadId
   ].some((value) => value?.toLowerCase().includes(query))
+}
+
+function threadStatusFromTurns(turns: Turn[]): 'idle' | 'running' {
+  return turns.some((turn) => turn.status === 'queued' || turn.status === 'running')
+    ? 'running'
+    : 'idle'
 }
 
 function rebuildTurnsFromItems(input: {
@@ -745,10 +1124,13 @@ function rebuildTurnsFromItems(input: {
       threadId: input.threadId,
       status: 'completed',
       prompt: input.fallbackPrompt,
+      orchestration: 'direct',
       steering: [],
       attachmentIds: [],
       activeSkillIds: [],
       injectedMemoryIds: [],
+      injectedMemorySummaries: [],
+      injectedInstructionSources: [],
       createdAt: input.now,
       finishedAt: input.now,
       items: []
@@ -763,10 +1145,13 @@ function rebuildTurnsFromItems(input: {
       threadId: input.threadId,
       status: 'completed',
       prompt,
+      orchestration: 'direct',
       steering: [],
       attachmentIds: attachmentIdsFromItems(items),
       activeSkillIds: [],
       injectedMemoryIds: [],
+      injectedMemorySummaries: [],
+      injectedInstructionSources: [],
       createdAt: items[0]?.createdAt ?? input.now,
       finishedAt: input.now,
       items
@@ -786,14 +1171,18 @@ function attachmentIdsFromItems(items: TurnItem[]): string[] {
   return [...ids]
 }
 
-function toSessionSnapshot(thread: ThreadRecord, now: string): AgentSession {
+function toSessionSnapshot(
+  thread: ThreadRecord,
+  now: string,
+  items: readonly TurnItem[] = thread.turns.flatMap((turn) => turn.items)
+): AgentSession {
   const firstTurn = thread.turns[0]
   return {
     threadId: thread.id,
     turnId: firstTurn?.id ?? '',
     startedAt: firstTurn?.createdAt ?? thread.createdAt,
     updatedAt: now,
-    items: thread.turns.flatMap((turn) => turn.items),
+    items: [...items],
     events: [],
     closed: true
   }

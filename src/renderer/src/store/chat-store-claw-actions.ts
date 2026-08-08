@@ -12,6 +12,7 @@ import type { ChatState, ChatStoreGet, ChatStoreSet } from './chat-store-types'
 import type { ChatBlock, NormalizedThread } from '../agent/types'
 import { clawThreadTitleLooksManaged, clawThreadIdsFromChannels } from './chat-store-helpers'
 import { emitRendererSettingsChanged } from '../lib/keyboard-shortcut-settings'
+import { invalidateThreadSnapshot } from './thread-snapshot-cache'
 
 type ClawAgentProviderLike = {
   createThread: (input: { workspace: string; title: string; mode: 'agent' | 'plan' }) => Promise<NormalizedThread>
@@ -531,7 +532,9 @@ export function createClawActions(options: CreateClawActionsOptions): Pick<
         const threadId = clawThreadIdForProvider(channel)
         if (threadId) {
           const provider = getProvider()
-          await provider.deleteThread(threadId).catch(() => undefined)
+          await provider.deleteThread(threadId)
+            .then(() => invalidateThreadSnapshot(threadId))
+            .catch(() => undefined)
         }
       }
       if (nextChannel) {
@@ -590,7 +593,9 @@ export function createClawActions(options: CreateClawActionsOptions): Pick<
         }))
         await get().selectThread(thread.id)
         if (oldThreadId && oldThreadId !== thread.id) {
-          await provider.deleteThread(oldThreadId).catch(() => undefined)
+          await provider.deleteThread(oldThreadId)
+            .then(() => invalidateThreadSnapshot(oldThreadId))
+            .catch(() => undefined)
           await get().refreshThreads()
         }
         set({ error: i18n.t('common:clawSessionCleared') })
@@ -604,13 +609,21 @@ export function createClawActions(options: CreateClawActionsOptions): Pick<
       }
     },
 
-    setClawChannelModel: async (channelId, model) => {
+    setClawChannelModel: async (channelId, model, providerId) => {
       if (typeof window.kunGui === 'undefined') return
       const normalized = normalizeClawComposerModel(model)
+      const normalizedProviderId = providerId?.trim() ?? ''
       const settings = await rendererRuntimeClient.getSettings()
       const now = new Date().toISOString()
       const channels = settings.claw.channels.map((channel) =>
-        channel.id === channelId ? { ...channel, model: normalized, updatedAt: now } : channel
+        channel.id === channelId
+          ? {
+              ...channel,
+              model: normalized,
+              ...(normalizedProviderId ? { providerId: normalizedProviderId } : {}),
+              updatedAt: now
+            }
+          : channel
       )
       const saved = await rendererRuntimeClient.setSettings({ claw: { channels } })
       emitRendererSettingsChanged(saved)

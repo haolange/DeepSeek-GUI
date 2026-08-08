@@ -1,7 +1,7 @@
 import { type Dirent } from 'node:fs'
 import { access, readdir, realpath, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { basename, isAbsolute, join, relative, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import type { WorkspaceDirectoryTarget } from '../../shared/workspace-file'
 
 export type ResolveTargetOptions = {
@@ -139,6 +139,30 @@ function isWithinWorkspace(workspaceRoot: string, targetPath: string): boolean {
   return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))
 }
 
+async function canonicalPathThroughExistingParent(targetPath: string): Promise<string> {
+  const missingSegments: string[] = []
+  let existing = resolve(targetPath)
+  while (!(await pathExists(existing))) {
+    const parent = dirname(existing)
+    if (parent === existing) break
+    missingSegments.unshift(basename(existing))
+    existing = parent
+  }
+  const canonicalParent = await canonicalPath(existing)
+  return resolve(canonicalParent, ...missingSegments)
+}
+
+async function enforceProspectiveWorkspaceBoundary(
+  workspacePath: string,
+  targetPath: string
+): Promise<string> {
+  const canonicalTarget = await canonicalPathThroughExistingParent(targetPath)
+  if (!isWithinWorkspace(workspacePath, canonicalTarget)) {
+    throw new Error('Path must stay within the selected workspace.')
+  }
+  return canonicalTarget
+}
+
 async function enforceWorkspaceBoundary(targetPath: string, workspaceRoot?: string): Promise<string> {
   const rawWorkspace = workspaceRoot?.trim()
   if (!rawWorkspace) return targetPath
@@ -167,18 +191,13 @@ export async function resolveTargetPathWithinWorkspace(rawPath: string, workspac
     if (!isWithinWorkspace(workspacePath, direct)) {
       throw new Error('Path must stay within the selected workspace.')
     }
-    return direct
+    return enforceProspectiveWorkspaceBoundary(workspacePath, direct)
   }
 
   const direct = resolve(expanded)
-  if (isWithinWorkspace(workspacePath, direct)) {
-    return direct
-  }
-  if (await pathExists(direct)) {
-    const canonicalTarget = await canonicalPath(direct)
-    if (isWithinWorkspace(workspacePath, canonicalTarget)) {
-      return canonicalTarget
-    }
+  const canonicalTarget = await canonicalPathThroughExistingParent(direct)
+  if (isWithinWorkspace(workspacePath, canonicalTarget)) {
+    return canonicalTarget
   }
   throw new Error('Path must stay within the selected workspace.')
 }

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type RefObject } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type RefObject } from 'react'
 
 /** Threshold (px) from the top of the scroll container that triggers
  * auto-loading earlier turns. */
@@ -12,7 +12,6 @@ type UseTimelineScrollOptions = {
   endRef: RefObject<HTMLDivElement | null>
   activeThreadId: string | null
   pageSize: number
-  autoCollapseThreshold: number
   totalTurns: number
   busy: boolean
   /** Triggers stick-to-bottom snap scroll. */
@@ -24,6 +23,39 @@ export type UseTimelineScrollResult = {
   hiddenTurnCount: number
   loadEarlierTurns: (options?: { userInitiated?: boolean }) => void
   collapseEarlierTurns: () => void
+}
+
+export function shouldCollapseTimelineHistory(totalTurns: number, pageSize: number): boolean {
+  return totalTurns > pageSize
+}
+
+export function isTimelineNearBottom({
+  scrollHeight,
+  scrollTop,
+  clientHeight
+}: {
+  scrollHeight: number
+  scrollTop: number
+  clientHeight: number
+}): boolean {
+  return scrollHeight - scrollTop - clientHeight < STICK_TO_BOTTOM_PX
+}
+
+export function deriveTimelineRenderedTurnCount({
+  visibleTurnCount,
+  totalTurns,
+  pageSize,
+  busy
+}: {
+  visibleTurnCount: number
+  totalTurns: number
+  pageSize: number
+  busy: boolean
+}): number {
+  if (busy && shouldCollapseTimelineHistory(totalTurns, pageSize)) {
+    return Math.min(pageSize, totalTurns)
+  }
+  return Math.min(visibleTurnCount, totalTurns)
 }
 
 export function deriveTimelineVisibleTurnCount({
@@ -58,13 +90,12 @@ export function useTimelineScroll({
   endRef,
   activeThreadId,
   pageSize,
-  autoCollapseThreshold,
   totalTurns,
   busy,
   scrollDeps
 }: UseTimelineScrollOptions): UseTimelineScrollResult {
   const { contentKey, streaming, userTurnKey } = scrollDeps
-  const shouldCollapseHistory = totalTurns > autoCollapseThreshold
+  const shouldCollapseHistory = shouldCollapseTimelineHistory(totalTurns, pageSize)
   const [visibleTurnCount, setVisibleTurnCount] = useState(() =>
     deriveTimelineVisibleTurnCount({
       currentVisibleTurnCount: 0,
@@ -74,7 +105,16 @@ export function useTimelineScroll({
       historyExpansionRequested: false
     })
   )
-  const hiddenTurnCount = Math.max(0, totalTurns - visibleTurnCount)
+  // Sending from an expanded long thread used to render the whole history for
+  // one frame before the effect below collapsed it. That transient Markdown
+  // mount can be enough to exhaust Chromium's renderer on very large threads.
+  const renderedVisibleTurnCount = deriveTimelineRenderedTurnCount({
+    visibleTurnCount,
+    totalTurns,
+    pageSize,
+    busy
+  })
+  const hiddenTurnCount = Math.max(0, totalTurns - renderedVisibleTurnCount)
 
   const stickToBottomRef = useRef(true)
   const lastUserTurnKeyRef = useRef(userTurnKey)
@@ -85,7 +125,7 @@ export function useTimelineScroll({
 
   const loadEarlierTurns = useCallback(
     (options?: { userInitiated?: boolean }): void => {
-      if (hiddenTurnCount === 0 || prependInFlightRef.current) return
+      if (busy || hiddenTurnCount === 0 || prependInFlightRef.current) return
       if (options?.userInitiated) {
         historyExpansionRequestedRef.current = true
       }
@@ -99,7 +139,7 @@ export function useTimelineScroll({
       prependInFlightRef.current = true
       setVisibleTurnCount((count) => Math.min(totalTurns, count + pageSize))
     },
-    [containerRef, hiddenTurnCount, pageSize, totalTurns]
+    [busy, containerRef, hiddenTurnCount, pageSize, totalTurns]
   )
 
   const collapseEarlierTurns = useCallback((): void => {
@@ -108,8 +148,9 @@ export function useTimelineScroll({
   }, [pageSize])
 
   // A freshly submitted user turn should become visible even if the user was
-  // reading older history before pressing Enter.
-  useEffect(() => {
+  // reading older history before pressing Enter. Runs as a layout effect so the
+  // stick-to-bottom intent is set before the snap effect below pins (issue #603).
+  useLayoutEffect(() => {
     if (!userTurnKey || lastUserTurnKeyRef.current === userTurnKey) return
     lastUserTurnKeyRef.current = userTurnKey
     stickToBottomRef.current = true
@@ -120,8 +161,7 @@ export function useTimelineScroll({
     const el = containerRef.current
     if (!el) return
     const onScroll = (): void => {
-      const distanceToBottom = el.scrollHeight - el.scrollTop - el.clientHeight
-      stickToBottomRef.current = distanceToBottom < STICK_TO_BOTTOM_PX
+      stickToBottomRef.current = isTimelineNearBottom(el)
       if (hiddenTurnCount > 0 && el.scrollTop <= TOP_LOAD_TRIGGER_PX) {
         loadEarlierTurns({ userInitiated: true })
       }
@@ -130,21 +170,28 @@ export function useTimelineScroll({
     return () => el.removeEventListener('scroll', onScroll)
   }, [containerRef, hiddenTurnCount, loadEarlierTurns])
 
-  // Snap to bottom when content changes, but only if the user was
-  // already at the bottom.
-  useEffect(() => {
+  // Snap to bottom when the content or the visible window changes, but only if
+  // the user was already at the bottom. Runs as a layout effect so a discrete
+  // change (e.g. sending a message, which slides the collapsed turn window and
+  // drops the oldest visible turn) pins *before* paint instead of flashing the
+  // viewport upward and then jumping back once the model streams (issue #603).
+  // Streaming deltas stay rAF-throttled to avoid a forced reflow per delta.
+  useLayoutEffect(() => {
     if (!stickToBottomRef.current) return
+    // A visibleTurnCount bump from loading earlier turns must not pull the
+    // viewport to the bottom — the prepend effect owns scroll position there.
+    if (prependInFlightRef.current) return
+    if (!streaming) {
+      endRef.current?.scrollIntoView({ behavior: 'auto', block: 'end' })
+    }
     if (scrollFrameRef.current !== null) {
       window.cancelAnimationFrame(scrollFrameRef.current)
     }
     scrollFrameRef.current = window.requestAnimationFrame(() => {
       scrollFrameRef.current = null
-      endRef.current?.scrollIntoView({
-        behavior: streaming ? 'auto' : 'smooth',
-        block: 'end'
-      })
+      endRef.current?.scrollIntoView({ behavior: 'auto', block: 'end' })
     })
-  }, [contentKey, endRef, streaming])
+  }, [contentKey, visibleTurnCount, streaming, endRef])
 
   // Hard reset on thread switch.
   useEffect(() => {
@@ -189,16 +236,9 @@ export function useTimelineScroll({
   // like it scrolled through the whole thread.
   useEffect(() => {
     if (!busy) return
-    setVisibleTurnCount((count) =>
-      deriveTimelineVisibleTurnCount({
-        currentVisibleTurnCount: count,
-        totalTurns,
-        pageSize,
-        shouldCollapseHistory,
-        historyExpansionRequested: historyExpansionRequestedRef.current
-      })
-    )
-  }, [busy, pageSize, shouldCollapseHistory, totalTurns])
+    historyExpansionRequestedRef.current = false
+    setVisibleTurnCount(Math.min(pageSize, totalTurns))
+  }, [busy, pageSize, totalTurns])
 
   // After a prepend, restore scroll position so the user's viewport
   // doesn't jump.
@@ -228,7 +268,7 @@ export function useTimelineScroll({
   }, [containerRef, hiddenTurnCount, loadEarlierTurns, visibleTurnCount])
 
   return {
-    visibleTurnCount,
+    visibleTurnCount: renderedVisibleTurnCount,
     hiddenTurnCount,
     loadEarlierTurns,
     collapseEarlierTurns

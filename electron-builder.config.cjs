@@ -1,5 +1,8 @@
 const { existsSync, readFileSync } = require('node:fs')
 const { join } = require('node:path')
+const {
+  configureElectronNativeBuildEnvironment
+} = require('./scripts/electron-native-build-env.cjs')
 
 // 品牌升级后构建环境变量改用 KUN_* 前缀;旧的 DEEPSEEK_GUI_* 仍然
 // 兼容读取,避免 CI / 本地发布脚本一刀切失效。
@@ -37,6 +40,7 @@ function loadLocalReleaseEnv() {
 }
 
 loadLocalReleaseEnv()
+configureElectronNativeBuildEnvironment(process.platform, process.env)
 
 const hasExplicitMacSigningIdentity = Boolean(
   process.env.CSC_LINK ||
@@ -73,11 +77,25 @@ const releaseArtifactVersion = (
 const artifactVersion = releaseArtifactVersion || releaseAppVersion || '${version}'
 const semverVersionPattern = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/
 const artifactVersionPattern = /^[0-9A-Za-z][0-9A-Za-z._-]*$/
+const chromiumPakLanguages = ['en-US', 'en-GB', 'zh-CN', 'zh-TW', 'ru', 'hi', 'th', 'ja', 'ko']
+const chromiumMacLanguages = ['en', 'en_GB', 'zh_CN', 'zh_TW', 'ru', 'hi', 'th', 'ja', 'ko']
+const appFlavor = normalizeAppFlavor(process.env.KUN_APP_FLAVOR || 'production')
+const developmentFlavor = appFlavor === 'development'
+const appId = developmentFlavor
+  ? 'com.xingyuzhong.deepseekgui.dv'
+  : 'com.xingyuzhong.deepseekgui'
+const productName = developmentFlavor ? 'kun-dv' : 'Kun'
 
 function normalizeUpdateChannel(raw) {
   const value = String(raw || '').trim()
   if (value === 'stable' || value === 'frontier') return value
   throw new Error(`KUN_UPDATE_CHANNEL (or legacy DEEPSEEK_GUI_UPDATE_CHANNEL) must be "stable" or "frontier", got: ${raw}`)
+}
+
+function normalizeAppFlavor(raw) {
+  const value = String(raw || '').trim()
+  if (value === 'production' || value === 'development') return value
+  throw new Error(`KUN_APP_FLAVOR must be "production" or "development", got: ${raw}`)
 }
 
 if (releaseAppVersion && !semverVersionPattern.test(releaseAppVersion)) {
@@ -93,19 +111,22 @@ if (releaseArtifactVersion && !artifactVersionPattern.test(releaseArtifactVersio
 }
 
 module.exports = {
-  // appId 永远保持旧值,即使品牌已改名 Kun:
+  // 正式版 appId 永远保持旧值；DV 使用独立 appId，绝不进入正式更新链路：
   //  - macOS 端 Squirrel.Mac 校验更新包签名时锚定 bundle identifier,
   //    换了 id 老版本会拒绝安装新版本;
   //  - Windows 端 NSIS 以 appId 派生卸载 GUID,换了 id 升级安装不会
   //    卸载旧版本,用户会装出两份应用;
   //  - macOS TCC 权限、通知授权也都挂在这个 id 上。
-  appId: 'com.xingyuzhong.deepseekgui',
-  productName: 'Kun',
+  appId,
+  productName,
   asar: true,
   asarUnpack: [
     '**/kun/dist/**/*',
     '**/kun/package*.json',
     '**/kun/node_modules/**/*',
+    '**/packages/extension-api/**/*',
+    '**/packages/provider-catalog/**/*',
+    '**/packages/create-kun-extension/**/*',
     '**/node_modules/better-sqlite3/**/*',
     '**/node_modules/node-pty/**/*',
     '**/node_modules/bindings/**/*',
@@ -113,7 +134,27 @@ module.exports = {
     // Computer-use native automation (@computer-use/nut-js + its libnut
     // binding + node-mac-permissions) ships prebuilt .node files that must
     // live outside the asar archive to load.
-    '**/node_modules/@computer-use/**/*'
+    '**/node_modules/@computer-use/**/*',
+    // OCR fallback loads native canvas bindings plus Tesseract worker/core
+    // wasm and language data by filesystem path at runtime.
+    '**/node_modules/@napi-rs/canvas*/**/*',
+    // UI Plugin image validation uses Sharp's native binding and its separately
+    // packaged libvips runtime; both must remain outside app.asar.
+    '**/node_modules/sharp/**/*',
+    '**/node_modules/@img/**/*',
+    '**/node_modules/tesseract.js/**/*',
+    '**/node_modules/tesseract.js-core/**/*',
+    '**/node_modules/@tesseract.js-data/**/*',
+    '**/node_modules/bmp-js/**/*',
+    '**/node_modules/idb-keyval/**/*',
+    '**/node_modules/is-url/**/*',
+    '**/node_modules/node-fetch/**/*',
+    '**/node_modules/whatwg-url/**/*',
+    '**/node_modules/tr46/**/*',
+    '**/node_modules/webidl-conversions/**/*',
+    '**/node_modules/regenerator-runtime/**/*',
+    '**/node_modules/wasm-feature-detect/**/*',
+    '**/node_modules/zlibjs/**/*'
   ],
   npmRebuild: true,
   directories: {
@@ -126,34 +167,78 @@ module.exports = {
     'kun/package.json',
     'kun/package-lock.json',
     'kun/node_modules/**/*',
+    'packages/extension-api/package.json',
+    'packages/extension-api/dist/**/*',
+    'packages/extension-api/schema/**/*',
+    'packages/extension-api/fixtures/**/*',
+    'packages/provider-catalog/package.json',
+    'packages/provider-catalog/dist/**/*',
+    'packages/create-kun-extension/package.json',
+    'packages/create-kun-extension/src/**/*',
+    // The Agent SDK ships a ~222MB per-platform Claude Code binary as an optional
+    // dep; do NOT bundle it into the installer. It's downloaded on demand into the
+    // user-data dir (see src/main/agent-sdk-installer.ts). The small SDK JS stays.
+    '!kun/node_modules/@anthropic-ai/claude-agent-sdk-*/**',
     '!**/*.map',
     '!**/*.d.ts',
     '!**/*.ts',
     '!**/tsconfig*.json',
     '!**/README*',
-    '!**/CHANGELOG*'
+    '!**/CHANGELOG*',
+    'packages/create-kun-extension/templates/**/*'
     // node_modules/openclaw (the vendor/openclaw-shim file: dep) must ship:
     // the WeChat bridge imports @tencent-weixin/openclaw-weixin/dist at
     // runtime to send media, and that chain resolves openclaw/plugin-sdk/*.
   ],
   extraResources: [
     {
+      // Ship third-party prompt attribution with packaged applications, not
+      // only in source checkouts.
+      from: 'THIRD_PARTY_NOTICES.md',
+      to: 'THIRD_PARTY_NOTICES.md'
+    },
+    {
+      from: 'resources/bundled-extensions',
+      to: 'bundled-extensions',
+      filter: ['catalog.json', '*.kunx']
+    },
+    {
       from: 'resources/whisper',
       to: 'whisper',
       filter: ['**/*']
-    }
-  ],
-  artifactName: `Kun-${artifactVersion}-\${os}-\${arch}.\${ext}`,
-  publish: [
+    },
     {
-      provider: 'generic',
-      url: genericUpdateUrl
-    }
+      from: 'resources/officecli/current',
+      to: 'officecli',
+      filter: ['officecli', 'officecli.exe', 'selected.json']
+    },
+    {
+      from: 'resources/officecli/manifest.json',
+      to: 'officecli/manifest.json'
+    },
+    {
+      from: 'resources/officecli/legal',
+      to: 'officecli/legal',
+      filter: ['LICENSE', 'NOTICE', 'THIRD-PARTY-NOTICES.txt']
+    },
   ],
+  artifactName: `${productName}-${artifactVersion}-\${os}-\${arch}.\${ext}`,
+  ...(developmentFlavor
+    ? { publish: [] }
+    : {
+        publish: [
+          {
+            provider: 'generic',
+            url: genericUpdateUrl
+          }
+        ]
+      }),
   beforePack: './scripts/before-pack.cjs',
   afterPack: './scripts/after-pack.cjs',
   afterSign: './scripts/mac-notarize.cjs',
   mac: {
+    // macOS stores Chromium locales in language-named .lproj directories.
+    electronLanguages: chromiumMacLanguages,
     category: 'public.app-category.developer-tools',
     identity: hasExplicitMacSigningIdentity ? undefined : null,
     // We notarize in scripts/mac-notarize.cjs so APPLE_API_KEY_BASE64 can be supported.
@@ -180,6 +265,8 @@ module.exports = {
     sign: hasExplicitMacSigningIdentity
   },
   win: {
+    // Windows and Linux use BCP 47 locale names for Chromium .pak files.
+    electronLanguages: chromiumPakLanguages,
     // Windows does not mask app icons for us; use the rounded asset so
     // desktop/start-menu/taskbar shortcuts do not show a hard square edge.
     // Ship a multi-size .ico (16/24/32/48/64/72/96/128/256) so Explorer and
@@ -190,7 +277,10 @@ module.exports = {
   },
   nsis: {
     oneClick: false,
-    allowToChangeInstallationDirectory: true,
+    // The stock assisted directory page appends APP_FILENAME by substring and
+    // turns a registered `DeepSeek GUI` location into `DeepSeek GUI\Kun`.
+    // installer.nsh adds one MUI directory page with component-aware migration.
+    allowToChangeInstallationDirectory: false,
     perMachine: false,
     allowElevation: true,
     selectPerMachineByDefault: false,
@@ -198,17 +288,32 @@ module.exports = {
     // 明确创建快捷方式；always 在覆盖安装时也会重建（即使用户曾删掉桌面图标）
     createDesktopShortcut: 'always',
     createStartMenuShortcut: true,
-    shortcutName: 'Kun',
-    uninstallDisplayName: 'Kun',
+    shortcutName: productName,
+    uninstallDisplayName: productName,
     deleteAppDataOnUninstall: false
   },
   linux: {
+    electronLanguages: chromiumPakLanguages,
     category: 'Development',
     icon: './src/asset/img/kun.png',
-    target: [{ target: 'AppImage', arch: ['x64'] }]
+    maintainer: 'Kun Contributors <1736101137@qq.com>',
+    // AppImage covers generic Linux; deb covers Debian-family installers such as
+    // openKylin / Ubuntu that expect apt/software-store packages.
+    target: [
+      { target: 'AppImage', arch: ['x64'] },
+      { target: 'deb', arch: ['x64'] }
+    ]
+  },
+  // Override electron-builder's sandbox-disabling default desktop argument.
+  // Linux uses user namespaces and seccomp; only the legacy SUID helper is disabled.
+  // afterPack also installs a product launcher that prepends the same flag for
+  // both AppImage and deb entrypoints (deb .desktop Exec hits that launcher).
+  appImage: {
+    executableArgs: ['--disable-setuid-sandbox', '--no-first-run']
   },
   extraMetadata: {
     ...(releaseAppVersion ? { version: releaseAppVersion } : {}),
+    kunAppFlavor: appFlavor,
     updateChannel,
     buildHints: {
       macSigningEnabled: hasExplicitMacSigningIdentity,

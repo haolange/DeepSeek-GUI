@@ -30,9 +30,11 @@ import type { AttachmentReference, ChatBlock, RuntimeConnectionStatus } from '..
 import type { QueuedUserMessage } from '../../store/chat-store-types'
 import type { ModelProviderModelGroup } from '@shared/kun-gui-api'
 import type { SddDraft } from '../../sdd/sdd-draft-store'
-import { MessageTimeline } from '../chat/MessageTimeline'
+import { useChatStore } from '../../store/chat-store'
+import { LazyMessageTimeline } from '../chat/LazyMessageTimeline'
 import { FloatingComposer } from '../chat/FloatingComposer'
 import type { ComposerReasoningEffort } from '../chat/FloatingComposerModelPicker'
+import { SubagentReturnBar } from '../chat/message-timeline-empty'
 import { SidebarTitlebarToggleButton } from '../sidebar/SidebarPrimitives'
 
 const FRAMEWORK_ICONS: Record<string, LucideIcon> = {
@@ -75,10 +77,13 @@ type Props = {
   composerPickList: string[]
   composerModelGroups?: ModelProviderModelGroup[]
   composerReasoningEffort: ComposerReasoningEffort
+  composerFastMode: boolean
   setComposerModel: (modelId: string, providerId?: string) => void
   setComposerReasoningEffort: (effort: ComposerReasoningEffort) => void
+  setComposerFastMode: (enabled: boolean) => void
   queuedMessages: QueuedUserMessage[]
   removeQueuedMessage: (id: string) => void
+  guideQueuedMessage: (id: string) => void | Promise<unknown>
   attachments?: AttachmentReference[]
   attachmentUploadEnabled?: boolean
   attachmentUploadBusy?: boolean
@@ -114,10 +119,13 @@ export function SddAssistantPanel({
   composerPickList,
   composerModelGroups = [],
   composerReasoningEffort,
+  composerFastMode,
   setComposerModel,
   setComposerReasoningEffort,
+  setComposerFastMode,
   queuedMessages,
   removeQueuedMessage,
+  guideQueuedMessage,
   attachments = [],
   attachmentUploadEnabled = false,
   attachmentUploadBusy = false,
@@ -136,15 +144,24 @@ export function SddAssistantPanel({
   className = ''
 }: Props): ReactElement {
   const { t } = useTranslation('common')
+  const resolveUserInput = useChatStore((s) => s.resolveUserInput)
+  const activeThreadRelation = useChatStore((s) => s.activeThreadRelation)
+  const activeThreadParentId = useChatStore((s) => s.activeThreadParentId)
+  const parentThreadTitle = useChatStore((s) =>
+    s.threads.find((thread) => thread.id === s.activeThreadParentId)?.title?.trim() ?? ''
+  )
+  const selectThread = useChatStore((s) => s.selectThread)
   const hasTimeline =
     blocks.length > 0 || liveReasoning.trim().length > 0 || liveAssistant.trim().length > 0
   const canCreateConversation = runtimeConnection === 'ready' && !busy
+  const showSubagentReturnBar =
+    activeThreadRelation === 'side' && Boolean(activeThreadParentId)
 
   return (
     <aside
-      className={`sdd-assistant-panel ds-no-drag flex min-h-0 flex-col border-l border-ds-border-muted bg-white backdrop-blur-xl dark:bg-ds-canvas ${busy ? 'is-busy' : ''} ${className}`}
+      className={`sdd-assistant-panel ds-sidebar-surface ds-no-drag flex min-h-0 flex-col border-l border-ds-border-muted backdrop-blur-xl ${busy ? 'is-busy' : ''} ${className}`}
     >
-      <div className="sdd-assistant-header shrink-0 border-b border-ds-border-muted bg-white/92 dark:bg-ds-card">
+      <div className="sdd-assistant-header ds-sidebar-surface-chrome shrink-0 border-b border-ds-border-muted">
         <div className="flex h-12 min-w-0 items-center gap-2 px-4">
           <SidebarTitlebarToggleButton
             onClick={onCollapse}
@@ -154,7 +171,7 @@ export function SddAssistantPanel({
           >
             <PanelRightClose className="h-4 w-4" strokeWidth={1.75} />
           </SidebarTitlebarToggleButton>
-          <div className="sdd-assistant-title-pill flex min-w-0 flex-1 items-center gap-2 rounded-[12px] bg-ds-surface-subtle px-3 py-1.5 dark:bg-white/8">
+          <div className="sdd-assistant-title-pill flex min-w-0 flex-1 items-center gap-2 rounded-[12px] border border-ds-border-muted bg-ds-card/70 px-3 py-1.5">
             <Sparkles className="sdd-assistant-sparkle h-4 w-4 shrink-0 text-accent" strokeWidth={1.8} />
             <span className="min-w-0 truncate text-[13px] font-medium text-ds-ink">
               {t('sddAssistant')}
@@ -172,16 +189,16 @@ export function SddAssistantPanel({
           </button>
         </div>
         <div className="min-w-0 px-4 pb-3">
-          <div className="truncate rounded-full border border-ds-border-muted bg-ds-surface-subtle px-3 py-1.5 text-[11.5px] font-medium text-ds-muted dark:bg-white/6">
+          <div className="truncate rounded-full border border-ds-border-muted bg-ds-card/70 px-3 py-1.5 text-[11.5px] font-medium text-ds-muted">
             {draft.relativePath}
           </div>
         </div>
       </div>
 
-      <div className="sdd-assistant-body min-h-0 flex-1 overflow-y-auto overflow-x-hidden bg-ds-main/45 dark:bg-transparent">
+      <div className="sdd-assistant-body ds-sidebar-surface-body flex min-h-0 flex-1 flex-col overflow-hidden">
         {hasTimeline ? (
-          <div className="sdd-assistant-timeline">
-            <MessageTimeline
+          <div className="sdd-assistant-timeline flex min-h-0 flex-1 flex-col overflow-hidden">
+            <LazyMessageTimeline
               blocks={blocks}
               liveReasoning={liveReasoning}
               live={liveAssistant}
@@ -193,7 +210,7 @@ export function SddAssistantPanel({
             />
           </div>
         ) : (
-          <div className="sdd-assistant-empty flex min-h-full flex-col justify-end px-5 py-5">
+          <div className="sdd-assistant-empty flex min-h-0 flex-1 flex-col overflow-y-auto overflow-x-hidden px-5 py-5">
             <div className="sdd-assistant-empty-card mb-auto rounded-[20px] border border-ds-border bg-ds-card/95 p-4 shadow-sm">
               <div className="sdd-assistant-empty-icon flex h-11 w-11 items-center justify-center rounded-2xl bg-accent/10 text-accent">
                 <FileQuestion className="h-5 w-5" strokeWidth={1.9} />
@@ -250,38 +267,55 @@ export function SddAssistantPanel({
         )}
       </div>
 
-      <div className="sdd-assistant-composer shrink-0 border-t border-ds-border-muted bg-white/92 px-4 pb-4 pt-3 dark:bg-ds-card">
-        <FloatingComposer
-          variant="compact"
-          workspaceRootOverride={draft.workspaceRoot}
-          input={input}
-          setInput={setInput}
-          mode={mode}
-          setMode={setMode}
-          busy={busy}
-          runtimeReady={runtimeConnection === 'ready'}
-          hasActiveThread={Boolean(activeThreadId)}
-          composerModel={composerModel}
-          composerProviderId={composerProviderId}
-          composerPickList={composerPickList}
-          composerModelGroups={composerModelGroups}
-          composerReasoningEffort={composerReasoningEffort}
-          onComposerModelChange={setComposerModel}
-          onComposerReasoningEffortChange={setComposerReasoningEffort}
-          modelPickerMode="combobox"
-          queuedMessages={queuedMessages}
-          onRemoveQueuedMessage={removeQueuedMessage}
-          attachments={attachments}
-          attachmentUploadEnabled={attachmentUploadEnabled}
-          attachmentUploadBusy={attachmentUploadBusy}
-          attachmentUploadError={attachmentUploadError}
-          onPickAttachments={onPickAttachments}
-          onPasteClipboardImage={onPasteClipboardImage}
-          onRemoveAttachment={onRemoveAttachment}
-          onSend={onSend}
-          onInterrupt={onInterrupt}
-          onConfigureProviders={onConfigureProviders}
-        />
+      <div className="sdd-assistant-composer ds-sidebar-surface-chrome shrink-0 border-t border-ds-border-muted px-4 pb-4 pt-3">
+        {showSubagentReturnBar ? (
+          <SubagentReturnBar
+            parentTitle={parentThreadTitle}
+            onBack={() => {
+              if (activeThreadParentId) void selectThread(activeThreadParentId)
+            }}
+          />
+        ) : (
+          <FloatingComposer
+            variant="compact"
+            workspaceRootOverride={draft.workspaceRoot}
+            activeThreadIdOverride={activeThreadId}
+            userInputBlocksOverride={blocks}
+            onResolveUserInput={resolveUserInput}
+            input={input}
+            setInput={setInput}
+            mode={mode}
+            setMode={setMode}
+            busy={busy}
+            runtimeReady={runtimeConnection === 'ready'}
+            hasActiveThread={Boolean(activeThreadId)}
+            composerModel={composerModel}
+            composerProviderId={composerProviderId}
+            composerPickList={composerPickList}
+            composerModelGroups={composerModelGroups}
+            composerReasoningEffort={composerReasoningEffort}
+            composerFastMode={composerFastMode}
+            onComposerModelChange={setComposerModel}
+            onComposerReasoningEffortChange={setComposerReasoningEffort}
+            onComposerFastModeChange={setComposerFastMode}
+            modelPickerMode="combobox"
+            modelControlVariant="split"
+            showProviderInModelLabel
+            queuedMessages={queuedMessages}
+            onRemoveQueuedMessage={removeQueuedMessage}
+            onGuideQueuedMessage={guideQueuedMessage}
+            attachments={attachments}
+            attachmentUploadEnabled={attachmentUploadEnabled}
+            attachmentUploadBusy={attachmentUploadBusy}
+            attachmentUploadError={attachmentUploadError}
+            onPickAttachments={onPickAttachments}
+            onPasteClipboardImage={onPasteClipboardImage}
+            onRemoveAttachment={onRemoveAttachment}
+            onSend={onSend}
+            onInterrupt={onInterrupt}
+            onConfigureProviders={onConfigureProviders}
+          />
+        )}
       </div>
     </aside>
   )

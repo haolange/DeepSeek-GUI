@@ -1,17 +1,197 @@
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
-  DEFAULT_APPROVAL_POLICY,
+  DEFAULT_CHECKPOINT_CLEANUP_ENABLED,
   DEFAULT_CHECKPOINT_CLEANUP_INTERVAL_DAYS,
+  DEFAULT_GIT_CHECKPOINT_CREATE_ENABLED,
   defaultKunRuntimeSettings,
   defaultModelProviderSettings
 } from '../shared/app-settings'
 import { DEFAULT_GUI_UPDATE_CHANNEL } from '../shared/gui-update'
-import { JsonSettingsStore } from './settings-store'
+import { devServerHintUrl, JsonSettingsStore } from './settings-store'
+
+type SettingsStoreModule = typeof import('./settings-store')
+
+async function withMockedHome<T>(
+  homeDir: string,
+  run: (settingsStore: SettingsStoreModule) => Promise<T>
+): Promise<T> {
+  vi.resetModules()
+  vi.doMock('node:os', () => ({ homedir: () => homeDir }))
+  try {
+    return await run(await import('./settings-store'))
+  } finally {
+    vi.doUnmock('node:os')
+    vi.resetModules()
+  }
+}
 
 describe('JsonSettingsStore', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('shares manager-backed settings revisions across independent profiles', async () => {
+    const userDataDir = await mkdtemp(join(tmpdir(), 'kun-shared-settings-'))
+    let revision = 0
+    let value: string | null = null
+    const backend = {
+      async read() {
+        return { revision, value }
+      },
+      async write(expectedRevision: number, next: string) {
+        if (expectedRevision !== revision) throw new Error('revision conflict')
+        value = next
+        revision += 1
+        return { revision, value: next }
+      }
+    }
+    const production = new JsonSettingsStore(userDataDir, { documentBackend: backend })
+    const development = new JsonSettingsStore(userDataDir, { documentBackend: backend })
+    expect((await development.load()).locale).toBe('en')
+    await production.patch({ locale: 'zh' })
+    expect((await development.load()).locale).toBe('zh')
+  })
+
+  it('serializes concurrent patches so stale full snapshots cannot overwrite sibling intent', async () => {
+    const userDataDir = await mkdtemp(join(tmpdir(), 'kun-serialized-settings-'))
+    let revision = 0
+    let value: string | null = null
+    let releaseFirstWrite!: () => void
+    const firstWriteGate = new Promise<void>((resolve) => { releaseFirstWrite = resolve })
+    let writes = 0
+    const backend = {
+      async read() {
+        return { revision, value }
+      },
+      async write(expectedRevision: number, next: string) {
+        writes += 1
+        if (writes === 1) await firstWriteGate
+        if (expectedRevision !== revision) throw new Error('revision conflict')
+        value = next
+        revision += 1
+        return { revision, value: next }
+      }
+    }
+    const store = new JsonSettingsStore(userDataDir, { documentBackend: backend })
+    await store.load()
+
+    const runtimePatch = store.patch({ agents: { kun: { model: 'deepseek-reasoner' } } })
+    const unrelatedPatch = store.patch({ locale: 'zh' })
+    await vi.waitFor(() => expect(writes).toBe(1))
+    expect(writes).toBe(1)
+
+    releaseFirstWrite()
+    await expect(Promise.all([runtimePatch, unrelatedPatch])).resolves.toHaveLength(2)
+
+    const saved = await store.load()
+    expect(saved.agents.kun.model).toBe('deepseek-reasoner')
+    expect(saved.locale).toBe('zh')
+    expect(writes).toBe(2)
+  })
+
+  it('retries a Manager revision conflict from the exact mutation snapshot', async () => {
+    const userDataDir = await mkdtemp(join(tmpdir(), 'kun-revision-retry-settings-'))
+    let revision = 0
+    let value: string | null = null
+    let releaseFirstProfileWrite!: () => void
+    let markFirstProfileWriteStarted!: () => void
+    const firstProfileWriteGate = new Promise<void>((resolve) => { releaseFirstProfileWrite = resolve })
+    const firstProfileWriteStarted = new Promise<void>((resolve) => { markFirstProfileWriteStarted = resolve })
+    let gated = false
+    const backend = {
+      async read() {
+        return { revision, value }
+      },
+      async write(expectedRevision: number, next: string) {
+        const parsed = JSON.parse(next) as { agents?: { kun?: { model?: string } } }
+        if (!gated && expectedRevision === 0 && parsed.agents?.kun?.model === 'deepseek-reasoner') {
+          gated = true
+          markFirstProfileWriteStarted()
+          await firstProfileWriteGate
+        }
+        if (expectedRevision !== revision) {
+          const conflict = new Error('revision conflict') as Error & { currentRevision: number }
+          conflict.name = 'ManagerRevisionConflictError'
+          conflict.currentRevision = revision
+          throw conflict
+        }
+        value = next
+        revision += 1
+        return { revision, value: next }
+      }
+    }
+    const production = new JsonSettingsStore(userDataDir, { documentBackend: backend })
+    const development = new JsonSettingsStore(userDataDir, { documentBackend: backend })
+    await Promise.all([production.load(), development.load()])
+
+    const productionPatch = production.patch({ agents: { kun: { model: 'deepseek-reasoner' } } })
+    await firstProfileWriteStarted
+    await development.patch({ locale: 'zh' })
+    releaseFirstProfileWrite()
+    await productionPatch
+
+    const saved = await production.load()
+    expect(saved.agents.kun.model).toBe('deepseek-reasoner')
+    expect(saved.locale).toBe('zh')
+    expect(revision).toBe(2)
+  })
+
+  it('re-checks an updateIf guard after a Manager revision conflict', async () => {
+    const userDataDir = await mkdtemp(join(tmpdir(), 'kun-conditional-retry-settings-'))
+    let revision = 0
+    let value: string | null = null
+    let releaseGuardedWrite!: () => void
+    let markGuardedWriteStarted!: () => void
+    const guardedWriteGate = new Promise<void>((resolve) => { releaseGuardedWrite = resolve })
+    const guardedWriteStarted = new Promise<void>((resolve) => { markGuardedWriteStarted = resolve })
+    let gated = false
+    const backend = {
+      async read() {
+        return { revision, value }
+      },
+      async write(expectedRevision: number, next: string) {
+        const parsed = JSON.parse(next) as { agents?: { kun?: { model?: string } } }
+        if (!gated && expectedRevision === 0 && parsed.agents?.kun?.model === 'deepseek-reasoner') {
+          gated = true
+          markGuardedWriteStarted()
+          await guardedWriteGate
+        }
+        if (expectedRevision !== revision) {
+          const conflict = new Error('revision conflict') as Error & { currentRevision: number }
+          conflict.name = 'ManagerRevisionConflictError'
+          conflict.currentRevision = revision
+          throw conflict
+        }
+        value = next
+        revision += 1
+        return { revision, value: next }
+      }
+    }
+    const production = new JsonSettingsStore(userDataDir, { documentBackend: backend })
+    const development = new JsonSettingsStore(userDataDir, { documentBackend: backend })
+    await Promise.all([production.load(), development.load()])
+
+    const guarded = production.updateIf(
+      (current) => current.locale === 'en',
+      (current) => ({
+        ...current,
+        agents: { kun: { ...current.agents.kun, model: 'deepseek-reasoner' } }
+      })
+    )
+    await guardedWriteStarted
+    await development.patch({ locale: 'zh' })
+    releaseGuardedWrite()
+
+    await expect(guarded).resolves.toMatchObject({ applied: false })
+    const saved = await production.load()
+    expect(saved.locale).toBe('zh')
+    expect(saved.agents.kun.model).not.toBe('deepseek-reasoner')
+    expect(revision).toBe(1)
+  })
+
   it('defaults GUI updates to the stable channel for new settings', async () => {
     const userDataDir = await mkdtemp(join(tmpdir(), 'ds-gui-settings-'))
 
@@ -19,10 +199,15 @@ describe('JsonSettingsStore', () => {
     const loaded = await store.load()
 
     expect(loaded.guiUpdate.channel).toBe(DEFAULT_GUI_UPDATE_CHANNEL)
-    expect(loaded.agents.kun.approvalPolicy).toBe(DEFAULT_APPROVAL_POLICY)
+    expect(loaded.agents.kun).toEqual(expect.objectContaining({
+      approvalPolicy: 'auto',
+      sandboxMode: 'danger-full-access',
+      approvalReviewer: 'user'
+    }))
     expect(loaded.checkpointCleanup.intervalDays).toBe(DEFAULT_CHECKPOINT_CLEANUP_INTERVAL_DAYS)
-    // Checkpoint cleanup deletes data, so it must be opt-in (disabled by default).
-    expect(loaded.checkpointCleanup.enabled).toBe(false)
+    // Checkpoint cleanup is enabled by default to keep stale checkpoints from accumulating.
+    expect(loaded.checkpointCleanup.enabled).toBe(DEFAULT_CHECKPOINT_CLEANUP_ENABLED)
+    expect(loaded.checkpointCleanup.createEnabled).toBe(DEFAULT_GIT_CHECKPOINT_CREATE_ENABLED)
     expect(loaded.appBehavior).toEqual({
       openAtLogin: false,
       startMinimized: false,
@@ -44,24 +229,54 @@ describe('JsonSettingsStore', () => {
     expect(clamped.checkpointCleanup.intervalDays).toBe(10)
   })
 
-  it('creates a default write workspace with welcome.md', async () => {
+  it('patches one notification source without resetting sibling preferences', async () => {
     const userDataDir = await mkdtemp(join(tmpdir(), 'ds-gui-settings-'))
-
     const store = new JsonSettingsStore(userDataDir)
-    const loaded = await store.load()
 
-    expect(loaded.write.defaultWorkspaceRoot).toContain('.kun')
-    expect(loaded.write.workspaces).toContain(loaded.write.defaultWorkspaceRoot)
-    expect(loaded.write.inlineCompletion.enabled).toBe(true)
-    expect(loaded.write.inlineCompletion.retrievalEnabled).toBe(true)
-    expect(loaded.write.inlineCompletion.longCompletionEnabled).toBe(true)
-    expect(loaded.provider.baseUrl).toBe('https://api.deepseek.com')
-    expect(loaded.write.inlineCompletion.apiKey).toBe('')
-    expect(loaded.write.inlineCompletion.baseUrl).toBe('')
-    expect(loaded.write.inlineCompletion.inheritModel).toBe(true)
-    expect(loaded.write.inlineCompletion.model).toBe('deepseek-v4-flash')
-    expect(loaded.write.inlineCompletion.longMaxTokens).toBe(256)
-    expect(await readFile(join(loaded.write.defaultWorkspaceRoot, 'welcome.md'), 'utf8')).toContain('Welcome to Write')
+    const mainDisabled = await store.patch({
+      notifications: { mainAgentTurnComplete: false }
+    })
+    expect(mainDisabled.notifications).toEqual({
+      turnComplete: true,
+      mainAgentTurnComplete: false,
+      subagentTurnComplete: false
+    })
+
+    const subagentEnabled = await store.patch({
+      notifications: { subagentTurnComplete: true }
+    })
+    expect(subagentEnabled.notifications).toEqual({
+      turnComplete: true,
+      mainAgentTurnComplete: false,
+      subagentTurnComplete: true
+    })
+  })
+
+  it('creates the app-managed default workspaces and welcome file', async () => {
+    const userDataDir = await mkdtemp(join(tmpdir(), 'ds-gui-settings-'))
+    const homeDir = await mkdtemp(join(tmpdir(), 'ds-gui-home-'))
+
+    await withMockedHome(homeDir, async ({ JsonSettingsStore: Store }) => {
+      const store = new Store(userDataDir)
+      const loaded = await store.load()
+
+      expect(loaded.write.defaultWorkspaceRoot).toContain('.kun')
+      expect(loaded.write.workspaces).toContain(loaded.write.defaultWorkspaceRoot)
+      expect(loaded.write.inlineCompletion.enabled).toBe(true)
+      expect(loaded.write.inlineCompletion.retrievalEnabled).toBe(true)
+      expect(loaded.write.inlineCompletion.longCompletionEnabled).toBe(true)
+      expect(loaded.provider.baseUrl).toBe('https://api.deepseek.com')
+      expect(loaded.write.inlineCompletion.apiKey).toBe('')
+      expect(loaded.write.inlineCompletion.baseUrl).toBe('')
+      expect(loaded.write.inlineCompletion.inheritModel).toBe(true)
+      expect(loaded.write.inlineCompletion.model).toBe('deepseek-v4-flash')
+      expect(loaded.write.inlineCompletion.longMaxTokens).toBe(256)
+      expect((await stat(loaded.workspaceRoot)).isDirectory()).toBe(true)
+      expect((await stat(loaded.write.defaultWorkspaceRoot)).isDirectory()).toBe(true)
+      expect((await stat(loaded.conversationWorkspaceRoot)).isDirectory()).toBe(true)
+      expect(await readFile(join(loaded.write.defaultWorkspaceRoot, 'welcome.md'), 'utf8'))
+        .toContain('Welcome to Write')
+    })
   })
 
   it('preserves the pro write completion model', async () => {
@@ -247,6 +462,91 @@ describe('JsonSettingsStore', () => {
     expect(secondLoaded.agents.kun.providerId).toBe('custom-provider-2')
   })
 
+  it('preserves route pools, local gateway state, and account sources across restart and unrelated patches', async () => {
+    const userDataDir = await mkdtemp(join(tmpdir(), 'ds-gui-settings-routes-'))
+    const initialStore = new JsonSettingsStore(userDataDir)
+    const initial = await initialStore.load()
+    const provider = {
+      id: 'kimi-code',
+      name: 'Kimi Code',
+      presetSource: { presetId: 'kimi-code', mode: 'api' as const },
+      apiKey: 'sk-kimi',
+      baseUrl: 'https://api.kimi.com/coding/v1',
+      endpointFormat: 'chat_completions' as const,
+      models: ['kimi-for-coding'],
+      modelProfiles: {}
+    }
+    const routePool = {
+      id: 'kimi-route',
+      name: 'Kimi Route',
+      modelId: 'kimi-auto',
+      enabled: true,
+      strategy: 'priority' as const,
+      targets: [{ id: 'kimi-primary', providerId: provider.id, modelId: provider.models[0], enabled: true, weight: 1 }],
+      failurePolicy: { failoverHttpStatusCodes: [429, 503], failoverOnNetworkError: true, failoverOnTimeout: true, failoverOnAuthError: true },
+      healthPolicy: { failureThreshold: 3, cooldownMs: 60_000, halfOpenMaxAttempts: 1 }
+    }
+
+    await initialStore.save({
+      ...initial,
+      provider: {
+        ...initial.provider,
+        providers: [...initial.provider.providers, provider],
+        routePools: [routePool],
+        localGateway: { enabled: true, name: 'Team Relay' }
+      }
+    })
+
+    const restarted = new JsonSettingsStore(userDataDir)
+    const loaded = await restarted.load()
+    expect(loaded.provider.routePools).toEqual([routePool])
+    expect(loaded.provider.localGateway).toEqual({ enabled: true, name: 'Team Relay' })
+    expect(loaded.provider.providers.find((item) => item.id === provider.id)?.presetSource)
+      .toEqual(provider.presetSource)
+
+    await restarted.patch({ theme: 'dark' })
+    const afterUnrelatedPatch = await new JsonSettingsStore(userDataDir).load()
+    expect(afterUnrelatedPatch.provider.routePools).toEqual([routePool])
+    expect(afterUnrelatedPatch.provider.localGateway).toEqual({ enabled: true, name: 'Team Relay' })
+  })
+
+  it('preserves current routing extensions while migrating mixed legacy settings', async () => {
+    const userDataDir = await mkdtemp(join(tmpdir(), 'ds-gui-settings-routes-legacy-'))
+    const provider = {
+      id: 'kimi-code',
+      name: 'Kimi Code',
+      presetSource: { presetId: 'kimi-code', mode: 'api' },
+      apiKey: 'sk-kimi',
+      baseUrl: 'https://api.kimi.com/coding/v1',
+      endpointFormat: 'chat_completions',
+      models: ['kimi-for-coding'],
+      modelProfiles: {}
+    }
+    const routePool = {
+      id: 'mixed-route', name: 'Mixed Route', modelId: 'mixed-auto', enabled: true, strategy: 'priority',
+      targets: [{ id: 'mixed-target', providerId: provider.id, modelId: provider.models[0], enabled: true, weight: 1 }],
+      failurePolicy: { failoverHttpStatusCodes: [429], failoverOnNetworkError: true, failoverOnTimeout: true, failoverOnAuthError: true },
+      healthPolicy: { failureThreshold: 3, cooldownMs: 60_000, halfOpenMaxAttempts: 1 }
+    }
+    await writeFile(join(userDataDir, 'deepseek-gui-settings.json'), JSON.stringify({
+      version: 1,
+      agentProvider: 'deepseek-runtime',
+      deepseek: { autoStart: false },
+      provider: {
+        providers: [provider],
+        routePools: [routePool],
+        localGateway: { enabled: true, name: 'Legacy Relay' }
+      }
+    }), 'utf8')
+
+    const loaded = await new JsonSettingsStore(userDataDir).load()
+    expect(loaded.agents.kun.autoStart).toBe(false)
+    expect(loaded.provider.routePools).toEqual([routePool])
+    expect(loaded.provider.localGateway).toEqual({ enabled: true, name: 'Legacy Relay' })
+    expect(loaded.provider.providers.find((item) => item.id === provider.id)?.presetSource)
+      .toEqual(provider.presetSource)
+  })
+
   it('loads settings from the legacy lowercase userData directory and writes them into the current path', async () => {
     const supportRoot = await mkdtemp(join(tmpdir(), 'ds-gui-settings-compat-'))
     const legacyUserDataDir = join(supportRoot, 'deepseek-gui')
@@ -272,15 +572,74 @@ describe('JsonSettingsStore', () => {
     expect(await readFile(currentSettingsPath, 'utf8')).toContain('sk-legacy-provider')
   })
 
-  it('creates the configured code workspace on load', async () => {
+  it('preserves a missing configured code workspace without creating it', async () => {
     const userDataDir = await mkdtemp(join(tmpdir(), 'ds-gui-settings-'))
+    const homeDir = await mkdtemp(join(tmpdir(), 'ds-gui-home-'))
     const workspaceRoot = join(userDataDir, 'missing-workspace')
+    const writeWorkspaceRoot = join(userDataDir, 'missing-write-workspace')
+    const conversationWorkspaceRoot = join(userDataDir, 'missing-conversation-workspace')
+    const clawChannelWorkspaceRoot = join(userDataDir, 'missing-claw-channel')
+    const clawConversationWorkspaceRoot = join(userDataDir, 'missing-claw-conversation')
 
     await writeFile(
       join(userDataDir, 'deepseek-gui-settings.json'),
       JSON.stringify({
         version: 1,
-        workspaceRoot
+        workspaceRoot,
+        conversationWorkspaceRoot,
+        write: {
+          defaultWorkspaceRoot: writeWorkspaceRoot,
+          activeWorkspaceRoot: writeWorkspaceRoot,
+          workspaces: [writeWorkspaceRoot]
+        },
+        claw: {
+          channels: [{
+            id: 'channel-1',
+            provider: 'feishu',
+            workspaceRoot: clawChannelWorkspaceRoot,
+            conversations: [{
+              id: 'conversation-1',
+              chatId: 'chat-1',
+              latestMessageId: 'message-1',
+              workspaceRoot: clawConversationWorkspaceRoot
+            }]
+          }]
+        }
+      }),
+      'utf8'
+    )
+
+    await withMockedHome(homeDir, async ({ JsonSettingsStore: Store }) => {
+      const store = new Store(userDataDir)
+      const loaded = await store.load()
+
+      expect(loaded.workspaceRoot).toBe(workspaceRoot)
+      expect(loaded.write.defaultWorkspaceRoot).toBe(writeWorkspaceRoot)
+      expect(loaded.conversationWorkspaceRoot).toBe(conversationWorkspaceRoot)
+      expect(loaded.claw.channels[0]?.workspaceRoot).toBe(clawChannelWorkspaceRoot)
+      expect(loaded.claw.channels[0]?.conversations[0]?.workspaceRoot).toBe(clawConversationWorkspaceRoot)
+      await expect(stat(workspaceRoot)).rejects.toMatchObject({ code: 'ENOENT' })
+      await expect(stat(writeWorkspaceRoot)).rejects.toMatchObject({ code: 'ENOENT' })
+      await expect(stat(conversationWorkspaceRoot)).rejects.toMatchObject({ code: 'ENOENT' })
+      await expect(stat(clawChannelWorkspaceRoot)).rejects.toMatchObject({ code: 'ENOENT' })
+      await expect(stat(clawConversationWorkspaceRoot)).rejects.toMatchObject({ code: 'ENOENT' })
+      expect((await stat(join(homeDir, '.kun', 'default_workspace'))).isDirectory()).toBe(true)
+      expect((await stat(join(homeDir, '.kun', 'write_workspace'))).isDirectory()).toBe(true)
+    })
+  })
+
+  it('does not replace an unavailable configured workspace on load', async () => {
+    const userDataDir = await mkdtemp(join(tmpdir(), 'ds-gui-settings-'))
+    const blockedParent = join(userDataDir, 'disconnected-drive')
+    const unavailableWorkspaceRoot = join(blockedParent, 'project')
+    const settingsPath = join(userDataDir, 'kun-settings.json')
+
+    await writeFile(blockedParent, 'not a directory', 'utf8')
+    await writeFile(
+      settingsPath,
+      JSON.stringify({
+        version: 1,
+        workspaceRoot: unavailableWorkspaceRoot
       }),
       'utf8'
     )
@@ -288,8 +647,22 @@ describe('JsonSettingsStore', () => {
     const store = new JsonSettingsStore(userDataDir)
     const loaded = await store.load()
 
-    expect(loaded.workspaceRoot).toBe(workspaceRoot)
-    expect((await stat(workspaceRoot)).isDirectory()).toBe(true)
+    const persisted = JSON.parse(await readFile(settingsPath, 'utf8')) as Record<string, unknown>
+    expect(loaded.workspaceRoot).toBe(unavailableWorkspaceRoot)
+    expect(persisted.workspaceRoot).toBe(unavailableWorkspaceRoot)
+  })
+
+  it('does not hide app-managed default workspace creation failures', async () => {
+    const userDataDir = await mkdtemp(join(tmpdir(), 'ds-gui-settings-'))
+    const homeRoot = await mkdtemp(join(tmpdir(), 'ds-gui-home-parent-'))
+    const homeDir = join(homeRoot, 'home-is-a-file')
+
+    await writeFile(homeDir, 'not a directory', 'utf8')
+
+    await withMockedHome(homeDir, async ({ JsonSettingsStore: Store }) => {
+      const store = new Store(userDataDir)
+      await expect(store.load()).rejects.toThrow(/ENOTDIR|not a directory|mkdir/i)
+    })
   })
 
   it('migrates legacy deepseek-runtime agentProvider to Kun', async () => {
@@ -346,6 +719,119 @@ describe('JsonSettingsStore', () => {
     expect(replaced.version).toBe(1)
   })
 
+  it('never persists plaintext credentials when protected storage is unavailable', async () => {
+    const userDataDir = await mkdtemp(join(tmpdir(), 'ds-gui-settings-'))
+    const store = new JsonSettingsStore(userDataDir, {
+      rejectPlaintextCredentials: true
+    })
+
+    const settingsWithSecret = await store.load()
+    settingsWithSecret.provider.apiKey = 'plaintext-secret'
+    settingsWithSecret.provider.providers[0].apiKey = 'plaintext-secret'
+    await expect(store.save(settingsWithSecret))
+      .rejects.toThrow(/plaintext credentials were not written/)
+
+    const settingsPath = join(userDataDir, 'kun-settings.json')
+    await expect(readFile(settingsPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('fails closed without caching plaintext when the protected backup cannot be created', async () => {
+    const userDataDir = await mkdtemp(join(tmpdir(), 'kun-settings-backup-fail-'))
+    const secret = 'backup-failure-secret'
+    const plainStore = new JsonSettingsStore(userDataDir)
+    const defaults = await plainStore.load()
+    await plainStore.save({
+      ...defaults,
+      provider: { ...defaults.provider, apiKey: secret }
+    })
+    const settingsPath = join(userDataDir, 'kun-settings.json')
+    const original = await readFile(settingsPath, 'utf8')
+    await mkdir(join(userDataDir, 'kun-settings.pre-extension-credential-migration.json'))
+    const prepare = vi.fn()
+    const store = new JsonSettingsStore(userDataDir, {
+      credentialMigration: { prepare }
+    })
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const error = await store.load().catch((value: unknown) => value)
+      expect(error).toBeInstanceOf(Error)
+      expect(String(error)).toMatch(/protected settings backup could not be written/)
+      expect(String(error)).not.toContain(secret)
+    }
+    expect(prepare).not.toHaveBeenCalled()
+    expect(await readFile(settingsPath, 'utf8')).toBe(original)
+  })
+
+  it('fails closed and retries when credential prepare cannot reach Registry authority', async () => {
+    const userDataDir = await mkdtemp(join(tmpdir(), 'kun-settings-prepare-fail-'))
+    const secret = 'prepare-failure-secret'
+    const plainStore = new JsonSettingsStore(userDataDir)
+    const defaults = await plainStore.load()
+    await plainStore.save({
+      ...defaults,
+      provider: { ...defaults.provider, apiKey: secret }
+    })
+    const settingsPath = join(userDataDir, 'kun-settings.json')
+    const original = await readFile(settingsPath, 'utf8')
+    const prepare = vi.fn(async () => { throw new Error('Registry CAS unavailable') })
+    const store = new JsonSettingsStore(userDataDir, {
+      credentialMigration: { prepare }
+    })
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const error = await store.load().catch((value: unknown) => value)
+      expect(error).toBeInstanceOf(Error)
+      expect(String(error)).toMatch(/could not be moved to protected storage/)
+      expect(String(error)).not.toContain(secret)
+    }
+    expect(prepare).toHaveBeenCalledTimes(2)
+    expect(await readFile(settingsPath, 'utf8')).toBe(original)
+  })
+
+  it('rolls back and never caches plaintext when secret-free settings persist fails', async () => {
+    const userDataDir = await mkdtemp(join(tmpdir(), 'kun-settings-persist-fail-'))
+    const secret = 'persist-failure-secret'
+    const defaults = await new JsonSettingsStore(userDataDir).load()
+    const runtimeSettings = {
+      ...defaults,
+      provider: { ...defaults.provider, apiKey: secret }
+    }
+    const persistedSettings = {
+      ...runtimeSettings,
+      provider: { ...runtimeSettings.provider, apiKey: '' }
+    }
+    const raw = JSON.stringify(runtimeSettings)
+    const backend = {
+      read: vi.fn(async () => ({ revision: 4, value: raw })),
+      write: vi.fn(async () => { throw new Error('Manager document write failed') })
+    }
+    const rollback = vi.fn(async () => undefined)
+    const prepare = vi.fn(async () => ({
+      runtimeSettings,
+      persistedSettings,
+      sourceIdsToCommit: ['settings:provider:deepseek'],
+      removedPlaintext: true,
+      rollback,
+      commit: async () => undefined
+    }))
+    const store = new JsonSettingsStore(userDataDir, {
+      documentBackend: backend,
+      credentialMigration: { prepare }
+    })
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const error = await store.load().catch((value: unknown) => value)
+      expect(error).toBeInstanceOf(Error)
+      expect(String(error)).toMatch(/could not commit secret-free settings/)
+      expect(String(error)).not.toContain(secret)
+    }
+    expect(prepare).toHaveBeenCalledTimes(2)
+    expect(rollback).toHaveBeenCalledTimes(2)
+    expect(backend.read).toHaveBeenCalledTimes(2)
+    expect(backend.write).toHaveBeenCalledTimes(2)
+    expect(raw).toContain(secret)
+  })
+
   it('ignores null entries in persisted Claw channels and schedule tasks', async () => {
     const userDataDir = await mkdtemp(join(tmpdir(), 'ds-gui-settings-'))
 
@@ -387,6 +873,47 @@ describe('JsonSettingsStore', () => {
     expect(rewritten).toContain('sk-migrated')
     // 旧文件保留,回滚老版本时仍可读。
     expect(await readFile(join(userDataDir, 'deepseek-gui-settings.json'), 'utf8')).toContain('sk-migrated')
+  })
+
+  it('persists the versioned stream idle timeout migration for existing users', async () => {
+    const userDataDir = await mkdtemp(join(tmpdir(), 'ds-gui-settings-'))
+    const settingsPath = join(userDataDir, 'kun-settings.json')
+    await writeFile(
+      settingsPath,
+      JSON.stringify({
+        version: 1,
+        agents: {
+          kun: {
+            runtimeTuning: {
+              maxConcurrentTurns: 256,
+              maxWallTimeMs: 86_400_000,
+              streamIdleTimeoutMs: 45_000
+            }
+          }
+        }
+      }),
+      'utf8'
+    )
+
+    const loaded = await new JsonSettingsStore(userDataDir).load()
+    expect(loaded.agents.kun.runtimeTuning).toMatchObject({
+      defaultsVersion: 1,
+      streamIdleTimeoutMs: 450_000
+    })
+
+    const persisted = JSON.parse(await readFile(settingsPath, 'utf8')) as {
+      agents: { kun: { runtimeTuning: { defaultsVersion: number; streamIdleTimeoutMs: number } } }
+    }
+    expect(persisted.agents.kun.runtimeTuning).toMatchObject({
+      defaultsVersion: 1,
+      streamIdleTimeoutMs: 450_000
+    })
+
+    const reloaded = await new JsonSettingsStore(userDataDir).load()
+    expect(reloaded.agents.kun.runtimeTuning).toMatchObject({
+      defaultsVersion: 1,
+      streamIdleTimeoutMs: 450_000
+    })
   })
 
   it('throws for non-recoverable read errors', async () => {
@@ -572,6 +1099,18 @@ describe('JsonSettingsStore', () => {
       expect(entries.filter((entry) => entry.includes('.tmp'))).toEqual([])
     } finally {
       await rm(userDataDir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('development renderer URL boundary', () => {
+  it('ignores renderer URL injection in packaged applications', () => {
+    vi.stubEnv('ELECTRON_RENDERER_URL', 'https://attacker.example/')
+    try {
+      expect(devServerHintUrl(true)).toBeUndefined()
+      expect(devServerHintUrl(false)).toBe('https://attacker.example/')
+    } finally {
+      vi.unstubAllEnvs()
     }
   })
 })

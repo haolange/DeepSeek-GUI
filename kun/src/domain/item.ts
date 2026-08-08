@@ -1,5 +1,11 @@
-import type { TurnItem } from '../contracts/items.js'
+import type {
+  ToolCallProviderMetadata,
+  TurnItem,
+  UserMessageSource
+} from '../contracts/items.js'
 import type { ReviewOutput, ReviewTarget } from '../contracts/review.js'
+import type { UserInputQuestion } from '../ports/user-input-gate.js'
+import type { ComposerContextAttachmentJson } from '../contracts/composer-context.js'
 
 export type ItemEntity = TurnItem
 
@@ -9,7 +15,9 @@ export function makeUserItem(input: {
   threadId: string
   text: string
   displayText?: string
+  messageSource?: UserMessageSource
   attachmentIds?: string[]
+  composerContexts?: ComposerContextAttachmentJson[]
   fileReferences?: Array<{ path: string; relativePath: string; name: string; kind?: 'file' | 'directory' }>
   workspaceCheckpointId?: string
 }): TurnItem {
@@ -34,9 +42,34 @@ export function makeUserItem(input: {
     kind: 'user_message',
     text: input.text,
     ...(displayText && displayText !== input.text ? { displayText } : {}),
+    ...(input.messageSource ? { messageSource: input.messageSource } : {}),
     ...(attachmentIds?.length ? { attachmentIds } : {}),
+    ...(input.composerContexts?.length ? { composerContexts: input.composerContexts } : {}),
     ...(fileReferences?.length ? { fileReferences } : {}),
     ...(input.workspaceCheckpointId ? { workspaceCheckpointId: input.workspaceCheckpointId } : {})
+  }
+}
+
+export function makeGoalContextItem(input: {
+  id: string
+  turnId: string
+  threadId: string
+  goalKey?: string
+  text: string
+  createdAt?: string
+}): TurnItem {
+  const createdAt = input.createdAt ?? new Date().toISOString()
+  return {
+    id: input.id,
+    turnId: input.turnId,
+    threadId: input.threadId,
+    role: 'system',
+    status: 'completed',
+    createdAt,
+    finishedAt: createdAt,
+    kind: 'goal_context',
+    ...(input.goalKey ? { goalKey: input.goalKey } : {}),
+    text: input.text
   }
 }
 
@@ -46,6 +79,7 @@ export function makeAssistantTextItem(input: {
   threadId: string
   text: string
   status?: 'running' | 'completed' | 'failed'
+  createdAt?: string
 }): TurnItem {
   return {
     id: input.id,
@@ -53,7 +87,7 @@ export function makeAssistantTextItem(input: {
     threadId: input.threadId,
     role: 'assistant',
     status: input.status ?? 'running',
-    createdAt: new Date().toISOString(),
+    createdAt: input.createdAt ?? new Date().toISOString(),
     kind: 'assistant_text',
     text: input.text
   }
@@ -65,6 +99,7 @@ export function makeAssistantReasoningItem(input: {
   threadId: string
   text: string
   status?: 'running' | 'completed' | 'failed'
+  createdAt?: string
 }): TurnItem {
   return {
     id: input.id,
@@ -72,7 +107,7 @@ export function makeAssistantReasoningItem(input: {
     threadId: input.threadId,
     role: 'assistant',
     status: input.status ?? 'running',
-    createdAt: new Date().toISOString(),
+    createdAt: input.createdAt ?? new Date().toISOString(),
     kind: 'assistant_reasoning',
     text: input.text
   }
@@ -86,6 +121,7 @@ export function makeToolCallItem(input: {
   toolName: string
   toolKind?: 'tool_call' | 'command_execution' | 'file_change'
   arguments: Record<string, unknown>
+  providerMetadata?: ToolCallProviderMetadata
   summary?: string
   status?: 'pending' | 'running' | 'completed' | 'failed'
 }): TurnItem {
@@ -101,6 +137,7 @@ export function makeToolCallItem(input: {
     callId: input.callId,
     toolKind: input.toolKind ?? 'tool_call',
     arguments: input.arguments,
+    ...(input.providerMetadata ? { providerMetadata: input.providerMetadata } : {}),
     summary: input.summary
   }
 }
@@ -167,12 +204,7 @@ export function makeUserInputItem(input: {
   threadId: string
   inputId: string
   prompt: string
-  questions?: Array<{
-    header: string
-    id: string
-    question: string
-    options: Array<{ label: string; description: string }>
-  }>
+  questions?: UserInputQuestion[]
 }): TurnItem {
   return {
     id: input.id,

@@ -11,10 +11,21 @@ import { z } from 'zod'
 export const UsageSnapshotSchema = z.object({
   promptTokens: z.number().int().nonnegative(),
   completionTokens: z.number().int().nonnegative(),
+  /** Provider-reported reasoning tokens when separately available. */
+  reasoningTokens: z.number().int().nonnegative().optional(),
+  /** Virtual/public alias requested before route-pool target resolution. */
+  requestedModelId: z.string().min(1).optional(),
+  /** Concrete upstream attribution for routed requests. */
+  actualProviderId: z.string().min(1).optional(),
+  actualModelId: z.string().min(1).optional(),
+  routePoolId: z.string().min(1).optional(),
+  routeTargetId: z.string().min(1).optional(),
   totalTokens: z.number().int().nonnegative(),
   cachedTokens: z.number().int().nonnegative().optional(),
   cacheHitTokens: z.number().int().nonnegative().optional(),
   cacheMissTokens: z.number().int().nonnegative().optional(),
+  /** Tokens written into a provider-managed prompt cache. */
+  cacheWriteTokens: z.number().int().nonnegative().optional(),
   cacheHitRate: z.number().min(0).max(1).nullable(),
   cacheableTokenHitRate: z.number().min(0).max(1).nullable().optional(),
   totalInputTokenHitRate: z.number().min(0).max(1).nullable().optional(),
@@ -23,6 +34,11 @@ export const UsageSnapshotSchema = z.object({
   turns: z.number().int().nonnegative(),
   costUsd: z.number().nonnegative().optional(),
   costCny: z.number().nonnegative().optional(),
+  /** Provider-reported costs retained without assuming a two-currency world. */
+  costByCurrency: z.record(
+    z.string().regex(/^[A-Z]{3}$/),
+    z.number().nonnegative()
+  ).optional(),
   /**
    * @deprecated Savings are reported in tokens only (cache hits via
    * `cacheHitTokens`, compression via `tokenEconomySavingsTokens`).
@@ -35,7 +51,25 @@ export const UsageSnapshotSchema = z.object({
   tokenEconomySavingsUsd: z.number().nonnegative().optional(),
   tokenEconomySavingsCny: z.number().nonnegative().optional(),
   /** Provider reported an unrecoverable error mid-stream. */
-  hasError: z.boolean().optional()
+  hasError: z.boolean().optional(),
+  /**
+   * Time-to-first-token of this single model request (ms), measured from
+   * request start until the first text/reasoning chunk arrives. Missing for
+   * non-streaming or legacy providers.
+   */
+  requestTtftMs: z.number().nonnegative().optional(),
+  /** Time spent generating this single model response (ms), from first chunk
+   * until the final usage/completed chunk. Used with `completionTokens` to
+   * derive per-request tokens-per-second. */
+  requestGenerationMs: z.number().nonnegative().optional(),
+  /** Average TTFT across model calls of the current turn (null = no data). */
+  turnAvgTtftMs: z.number().nonnegative().nullable().optional(),
+  /** Average tokens-per-second across model calls of the current turn. */
+  turnAvgTokensPerSecond: z.number().nonnegative().nullable().optional(),
+  /** Thread-cumulative average TTFT across all model calls (null = no data). */
+  avgTtftMs: z.number().nonnegative().nullable().optional(),
+  /** Thread-cumulative average tokens-per-second across all model calls. */
+  avgTokensPerSecond: z.number().nonnegative().nullable().optional()
 })
 export type UsageSnapshot = z.infer<typeof UsageSnapshotSchema>
 
@@ -142,5 +176,9 @@ export const emptyUsageSnapshot = (): UsageSnapshot => ({
   cacheMissTokens: 0,
   cacheHitRate: null,
   turns: 0,
-  tokenEconomySavingsTokens: 0
+  tokenEconomySavingsTokens: 0,
+  turnAvgTtftMs: null,
+  turnAvgTokensPerSecond: null,
+  avgTtftMs: null,
+  avgTokensPerSecond: null
 })

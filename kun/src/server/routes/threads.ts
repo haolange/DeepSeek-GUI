@@ -9,6 +9,7 @@ import {
   SetThreadGoalRequest,
   SetThreadTodosRequest,
   ThreadGoalResponse,
+  ThreadRuntimeStateSchema,
   ThreadSchema,
   ThreadTodosResponse,
   UpdateThreadRequest,
@@ -19,8 +20,20 @@ import { readJsonBody } from '../read-json-body.js'
 import type { ForkThreadOptions, ListThreadsOptions, ThreadService } from '../../services/thread-service.js'
 import type { RuntimeError } from './runtime-error.js'
 import type { SessionStore } from '../../ports/session-store.js'
+import type { UserInputGate } from '../../ports/user-input-gate.js'
+import type { ApprovalGate } from '../../ports/approval-gate.js'
 import type { Turn } from '../../contracts/turns.js'
-import type { TurnItem } from '../../contracts/items.js'
+import {
+  isPublicTurnItem,
+  type ApprovalTurnItem,
+  type TurnItem
+} from '../../contracts/items.js'
+import type { ApprovalRequest } from '../../domain/approval.js'
+import { placeCompactionsChronologically } from '../../loop/compaction-history.js'
+import {
+  type FinishedTurnStatus,
+  finalizeOpenTurnItem
+} from '../../domain/turn-item-finalization.js'
 
 /**
  * Handlers for the thread CRUD endpoints. The handlers accept a
@@ -73,38 +86,181 @@ export async function createThread(
     return validationError('invalid create thread body', parsed.error.issues)
   }
   const thread = await service.create(parsed.data)
-  return jsonResponse(ThreadSchema.parse(thread), 201)
+  return jsonResponse(ThreadSchema.parse(projectPublicThreadRecord(thread)), 201)
 }
 
 export async function getThread(
   service: ThreadService,
   threadId: string,
-  sessionStore?: SessionStore
+  sessionStore?: SessionStore,
+  userInputGate?: UserInputGate,
+  approvalGate?: ApprovalGate
 ): Promise<JsonResponse> {
-  const thread = await service.get(threadId)
+  // Freeze the replay floor before reading the projection. Runtime writers
+  // persist terminal/tool/goal state before appending the corresponding event,
+  // so those records at or below this boundary are visible to the reads below.
+  // Streaming text deltas follow the same state-first ordering and carry a
+  // text offset, making a fragment replayed from the opposite hydration window
+  // idempotent. Every event appended after this floor therefore remains safely
+  // replayable without creating either an old-state/new-cursor gap or duplicate
+  // assistant text.
+  const latestSeq = sessionStore ? await sessionStore.highestSeq(threadId) : 0
+  // With a durable session store, the thread metadata and items are separate
+  // projections. Read only metadata here, then hydrate item history once
+  // below; `service.get()` would otherwise transfer the same history first.
+  let thread: ThreadRecord | null
+  let loadedSessionItems: TurnItem[] | undefined
+  if (sessionStore) {
+    const loaded = await Promise.all([
+      loadThreadMetadata(service, threadId),
+      sessionStore.loadItems(threadId)
+    ])
+    thread = loaded[0]
+    loadedSessionItems = loaded[1]
+  } else {
+    thread = await service.get(threadId)
+  }
   if (!thread) {
     return jsonResponse(
       { code: 'not_found', message: `thread not found: ${threadId}` },
       404
     )
   }
-  let latestSeq = 0
+  const pendingApprovals = approvalGate?.pending(threadId) ?? []
   let sessionItems: TurnItem[] = []
   if (sessionStore) {
-    [latestSeq, sessionItems] = await Promise.all([
-      sessionStore.highestSeq(threadId),
-      sessionStore.loadItems(threadId)
-    ])
+    sessionItems = loadedSessionItems ?? []
     sessionItems = await healSessionItemsForFinishedTurns(thread, sessionItems, sessionStore)
+  } else if (pendingApprovals.length > 0) {
+    // Tests and lightweight embedded callers can omit the session store. Use
+    // the thread's in-memory items as the merge base so recovering a live
+    // approval never replaces the rest of that turn with only the card.
+    sessionItems = thread.turns.flatMap((turn) => turn.items)
   }
-  const hydratedThread = hydrateThreadItemsFromSession(thread, sessionItems)
+  // Goal context belongs to canonical model history only. It has no event and
+  // must not become visible through the GET snapshot used to hydrate the
+  // renderer after reconnect or restart.
+  sessionItems = sessionItems.filter(isPublicTurnItem)
+  // Tool approvals intentionally remain event-only in history. A live gate is
+  // the authoritative source during SSE recovery, so materialize only the
+  // currently actionable requests rather than replaying the full events log
+  // on every thread-detail poll.
+  sessionItems = mergePendingApprovalItems(sessionItems, pendingApprovals)
+  const hydratedThread = projectPublicThreadRecord(hydrateThreadItemsFromSession(thread, sessionItems))
+  // Request ids the runtime is still actively awaiting. The renderer uses these
+  // to tell a live ask-user prompt (answerable across reconnects) apart from a
+  // stale `pending` item rehydrated from a finished thread (issue #606).
+  const pendingUserInputIds = userInputGate?.pending(threadId).map((request) => request.id) ?? []
+  // The renderer uses this live-gate list to distinguish an actionable approval
+  // from a stale pending card rehydrated after its runtime request expired.
+  const pendingApprovalIds = approvalGate
+    ? pendingApprovals.map((request) => request.id)
+    : undefined
   return jsonResponse({
     ...ThreadSchema.parse(hydratedThread),
-    latestSeq
+    latestSeq,
+    pendingUserInputIds,
+    ...(pendingApprovalIds ? { pendingApprovalIds } : {})
   })
 }
 
-type FinishedTurnStatus = Extract<Turn['status'], 'completed' | 'failed' | 'aborted'>
+/**
+ * Return just enough state to decide whether a background thread is still
+ * running. This route intentionally never reads session items.
+ */
+export async function getThreadState(
+  service: ThreadService,
+  threadId: string,
+  sessionStore?: SessionStore
+): Promise<JsonResponse> {
+  const latestSeq = sessionStore ? await sessionStore.highestSeq(threadId) : 0
+  const thread = await loadThreadMetadata(service, threadId)
+  if (!thread) {
+    return jsonResponse(
+      { code: 'not_found', message: `thread not found: ${threadId}` },
+      404
+    )
+  }
+  const latestTurn = thread.turns.at(-1)
+  return jsonResponse(ThreadRuntimeStateSchema.parse({
+    id: thread.id,
+    status: thread.status,
+    updatedAt: thread.updatedAt,
+    latestSeq,
+    latestTurn: latestTurn
+      ? {
+          id: latestTurn.id,
+          status: latestTurn.status,
+          orchestration: latestTurn.orchestration === 'graph' ? 'graph' : 'direct'
+        }
+      : null
+  }))
+}
+
+function loadThreadMetadata(service: ThreadService, threadId: string): Promise<ThreadRecord | null> {
+  // Keep direct route-unit fakes and third-party ThreadService facades from
+  // needing a coordinated upgrade; production ThreadService always exposes
+  // getMetadata and takes the lightweight path.
+  return typeof service.getMetadata === 'function'
+    ? service.getMetadata(threadId)
+    : service.get(threadId)
+}
+
+function mergePendingApprovalItems(
+  sessionItems: TurnItem[],
+  pendingApprovals: readonly ApprovalRequest[]
+): TurnItem[] {
+  if (pendingApprovals.length === 0) return sessionItems
+  const byApprovalId = new Map(pendingApprovals.map((approval) => [approval.id, approval]))
+  const foundApprovalIds = new Set<string>()
+  const merged = sessionItems.map((item) => {
+    if (item.kind !== 'approval') return item
+    const approval = byApprovalId.get(item.approvalId)
+    if (!approval) return item
+    foundApprovalIds.add(approval.id)
+    return approvalItemFromRequest(approval, item)
+  })
+  const additions = pendingApprovals
+    .filter((approval) => !foundApprovalIds.has(approval.id))
+    .map((approval) => approvalItemFromRequest(approval))
+    .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))
+
+  for (const item of additions) {
+    const firstLaterItem = merged.findIndex(
+      (candidate) => candidate.turnId === item.turnId && candidate.createdAt > item.createdAt
+    )
+    if (firstLaterItem >= 0) {
+      merged.splice(firstLaterItem, 0, item)
+      continue
+    }
+    const lastTurnItem = merged.reduce(
+      (index, candidate, candidateIndex) => candidate.turnId === item.turnId ? candidateIndex : index,
+      -1
+    )
+    if (lastTurnItem >= 0) merged.splice(lastTurnItem + 1, 0, item)
+    else merged.push(item)
+  }
+  return merged
+}
+
+function approvalItemFromRequest(
+  approval: ApprovalRequest,
+  existing?: ApprovalTurnItem
+): ApprovalTurnItem {
+  return {
+    id: existing?.id ?? `item_${approval.id}`,
+    turnId: approval.turnId,
+    threadId: approval.threadId,
+    role: 'tool',
+    createdAt: existing?.createdAt ?? approval.createdAt,
+    kind: 'approval',
+    approvalId: approval.id,
+    toolName: approval.toolName,
+    summary: approval.summary,
+    status: 'pending',
+    approvalReviewer: 'user'
+  }
+}
 
 async function healSessionItemsForFinishedTurns(
   thread: ThreadRecord,
@@ -125,7 +281,7 @@ async function healSessionItemsForFinishedTurns(
   const nextItems = items.map((item) => {
     const finished = finishedByTurnId.get(item.turnId)
     if (!finished) return item
-    const next = finalizeOpenSessionItem(item, finished.status, finished.finishedAt ?? healedAt)
+    const next = finalizeOpenTurnItem(item, finished.status, finished.finishedAt ?? healedAt)
     if (next !== item) healedItems.push(next)
     return next
   })
@@ -145,26 +301,11 @@ function finishedTurnStatus(status: Turn['status']): FinishedTurnStatus | null {
   return status === 'completed' || status === 'failed' || status === 'aborted' ? status : null
 }
 
-function finalizeOpenSessionItem(
-  item: TurnItem,
-  status: FinishedTurnStatus,
-  finishedAt: string
-): TurnItem {
-  if (item.status !== 'pending' && item.status !== 'running') return item
-  if (item.kind === 'approval') {
-    return { ...item, status: 'expired', finishedAt }
-  }
-  if (item.kind === 'user_input') {
-    return { ...item, status: 'cancelled', finishedAt }
-  }
-  const itemStatus = status === 'completed' ? 'completed' : status
-  return { ...item, status: itemStatus, finishedAt } as TurnItem
-}
-
 function hydrateThreadItemsFromSession(thread: ThreadRecord, items: TurnItem[]): ThreadRecord {
-  if (items.length === 0 || thread.turns.length === 0) return thread
+  if (thread.turns.length === 0) return thread
   const itemsByTurn = new Map<string, TurnItem[]>()
   for (const item of items) {
+    if (!isPublicTurnItem(item)) continue
     const turnItems = itemsByTurn.get(item.turnId) ?? []
     turnItems.push(item)
     itemsByTurn.set(item.turnId, turnItems)
@@ -172,9 +313,30 @@ function hydrateThreadItemsFromSession(thread: ThreadRecord, items: TurnItem[]):
   let changed = false
   const turns = thread.turns.map((turn): Turn => {
     const sessionTurnItems = itemsByTurn.get(turn.id)
-    if (!sessionTurnItems) return turn
+    if (sessionTurnItems) {
+      changed = true
+      return { ...turn, items: placeCompactionsChronologically(sessionTurnItems) }
+    }
+    const publicItems = turn.items.filter(isPublicTurnItem)
+    if (publicItems.length === turn.items.length) return turn
     changed = true
-    return { ...turn, items: sessionTurnItems }
+    return { ...turn, items: publicItems }
+  })
+  return changed ? { ...thread, turns } : thread
+}
+
+/**
+ * Defense in depth for every HTTP endpoint that returns a ThreadRecord.
+ * The durable SessionStore intentionally contains internal goal-context
+ * items; an old or manually repaired ThreadRecord may contain one too.
+ */
+function projectPublicThreadRecord(thread: ThreadRecord): ThreadRecord {
+  let changed = false
+  const turns = thread.turns.map((turn): Turn => {
+    const items = turn.items.filter(isPublicTurnItem)
+    if (items.length === turn.items.length) return turn
+    changed = true
+    return { ...turn, items }
   })
   return changed ? { ...thread, turns } : thread
 }
@@ -192,7 +354,7 @@ export async function updateThread(
   }
   try {
     const updated: ThreadRecord = await service.update(threadId, parsed.data)
-    return jsonResponse(ThreadSchema.parse(updated))
+    return jsonResponse(ThreadSchema.parse(projectPublicThreadRecord(updated)))
   } catch (error) {
     if (error instanceof Error && /not found/i.test(error.message)) {
       return jsonResponse(
@@ -236,7 +398,7 @@ export async function forkThread(
   }
   try {
     const fork = await service.fork(threadId, options)
-    return jsonResponse(ThreadSchema.parse(fork), 201)
+    return jsonResponse(ThreadSchema.parse(projectPublicThreadRecord(fork)), 201)
   } catch (error) {
     if (error instanceof Error && /not found/i.test(error.message)) {
       return jsonResponse(

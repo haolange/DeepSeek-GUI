@@ -1,0 +1,203 @@
+name: PR Checks
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '22'
+
+jobs:
+  package:
+    name: Build Linux package
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            kun/package-lock.json
+
+      - name: Install Linux packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libarchive-tools rpm fakeroot dpkg build-essential python3
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Build Linux AppImage
+        run: npm run dist:linux
+
+      - name: Upload Linux package
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-linux-package
+          if-no-files-found: error
+          retention-days: 3
+          path: |
+            dist/Kun-*-linux-x86_64.AppImage
+            dist/Kun-*-linux-x86_64.AppImage.blockmap
+            dist/Kun-*-linux-amd64.deb
+
+  package-macos:
+    name: Build ad-hoc macOS packages (PR)
+    runs-on: macos-latest
+    timeout-minutes: 90
+    env:
+      # PR validation intentionally uses the afterPack ad-hoc signature only.
+      # It never consumes Developer ID or notarization secrets.
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            kun/package-lock.json
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Build ad-hoc macOS packages (x64 and arm64)
+        run: npm run dist:mac
+
+      - name: Upload ad-hoc macOS PR packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-macos-adhoc-packages
+          if-no-files-found: error
+          retention-days: 3
+          path: |
+            dist/Kun-*-mac-*.dmg
+            dist/Kun-*-mac-*.zip
+            dist/Kun-*-mac-*.blockmap
+            dist/latest-mac.yml
+
+  package-windows:
+    name: Build Windows NSIS installer (PR)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.23.1'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            kun/package-lock.json
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Build standalone TUI (host-native Windows)
+        shell: pwsh
+        run: |
+          $version = node -p "require('./kun/package.json').version"
+          $env:KUN_APP_VERSION = $version
+          $env:KUN_ARTIFACT_VERSION = $version
+          $env:KUN_UPDATE_CHANNEL = 'stable'
+          $env:RELEASE_CHANNEL = 'stable'
+          npm run build:kun
+          npm run package:tui -- `
+            --version $version `
+            --artifact-version $version `
+            --tag "v$version" `
+            --channel stable `
+            --commit $env:GITHUB_SHA `
+            --target win32-x64 `
+            --output dist/tui-pr
+      - name: Build Windows NSIS installer
+        run: npm run dist:win
+
+      - name: Upload Windows PR package
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-windows-nsis-package
+          if-no-files-found: error
+          retention-days: 3
+          path: |
+            dist/Kun-*-win-x64.exe
+            dist/Kun-*-win-x64.exe.blockmap
+            dist/latest.yml
+
+  request-changes-on-failure:
+    name: Request PR changes on failure
+    runs-on: ubuntu-latest
+    needs:
+      - package
+      - package-macos
+      - package-windows
+    if: >-
+      ${{
+        always() &&
+        github.event_name == 'pull_request' &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        (
+          needs.package.result == 'failure' ||
+          needs['package-macos'].result == 'failure' ||
+          needs['package-windows'].result == 'failure'
+        )
+      }}
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Request changes
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const failedJobs = [
+              ['Build Linux package', '${{ needs.package.result }}'],
+              ['Build ad-hoc macOS packages (PR)', '${{ needs['package-macos'].result }}'],
+              ['Build Windows NSIS installer (PR)', '${{ needs['package-windows'].result }}']
+            ]
+              .filter(([, result]) => result === 'failure')
+              .map(([name]) => `- ${name}`)
+              .join('\n')
+
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            const body = [
+              'PR checks failed. Please fix the failing CI jobs before merging.',
+              '',
+              failedJobs ? `Failed jobs:\n${failedJobs}` : 'At least one required job failed.',
+              '',
+              `Run details: ${runUrl}`
+            ].join('\n')
+
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+              event: 'REQUEST_CHANGES',
+              body
+            })

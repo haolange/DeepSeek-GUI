@@ -1,5 +1,5 @@
 import type { ReactElement, ReactNode } from 'react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   Brain,
@@ -49,6 +49,8 @@ import {
 } from '../../lib/settings-home-paths'
 import { SidebarTitlebarToggleButton } from '../sidebar/SidebarPrimitives'
 import { ScheduleDefaultsDialog } from './ScheduleDefaultsDialog'
+import { createScheduleRefreshCoordinator } from './schedule-refresh-coordinator'
+import { SessionDaemonsView } from './SessionDaemonsView'
 
 type Props = {
   leftSidebarCollapsed: boolean
@@ -391,12 +393,27 @@ export function ScheduleTasksView({
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [filter, setFilter] = useState<TaskFilter>('all')
+  const [scheduleSection, setScheduleSection] = useState<'tasks' | 'daemons'>('tasks')
+  const mainRef = useRef<HTMLElement | null>(null)
+  const sectionScrollTop = useRef<{ tasks: number; daemons: number }>({ tasks: 0, daemons: 0 })
+  const switchScheduleSection = (next: 'tasks' | 'daemons'): void => {
+    if (mainRef.current) {
+      sectionScrollTop.current[scheduleSection] = mainRef.current.scrollTop
+    }
+    setScheduleSection(next)
+  }
+  useEffect(() => {
+    if (mainRef.current) mainRef.current.scrollTop = sectionScrollTop.current[scheduleSection]
+  }, [scheduleSection])
   const [dialog, setDialog] = useState<TaskDialogState | null>(null)
   const [dialogError, setDialogError] = useState<string | null>(null)
   const [settingsDialogOpen, setSettingsDialogOpen] = useState(false)
   const [expandedResultTaskIds, setExpandedResultTaskIds] = useState<Set<string>>(() => new Set())
+  const refreshCoordinator = useRef(createScheduleRefreshCoordinator()).current
 
   const load = useCallback(async (): Promise<void> => {
+    const ticket = refreshCoordinator.beginRefresh()
+    if (ticket === null) return
     try {
       const [nextSettings, nextStatus] = await Promise.all([
         rendererRuntimeClient.getSettings({ forceRefresh: true }),
@@ -404,21 +421,26 @@ export function ScheduleTasksView({
           ? window.kunGui.getScheduleStatus()
           : Promise.resolve(null)
       ])
+      if (!refreshCoordinator.isCurrent(ticket)) return
       setSettings(nextSettings)
       setStatus(nextStatus)
       setError(null)
     } catch (loadError) {
+      if (!refreshCoordinator.isCurrent(ticket)) return
       setError(loadError instanceof Error ? loadError.message : String(loadError))
     } finally {
-      setLoading(false)
+      if (refreshCoordinator.isCurrent(ticket)) setLoading(false)
     }
-  }, [])
+  }, [refreshCoordinator])
 
   useEffect(() => {
     void load()
     const id = window.setInterval(() => void load(), 5_000)
-    return () => window.clearInterval(id)
-  }, [load])
+    return () => {
+      window.clearInterval(id)
+      refreshCoordinator.invalidate()
+    }
+  }, [load, refreshCoordinator])
 
   const schedule = settings ? normalizeScheduleSettings(settings.schedule) : null
   const tasks = schedule?.tasks ?? EMPTY_SCHEDULE_TASKS
@@ -433,12 +455,19 @@ export function ScheduleTasksView({
 
   const persistSchedule = async (patch: Parameters<typeof mergeScheduleSettings>[1]): Promise<void> => {
     if (!settings) return
+    const ticket = refreshCoordinator.beginMutation()
     const nextSchedule = mergeScheduleSettings(settings.schedule, patch)
     setSettings({ ...settings, schedule: nextSchedule })
-    const saved = await rendererRuntimeClient.setSettings({ schedule: nextSchedule })
-    setSettings(saved)
-    if (typeof window.kunGui?.getScheduleStatus === 'function') {
-      setStatus(await window.kunGui.getScheduleStatus())
+    try {
+      const saved = await rendererRuntimeClient.setSettings({ schedule: nextSchedule })
+      if (!refreshCoordinator.isCurrent(ticket)) return
+      setSettings(saved)
+      if (typeof window.kunGui?.getScheduleStatus === 'function') {
+        const nextStatus = await window.kunGui.getScheduleStatus()
+        if (refreshCoordinator.isCurrent(ticket)) setStatus(nextStatus)
+      }
+    } finally {
+      refreshCoordinator.endMutation()
     }
   }
 
@@ -629,8 +658,46 @@ export function ScheduleTasksView({
         </header>
       </div>
 
-      <main className="ds-no-drag min-h-0 flex-1 overflow-y-auto px-6 pb-8 pt-8">
+      <main ref={mainRef} className="ds-no-drag min-h-0 flex-1 overflow-y-auto px-6 pb-8 pt-8">
         <div className="mx-auto flex w-full max-w-[880px] flex-col gap-8">
+          <nav className="flex items-center gap-1 border-b border-ds-border-muted" aria-label={t('schedule')}>
+            <button
+              type="button"
+              onClick={() => switchScheduleSection('tasks')}
+              className={`relative -mb-px border-b-2 px-3 pb-2.5 pt-1 text-[13px] font-semibold transition ${
+                scheduleSection === 'tasks'
+                  ? 'border-ds-ink text-ds-ink'
+                  : 'border-transparent text-ds-muted hover:text-ds-ink'
+              }`}
+            >
+              {t('scheduleTabTasks')}
+            </button>
+            <button
+              type="button"
+              onClick={() => switchScheduleSection('daemons')}
+              className={`relative -mb-px border-b-2 px-3 pb-2.5 pt-1 text-[13px] font-semibold transition ${
+                scheduleSection === 'daemons'
+                  ? 'border-ds-ink text-ds-ink'
+                  : 'border-transparent text-ds-muted hover:text-ds-ink'
+              }`}
+            >
+              {t('scheduleTabDaemons')}
+            </button>
+          </nav>
+          {scheduleSection === 'daemons' ? (
+            schedule ? (
+              <SessionDaemonsView
+                schedule={schedule}
+                clawChannels={clawChannels}
+                defaultWorkspaceRoot={settings?.claw.im.workspaceRoot.trim() || ''}
+                onPatchSchedule={persistSchedule}
+                onOpenThread={onOpenThread}
+              />
+            ) : (
+              <div className="py-20 text-center text-[14px] text-ds-faint">{t('loading')}</div>
+            )
+          ) : (
+          <>
           <div className="flex flex-wrap items-center justify-between gap-3">
             <p className="text-[14px] leading-6 text-ds-faint">
               {t('scheduleSubtitle')}
@@ -828,6 +895,8 @@ export function ScheduleTasksView({
                 )
               })}
             </div>
+          )}
+          </>
           )}
         </div>
       </main>

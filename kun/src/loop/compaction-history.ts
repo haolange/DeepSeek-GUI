@@ -16,24 +16,50 @@ export function insertCompactionIntoVisibleHistory(input: {
   summaryItem: TurnItem
 }): TurnItem[] {
   const summaryIndex = input.compactedItems.findIndex((item) => item.id === input.summaryItem.id)
-  if (summaryIndex < 0) return replaceOrAppendItem(input.visibleItems, input.summaryItem)
+  if (summaryIndex < 0) {
+    return replaceOrAppendItem(input.visibleItems, input.summaryItem)
+  }
 
+  // Goal context is internal model history. `ContextCompactor` intentionally
+  // positions it immediately after the new summary, but the public transcript
+  // insertion path otherwise preserves folded items before that summary. Do
+  // not let the internal record choose the insertion point: doing so would
+  // leave folded visible items after the summary and replay them again.
+  const goalContexts = uniqueGoalContexts([
+    ...input.compactedItems,
+    ...input.visibleItems
+  ])
   const tailIds = new Set(
     input.compactedItems
       .slice(summaryIndex + 1)
+      .filter((item) => item.kind !== 'goal_context')
       .map((item) => item.id)
   )
-  const withoutSummary = input.visibleItems.filter((item) => item.id !== input.summaryItem.id)
-  if (tailIds.size === 0) return [...withoutSummary, input.summaryItem]
+  const withoutSummary = input.visibleItems.filter(
+    (item) => item.id !== input.summaryItem.id && item.kind !== 'goal_context'
+  )
+  if (tailIds.size === 0) return [...withoutSummary, input.summaryItem, ...goalContexts]
 
   const insertIndex = withoutSummary.findIndex((item) => tailIds.has(item.id))
-  if (insertIndex < 0) return [...withoutSummary, input.summaryItem]
+  if (insertIndex < 0) return [...withoutSummary, input.summaryItem, ...goalContexts]
 
   return [
     ...withoutSummary.slice(0, insertIndex),
     input.summaryItem,
+    ...goalContexts,
     ...withoutSummary.slice(insertIndex)
   ]
+}
+
+function uniqueGoalContexts(items: readonly TurnItem[]): TurnItem[] {
+  const seen = new Set<string>()
+  const contexts: TurnItem[] = []
+  for (const item of items) {
+    if (item.kind !== 'goal_context' || seen.has(item.id)) continue
+    seen.add(item.id)
+    contexts.push(item)
+  }
+  return contexts
 }
 
 function replaceOrAppendItem(items: readonly TurnItem[], item: TurnItem): TurnItem[] {
@@ -43,34 +69,88 @@ function replaceOrAppendItem(items: readonly TurnItem[], item: TurnItem): TurnIt
 }
 
 /**
- * Reorder a turn's items so any compaction summary lands LAST in the bucket.
+ * Restore compaction markers to their chronological position for a
+ * renderer-facing turn bucket.
  *
- * The session-store layout (used by the runtime) keeps `[head, summary, tail]`
- * so `effectiveHistoryAfterLatestCompaction` returns `[summary, tail]` for the
- * model. But the thread-store layout drives the renderer's `groupTurns`, which
- * splits blocks at every user message — leaving the summary in that flat
- * position would push it into the previous turn's process timeline, making the
- * 已压缩上下文 row appear under an older exchange instead of the latest one.
- * Moving the summary to the end of its own turn's bucket ensures the renderer
- * shows it inside the turn where the compaction actually happened.
+ * The canonical session layout intentionally inserts a compaction summary
+ * before the retained model-history tail. The UI mirror must not reuse that
+ * model-facing order or force the marker to the end of the turn: either choice
+ * can put work performed after compaction above the marker. Only compaction
+ * items move here; every other item keeps its established relative order.
  */
-export function placeCompactionsAtTurnEnd(items: readonly TurnItem[]): TurnItem[] {
-  let hasTrailingCompaction = false
-  for (const item of items) {
-    if (item.kind === 'compaction' && item.replacedTokens > 0) {
-      hasTrailingCompaction = true
-      break
+export function placeCompactionsChronologically(items: readonly TurnItem[]): TurnItem[] {
+  const indexed = items.map((item, sourceIndex) => ({ item, sourceIndex }))
+  const compactions = indexed.filter(({ item }) => isVisibleCompaction(item))
+  if (compactions.length === 0) return [...items]
+
+  const timeline = indexed.filter(({ item }) => !isVisibleCompaction(item))
+  const turnOwnerItemIds = new Map<string, string>()
+  for (const { item } of indexed) {
+    if (item.kind === 'user_message' && !turnOwnerItemIds.has(item.turnId)) {
+      turnOwnerItemIds.set(item.turnId, item.id)
     }
   }
-  if (!hasTrailingCompaction) return [...items]
-  const rest: TurnItem[] = []
-  const trailing: TurnItem[] = []
-  for (const item of items) {
-    if (item.kind === 'compaction' && item.replacedTokens > 0) {
-      trailing.push(item)
-    } else {
-      rest.push(item)
-    }
+  compactions.sort(compareTimelineEntries)
+
+  for (const compaction of compactions) {
+    const insertIndex = timeline.findIndex((candidate) =>
+      timelineEntryFollowsCompaction(
+        candidate,
+        compaction,
+        turnOwnerItemIds.get(compaction.item.turnId)
+      )
+    )
+    timeline.splice(insertIndex < 0 ? timeline.length : insertIndex, 0, compaction)
   }
-  return [...rest, ...trailing]
+  return timeline.map(({ item }) => item)
+}
+
+type TimelineEntry = {
+  item: TurnItem
+  sourceIndex: number
+}
+
+function timelineTimestamp(value: string): number | null {
+  const timestamp = Date.parse(value)
+  return Number.isFinite(timestamp) ? timestamp : null
+}
+
+function compareTimelineEntries(left: TimelineEntry, right: TimelineEntry): number {
+  const leftTimestamp = timelineTimestamp(left.item.createdAt)
+  const rightTimestamp = timelineTimestamp(right.item.createdAt)
+  if (leftTimestamp !== null && rightTimestamp !== null && leftTimestamp !== rightTimestamp) {
+    return leftTimestamp - rightTimestamp
+  }
+  return left.sourceIndex - right.sourceIndex
+}
+
+function timelineEntryFollowsCompaction(
+  candidate: TimelineEntry,
+  compaction: TimelineEntry,
+  turnOwnerItemId: string | undefined
+): boolean {
+  const candidateTimestamp = timelineTimestamp(candidate.item.createdAt)
+  const compactionTimestamp = timelineTimestamp(compaction.item.createdAt)
+  if (
+    candidateTimestamp !== null &&
+    compactionTimestamp !== null &&
+    candidateTimestamp !== compactionTimestamp
+  ) {
+    return candidateTimestamp > compactionTimestamp
+  }
+
+  // The model-facing insertion can place the summary immediately before the
+  // retained user message. At an equal/invalid timestamp, keep that turn owner
+  // before the UI marker and use stable source order for every other item.
+  if (
+    candidate.item.kind === 'user_message' &&
+    candidate.item.id === turnOwnerItemId
+  ) {
+    return false
+  }
+  return candidate.sourceIndex > compaction.sourceIndex
+}
+
+function isVisibleCompaction(item: TurnItem): boolean {
+  return item.kind === 'compaction' && item.replacedTokens > 0
 }
