@@ -1,0 +1,8 @@
+schema_version: 1
+module_path: extension_packages
+title: Kun 扩展生态包集合
+scope:
+    - packages/
+source_files: []
+depends_on: []
+related_to: []

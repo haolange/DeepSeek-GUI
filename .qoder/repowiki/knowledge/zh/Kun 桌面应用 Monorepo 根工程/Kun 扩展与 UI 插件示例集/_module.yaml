@@ -1,0 +1,8 @@
+schema_version: 1
+module_path: examples
+title: Kun 扩展与 UI 插件示例集
+scope:
+    - examples/
+source_files: []
+depends_on: []
+related_to: []

@@ -1,0 +1,32 @@
+schema_version: 1
+module_path: ""
+title: Kun 桌面应用 Monorepo 根工程
+scope:
+    - README.md
+    - README.en.md
+    - AGENTS.md
+    - DESIGN.md
+    - DESIGN.zh-CN.md
+    - DESIGN_MODE_PLAN.md
+    - SECURITY.md
+    - CODE_OF_CONDUCT.md
+    - CLA.md
+    - THIRD_PARTY_NOTICES.md
+    - package.json
+    - package-lock.json
+    - electron-builder.config.cjs
+    - electron.vite.config.ts
+    - tsconfig.json
+    - tsconfig.node.json
+    - tsconfig.web.json
+    - vitest.config.ts
+    - .gitignore
+    - CODE_OF_CONDUCT.zh-CN.md
+    - LICENSE
+    - SECURITY.zh-CN.md
+    - eslint.config.js
+    - postcss.config.js
+    - tailwind.config.js
+source_files: []
+depends_on: []
+related_to: []

@@ -1,0 +1,8 @@
+schema_version: 1
+module_path: build_release_scripts
+title: 构建与发布脚本集（Kun GUI/TUI）
+scope:
+    - scripts/
+source_files: []
+depends_on: []
+related_to: []

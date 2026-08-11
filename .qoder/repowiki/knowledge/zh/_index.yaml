@@ -2,22 +2,108 @@
 schema_version: 1
 locale: zh-CN
 branch: master
-exported_at: "2026-06-07T11:08:00Z"
+nodes_managed: true
+exported_at: "2026-08-09T01:03:04Z"
 modules:
+    "":
+        dir_name: Kun 桌面应用 Monorepo 根工程
+        title: Kun 桌面应用 Monorepo 根工程
+        scope:
+            - README.md
+            - README.en.md
+            - AGENTS.md
+            - DESIGN.md
+            - DESIGN.zh-CN.md
+            - DESIGN_MODE_PLAN.md
+            - SECURITY.md
+            - CODE_OF_CONDUCT.md
+            - CLA.md
+            - THIRD_PARTY_NOTICES.md
+            - package.json
+            - package-lock.json
+            - electron-builder.config.cjs
+            - electron.vite.config.ts
+            - tsconfig.json
+            - tsconfig.node.json
+            - tsconfig.web.json
+            - vitest.config.ts
+            - .gitignore
+            - CODE_OF_CONDUCT.zh-CN.md
+            - LICENSE
+            - SECURITY.zh-CN.md
+            - eslint.config.js
+            - postcss.config.js
+            - tailwind.config.js
+        source_files: []
+        children:
+            - build_release_scripts
+            - core_engine
+            - docs
+            - electron_app
+            - examples
+            - extension_packages
+            - resources
+        depends_on: []
+        related_to: []
+    build_release_scripts:
+        dir_name: 构建与发布脚本集（Kun GUI_TUI）
+        title: 构建与发布脚本集（Kun GUI/TUI）
+        scope:
+            - scripts/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
+    core_engine:
+        dir_name: Kun 本地 Agent 运行时核心引擎
+        title: Kun 本地 Agent 运行时核心引擎
+        scope:
+            - kun/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
+    docs:
+        dir_name: Kun 项目文档与扩展指南
+        title: Kun 项目文档与扩展指南
+        scope:
+            - docs/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
     electron_app:
-        dir_name: DeepSeek GUI 桌面应用与多模态代理运行时
-        title: DeepSeek GUI 桌面应用与多模态代理运行时
+        dir_name: Kun 桌面端 Electron 应用（主进程_预加载_渲染器）
+        title: Kun 桌面端 Electron 应用（主进程/预加载/渲染器）
         scope:
             - src/
         source_files: []
         children: []
         depends_on: []
         related_to: []
-    kun:
-        dir_name: Kun Agent Runtime & HTTP_SSE Server
-        title: Kun Agent Runtime & HTTP/SSE Server
+    examples:
+        dir_name: Kun 扩展与 UI 插件示例集
+        title: Kun 扩展与 UI 插件示例集
         scope:
-            - kun/
+            - examples/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
+    extension_packages:
+        dir_name: Kun 扩展生态包集合
+        title: Kun 扩展生态包集合
+        scope:
+            - packages/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
+    resources:
+        dir_name: 第三方二进制资源与运行器清单
+        title: 第三方二进制资源与运行器清单
+        scope:
+            - resources/
         source_files: []
         children: []
         depends_on: []

@@ -1,0 +1,8 @@
+schema_version: 1
+module_path: electron_app
+title: Kun 桌面端 Electron 应用（主进程/预加载/渲染器）
+scope:
+    - src/
+source_files: []
+depends_on: []
+related_to: []

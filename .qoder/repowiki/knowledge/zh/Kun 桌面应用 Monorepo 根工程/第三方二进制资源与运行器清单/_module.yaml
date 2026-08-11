@@ -1,0 +1,8 @@
+schema_version: 1
+module_path: resources
+title: 第三方二进制资源与运行器清单
+scope:
+    - resources/
+source_files: []
+depends_on: []
+related_to: []
